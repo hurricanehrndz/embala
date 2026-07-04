@@ -1,0 +1,10 @@
+[package]
+name = "embala-msi"
+description = "WiX-less MSI builder — writes the Windows Installer database directly, on any OS"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
