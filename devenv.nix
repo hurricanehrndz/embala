@@ -5,7 +5,7 @@
   packages = with pkgs; [
     just
     # MSI differential-testing oracle: wixl builds reference MSIs on Linux,
-    # msiinfo/msidump inspect table contents (see research paper §7).
+    # msiinfo/msidump inspect table contents.
     msitools
   ];
 
@@ -26,6 +26,7 @@
       nixfmt.enable = true;
       rustfmt.enable = true;
       yamlfmt.enable = true;
+      mdformat.enable = true;
     };
   };
 

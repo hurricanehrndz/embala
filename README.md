@@ -6,9 +6,8 @@ One config, every installer — build `.msi`, `.app`, `.deb`, `.pkg`, and Chocol
 `.nupkg` for **any ecosystem's binaries** (Go, Rust, Zig, C, .NET AOT, Deno/Bun, …),
 from **any host OS**. No WiX, no Wine, no macOS required.
 
-**Status: skeleton.** Nothing works yet. The design lives in the research paper
-(`~/Documents/generic-installer-packager-research.md`, Draft v7); next step is the
-1-week MSI spike described there (§7).
+**Status: skeleton.** Nothing works yet; next step is a 1-week spike proving WiX-less
+MSI generation end to end.
 
 ## Why
 
