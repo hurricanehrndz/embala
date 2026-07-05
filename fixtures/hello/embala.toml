@@ -1,0 +1,31 @@
+# Test fixture: one config exercising all four v1 formats.
+# Payload `src` paths are relative to this file; `just fixtures` builds
+# dist/hello.exe (mingw cross) — hello.sh is the macOS executable stand-in.
+
+[package]
+name = "hello"
+display-name = "Embala Hello"
+version = "0.1.0"
+identifier = "ca.hrndz.embala.hello"
+publisher = "Carlos Hernandez"
+description = "Embala end-to-end test fixture"
+homepage = "https://github.com/hurricanehrndz/embala"
+license = "MIT"
+
+[msi]
+arch = "x86_64"
+main-executable = "hello.exe"
+files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
+
+[app]
+executable = "hello.sh"
+icon = "icon.png"
+
+[pkg]
+install-location = "/usr/local"
+enable-user-home = true
+files = [{ src = "hello.sh", dest = "bin/embala-hello" }]
+
+[nupkg]
+style = "embedded"
+files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
