@@ -75,3 +75,22 @@ cargo check
 
 `msitools` (wixl, msiinfo) is included in the dev shell as the differential-testing
 oracle for MSI table output.
+
+## Attribution
+
+embala is MIT-licensed (see [LICENSE](LICENSE)) and stands on prior work:
+
+- **[deno](https://github.com/denoland/deno) desktop** (MIT, © 2018–2026 the
+  Deno authors) — embala-msi's MSI authoring (summary info, table shapes,
+  embedded cab, the table-stream sort fix) is ported and adapted from
+  `cli/tools/desktop.rs`; each ported file carries a header notice.
+- **[apple-bom](https://crates.io/crates/apple-bom)** (Apache-2.0 OR MIT,
+  © Gregory Szorc) — embala-pkg's `bom_builder` ports the crate's builder
+  with correctness fixes (used here under the MIT option); the module header
+  catalogs every divergence. The rest of the `apple-*` suite (apple-xar,
+  apple-bundles) is used as regular dependencies.
+- **Format references** (no code taken): Apple's `pkgbuild`/`productbuild`/
+  `mkbom`/`lsbom` output and [msitools](https://gitlab.gnome.org/GNOME/msitools)'
+  wixl served as differential-testing oracles;
+  [bomutils](https://github.com/hogliux/bomutils)' documentation of the BOM
+  format aided the dissection.
