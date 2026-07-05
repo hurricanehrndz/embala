@@ -12,7 +12,9 @@ apple-bom = "0.3"
 apple-xar = { version = "0.20", default-features = false }
 chrono = { version = "0.4", default-features = false }
 flate2 = "1"
+quick-xml = "0.41"
 scroll = "0.12"
+tempfile = "3"
 thiserror = "2.0.18"
 
 [dev-dependencies]

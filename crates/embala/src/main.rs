@@ -111,7 +111,7 @@ fn build_format(format: Format, config: &Config, config_path: &Path, out_dir: &P
     match format {
         Format::Msi => build_msi(config, config_path, out_dir),
         Format::App => build_app(config, config_path, out_dir),
-        Format::Pkg => bail!("pkg: not implemented yet"),
+        Format::Pkg => build_pkg(config, config_path, out_dir),
         Format::Nupkg => build_nupkg(config, config_path, out_dir),
     }
 }
@@ -122,6 +122,34 @@ fn build_app(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> 
     let base = config_path.parent().unwrap_or(Path::new("."));
     let out = app::build(&config.package, section, base, out_dir)?;
     println!("app: wrote {}", out.display());
+    Ok(())
+}
+
+fn build_pkg(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> {
+    let section = config.pkg.as_ref().expect("caller checked [pkg] presence");
+    // FileEntry.src is relative to the config file's directory.
+    let base = config_path.parent().unwrap_or(Path::new("."));
+    let package = &config.package;
+    let spec = embala_pkg::PkgSpec {
+        name: package.name.clone(),
+        display_name: package.display_name.clone(),
+        identifier: package.identifier.clone(),
+        version: package.version.clone(),
+        install_location: section.install_location.clone(),
+        enable_user_home: section.enable_user_home,
+        files: section
+            .files
+            .iter()
+            .map(|f| embala_pkg::FileSpec {
+                src: base.join(&f.src),
+                dest: f.dest.clone(),
+            })
+            .collect(),
+    };
+    let out = out_dir.join(format!("{}-{}.pkg", package.name, package.version));
+    std::fs::create_dir_all(out_dir)?;
+    embala_pkg::build(&spec, &out)?;
+    println!("pkg: wrote {}", out.display());
     Ok(())
 }
 

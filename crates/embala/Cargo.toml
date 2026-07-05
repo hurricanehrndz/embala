@@ -13,6 +13,7 @@ apple-bundles = "0.21"
 clap = { version = "4.6.1", features = ["derive"] }
 embala-msi = { version = "0.0.1", path = "../embala-msi" }
 embala-nupkg = { version = "0.0.1", path = "../embala-nupkg" }
+embala-pkg = { version = "0.0.1", path = "../embala-pkg" }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 plist = "1"
 serde = { version = "1.0.228", features = ["derive"] }

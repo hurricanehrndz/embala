@@ -10,7 +10,7 @@
 //!
 //! Usage: `cargo run -p embala-pkg --example xar_spike [OUTPUT]`
 
-use embala_pkg::{XarEntry, write_xar};
+use embala_pkg::{XarEntry, XarEntryKind, write_xar};
 
 const HELLO: &[u8] = b"#!/bin/sh\necho \"hello from embala xar spike\"\n";
 const README: &[u8] = b"Hello fixture README for embala pkg spike.\n";
@@ -23,13 +23,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let entries = [
         XarEntry {
             name: "embala-hello",
-            data: HELLO,
-            mode: 0o755,
+            kind: XarEntryKind::File {
+                data: HELLO,
+                mode: 0o755,
+                store: false,
+            },
         },
         XarEntry {
             name: "README",
-            data: README,
-            mode: 0o644,
+            kind: XarEntryKind::File {
+                data: README,
+                mode: 0o644,
+                store: false,
+            },
         },
     ];
 

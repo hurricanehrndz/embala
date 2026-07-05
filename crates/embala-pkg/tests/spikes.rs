@@ -10,7 +10,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use apple_bom::ParsedBom;
 use apple_xar::reader::XarReader;
-use embala_pkg::{XarEntry, write_bom, write_xar};
+use embala_pkg::{XarEntry, XarEntryKind, write_bom, write_xar};
 
 const HELLO: &[u8] = b"#!/bin/sh\necho hi\n";
 const README: &[u8] = b"read me\n";
@@ -19,13 +19,19 @@ fn spike_entries() -> [XarEntry<'static>; 2] {
     [
         XarEntry {
             name: "embala-hello",
-            data: HELLO,
-            mode: 0o755,
+            kind: XarEntryKind::File {
+                data: HELLO,
+                mode: 0o755,
+                store: false,
+            },
         },
         XarEntry {
             name: "README",
-            data: README,
-            mode: 0o644,
+            kind: XarEntryKind::File {
+                data: README,
+                mode: 0o644,
+                store: false,
+            },
         },
     ]
 }
