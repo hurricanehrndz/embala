@@ -7,6 +7,9 @@
     # MSI differential-testing oracle: wixl builds reference MSIs on Linux,
     # msiinfo/msidump inspect table contents.
     msitools
+    # Cross toolchain for the fixture Windows test exe (x86_64-w64-mingw32-cc);
+    # embala itself never compiles user artifacts.
+    pkgsCross.mingwW64.buildPackages.gcc
   ];
 
   languages.rust = {

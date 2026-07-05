@@ -4,6 +4,9 @@
 # Packaging output
 /dist
 
+# Fixture build products (`just fixtures`)
+/fixtures/hello/dist
+
 # Devenv
 .devenv*
 devenv.local.nix
