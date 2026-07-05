@@ -21,3 +21,36 @@ fixtures:
     mkdir -p fixtures/hello/dist
     x86_64-w64-mingw32-cc -DVERSION='"0.1.0"' -o fixtures/hello/dist/hello.exe fixtures/hello/hello.c
     x86_64-w64-mingw32-cc -DVERSION='"0.2.0"' -o fixtures/hello/dist/hello-0.2.0.exe fixtures/hello/hello.c
+
+# Differential oracle: build the same install with wixl and with embala,
+# export every table from both, and diff table-by-table. Inspection tool —
+# differences are reported, not fatal. Ids/GUIDs/short-names may differ;
+# whole missing table classes are what to look for.
+msi-diff:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    workdir=/tmp/msi-diff
+    rm -rf "$workdir" && mkdir -p "$workdir/ref" "$workdir/ours"
+    wixl -a x64 -o "$workdir/ref.msi" fixtures/wix/hello.wxs
+    cargo run -q -p embala -- build --config fixtures/hello/embala.toml --formats msi --out-dir dist
+    cp dist/hello-0.1.0-x86_64.msi "$workdir/ours.msi"
+    for side in ref ours; do
+        for t in $(msiinfo tables "$workdir/$side.msi"); do
+            [ "$t" = "_SummaryInformation" ] && continue
+            msiinfo export "$workdir/$side.msi" "$t" > "$workdir/$side/$t.idt" 2>/dev/null || true
+            # Drop empty tables (wixl emits every table it knows, mostly empty)
+            [ "$(wc -l < "$workdir/$side/$t.idt")" -le 3 ] && rm -f "$workdir/$side/$t.idt"
+        done
+    done
+    echo "=== table classes: ref (wixl) vs ours (embala) ==="
+    comm <(ls "$workdir/ref") <(ls "$workdir/ours") \
+        | sed 's/^\t\t/BOTH   /; s/^\t/OURS   /; s/^/REF    /; s/^REF    \(BOTH\|OURS\)/\1/'
+    echo
+    for t in $(ls "$workdir/ref"); do
+        if [ -f "$workdir/ours/$t" ]; then
+            echo "=== diff $t (ref | ours) ==="
+            diff "$workdir/ref/$t" "$workdir/ours/$t" || true
+            echo
+        fi
+    done
+    echo "exports left in $workdir/{ref,ours} for inspection"

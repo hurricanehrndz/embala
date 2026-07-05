@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Differential-testing reference: the same install as fixtures/hello/embala.toml
+  ([msi] section), expressed in wixl-compatible WiX v3 syntax. `just msi-diff`
+  builds this with wixl and compares its tables against embala-msi's output.
+  File Source paths are relative to the repo root (wixl resolves from cwd).
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="{6CB00C44-06B1-575C-904F-14223F55E843}"
+           Name="Embala Hello"
+           Language="1033"
+           Version="0.1.0"
+           Manufacturer="Carlos Hernandez"
+           UpgradeCode="{AEEE1525-B29B-5F4D-AA97-3E85DD62F6D2}">
+    <Package InstallerVersion="200" Compressed="yes" InstallScope="perMachine"/>
+    <Media Id="1" Cabinet="embala.cab" EmbedCab="yes"/>
+
+    <!-- ARP metadata -->
+    <Property Id="ARPCOMMENTS" Value="Embala end-to-end test fixture"/>
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/hurricanehrndz/embala"/>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLDIR" Name="Embala Hello">
+          <Component Id="MainExecutable"
+                     Guid="{6DA375E3-B14D-5240-901F-1623A09F9F7A}"
+                     Win64="yes">
+            <File Id="helloexe" Name="hello.exe"
+                  Source="fixtures/hello/dist/hello.exe" KeyPath="yes"/>
+          </Component>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <!-- Shortcut directly in the Start Menu root (no subfolder), with an
+             HKCU registry value as the component KeyPath, matching embala. -->
+        <Component Id="ShortcutComponent"
+                   Guid="{DD0EC1DA-82DF-50D1-BDEC-1F8547ADE512}"
+                   Win64="yes">
+          <Shortcut Id="AppShortcut" Name="Embala Hello"
+                    Target="[INSTALLDIR]hello.exe"
+                    WorkingDirectory="INSTALLDIR"/>
+          <RegistryValue Root="HKCU" Key="Software\Carlos Hernandez\hello"
+                         Name="installed" Type="integer" Value="1"
+                         KeyPath="yes"/>
+        </Component>
+      </Directory>
+    </Directory>
+
+    <Feature Id="MainFeature" Title="Embala Hello" Level="1">
+      <ComponentRef Id="MainExecutable"/>
+      <ComponentRef Id="ShortcutComponent"/>
+    </Feature>
+  </Product>
+</Wix>
