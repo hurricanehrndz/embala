@@ -1,0 +1,19 @@
+[package]
+name = "embala-pkg"
+description = "macOS .pkg builder — flat packages (xar + BOM + cpio payload), on any OS"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+apple-bom = "0.3"
+apple-xar = { version = "0.20", default-features = false }
+chrono = { version = "0.4", default-features = false }
+flate2 = "1"
+scroll = "0.12"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+tempfile = "3"
