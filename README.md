@@ -2,12 +2,12 @@
 
 > *embalar* (es/pt): to pack.
 
-One config, every installer — build `.msi`, `.app`, `.deb`, `.pkg`, and Chocolatey
+One config, every installer — build `.msi`, `.app`, `.pkg`, and Chocolatey
 `.nupkg` for **any ecosystem's binaries** (Go, Rust, Zig, C, .NET AOT, Deno/Bun, …),
 from **any host OS**. No WiX, no Wine, no macOS required.
 
-**Status: skeleton.** Nothing works yet; next step is a 1-week spike proving WiX-less
-MSI generation end to end.
+**Status: v1 in progress.** Every backend is embala's own code on top of small
+format-primitive crates — no packager frameworks underneath.
 
 ## Why
 
@@ -19,9 +19,9 @@ plus one config file and writes every format natively.
 | Format | Approach |
 |---|---|
 | `.msi` | `embala-msi`: direct Windows Installer database writing (`msi` + `cab` crates) |
-| `.app` / `.deb` / AppImage / NSIS | [cargo-packager](https://crates.io/crates/cargo-packager) as a library |
-| `.pkg` | planned: `apple-xar` + BOM writer |
-| `.nupkg` (Chocolatey) | planned: native OPC zip writer |
+| `.app` | native bundle layout via `apple-bundles`, PNG→icns via `tauri-icns` |
+| `.pkg` | `embala-pkg`: native flat package — `apple-xar` + `apple-bom` + cpio payload |
+| `.nupkg` (Chocolatey) | `embala-nupkg`: native OPC zip writer (`zip` + `quick-xml`) |
 
 The core knows nothing about any build system: input is files + metadata, never a
 compilation step.
