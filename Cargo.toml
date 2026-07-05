@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/embala", "crates/embala-msi"]
+members = ["crates/embala", "crates/embala-msi", "crates/embala-nupkg"]
 
 [workspace.package]
 version = "0.0.1"

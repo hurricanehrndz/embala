@@ -111,8 +111,65 @@ fn build_format(format: Format, config: &Config, config_path: &Path, out_dir: &P
         Format::Msi => build_msi(config, config_path, out_dir),
         Format::App => bail!("app: not implemented yet"),
         Format::Pkg => bail!("pkg: not implemented yet"),
-        Format::Nupkg => bail!("nupkg: not implemented yet"),
+        Format::Nupkg => build_nupkg(config, config_path, out_dir),
     }
+}
+
+fn build_nupkg(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> {
+    let section = config
+        .nupkg
+        .as_ref()
+        .expect("caller checked [nupkg] presence");
+    // FileEntry.src is relative to the config file's directory.
+    let base = config_path.parent().unwrap_or(Path::new("."));
+    let package = &config.package;
+    let style = match section.style {
+        config::NupkgStyle::Embedded => embala_nupkg::Style::Embedded {
+            files: section
+                .files
+                .iter()
+                .map(|f| embala_nupkg::FileSpec {
+                    src: base.join(&f.src),
+                    dest: f.dest.clone(),
+                })
+                .collect(),
+        },
+        config::NupkgStyle::Download => {
+            // For download style the files list names the downloaded
+            // payload's dest; one URL downloads one file.
+            let [file] = section.files.as_slice() else {
+                bail!(
+                    "nupkg: style \"download\" needs exactly one files entry (its dest \
+                     names the downloaded payload), got {}",
+                    section.files.len()
+                );
+            };
+            embala_nupkg::Style::Download {
+                url: section.url.clone().expect("config validation requires url"),
+                checksum: section
+                    .checksum
+                    .clone()
+                    .expect("config validation requires checksum"),
+                dest: file.dest.clone(),
+            }
+        }
+    };
+    let spec = embala_nupkg::NupkgSpec {
+        name: package.name.clone(),
+        display_name: package.display_name.clone(),
+        version: package.version.clone(),
+        identifier: package.identifier.clone(),
+        publisher: package.publisher.clone(),
+        description: package.description.clone(),
+        homepage: package.homepage.clone(),
+        license: package.license.clone(),
+        style,
+    };
+    let out = out_dir.join(format!("{}-{}.nupkg", package.name, package.version));
+    std::fs::create_dir_all(out_dir)?;
+    embala_nupkg::build(&spec, &out)?;
+    println!("nupkg: wrote {}", out.display());
+    Ok(())
 }
 
 fn build_msi(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> {
