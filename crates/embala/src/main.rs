@@ -1,3 +1,4 @@
+mod app;
 mod config;
 
 use std::fmt;
@@ -109,10 +110,19 @@ fn build(config_path: &Path, formats: &[Format], out_dir: &Path) -> Result<()> {
 fn build_format(format: Format, config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> {
     match format {
         Format::Msi => build_msi(config, config_path, out_dir),
-        Format::App => bail!("app: not implemented yet"),
+        Format::App => build_app(config, config_path, out_dir),
         Format::Pkg => bail!("pkg: not implemented yet"),
         Format::Nupkg => build_nupkg(config, config_path, out_dir),
     }
+}
+
+fn build_app(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> {
+    let section = config.app.as_ref().expect("caller checked [app] presence");
+    // Section paths are relative to the config file's directory.
+    let base = config_path.parent().unwrap_or(Path::new("."));
+    let out = app::build(&config.package, section, base, out_dir)?;
+    println!("app: wrote {}", out.display());
+    Ok(())
 }
 
 fn build_nupkg(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> {

@@ -26,6 +26,22 @@ plus one config file and writes every format natively.
 The core knows nothing about any build system: input is files + metadata, never a
 compilation step.
 
+## macOS `.app` bundles and Gatekeeper — read this
+
+**embala's `.app` bundles are unsigned and not notarized** (signing/notarization
+is v2 scope). What that means in practice:
+
+- Bundles **downloaded via a browser** get the `com.apple.quarantine` xattr and
+  Gatekeeper refuses to launch them with a "cannot be opened" dialog.
+  Escape hatches: right-click → **Open** (once per app), or
+  `xattr -d com.apple.quarantine "/path/to/Your App.app"`.
+- Bundles arriving via **scp, rsync, or a local copy** carry no quarantine
+  flag and run normally.
+- The bundle executable must be a **Mach-O binary**: as of macOS 26,
+  LaunchServices refuses to launch a bundle whose `CFBundleExecutable` is a
+  script (`open` fails with error -10669, even ad-hoc signed). Direct
+  execution of `Contents/MacOS/<name>` still works either way.
+
 ## Workspace
 
 - `crates/embala` — the CLI/binary and config schema
