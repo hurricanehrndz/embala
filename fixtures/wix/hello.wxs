@@ -13,6 +13,7 @@
            Manufacturer="Carlos Hernandez"
            UpgradeCode="{AEEE1525-B29B-5F4D-AA97-3E85DD62F6D2}">
     <Package InstallerVersion="200" Compressed="yes" InstallScope="perMachine"/>
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed."/>
     <Media Id="1" Cabinet="embala.cab" EmbedCab="yes"/>
 
     <!-- ARP metadata -->

@@ -368,6 +368,12 @@ pub(crate) fn write<F: Read + Write + Seek>(
             Value::Str("ARPCOMMENTS".to_string()),
             Value::Str(spec.description.clone()),
         ],
+        // FindRelatedProducts writes into these; marking them secure lets the
+        // elevated server side of the install see the values.
+        vec![
+            Value::Str("SecureCustomProperties".to_string()),
+            Value::Str("OLDPRODUCTFOUND;NEWERVERSIONDETECTED".to_string()),
+        ],
     ];
     if let Some(homepage) = &spec.homepage {
         property_rows.push(vec![
@@ -377,12 +383,53 @@ pub(crate) fn write<F: Read + Write + Seek>(
     }
     package.insert_rows(Insert::into("Property").rows(property_rows))?;
 
+    // --- Upgrade: MajorUpgrade detection (attribute values mirror what wixl
+    // emits for <MajorUpgrade/>) ----------------------------------------------
+    const UPGRADE_MIGRATE_FEATURES: i32 = 1; // msidbUpgradeAttributesMigrateFeatures
+    const UPGRADE_ONLY_DETECT: i32 = 2; // msidbUpgradeAttributesOnlyDetect
+    let upgrade_code = guids::upgrade_code(&spec.identifier);
+    package.insert_rows(Insert::into("Upgrade").rows(vec![
+        // Any older version (VersionMax is exclusive, so not this one):
+        // RemoveExistingProducts uninstalls it, migrating feature states.
+        vec![
+            Value::Str(upgrade_code.clone()),
+            Value::Null, // VersionMin: no lower bound
+            Value::Str(spec.version.clone()),
+            Value::Null, // Language: any
+            Value::Int(UPGRADE_MIGRATE_FEATURES),
+            Value::Null, // Remove: all features
+            Value::Str("OLDPRODUCTFOUND".to_string()),
+        ],
+        // Any strictly newer version (VersionMin is exclusive): detect only,
+        // so the LaunchCondition below can refuse the downgrade.
+        vec![
+            Value::Str(upgrade_code),
+            Value::Str(spec.version.clone()),
+            Value::Null, // VersionMax: no upper bound
+            Value::Null,
+            Value::Int(UPGRADE_ONLY_DETECT),
+            Value::Null,
+            Value::Str("NEWERVERSIONDETECTED".to_string()),
+        ],
+    ]))?;
+
+    // --- LaunchCondition: block downgrades ------------------------------------
+    package.insert_rows(Insert::into("LaunchCondition").row(vec![
+        Value::Str("NOT NEWERVERSIONDETECTED".to_string()),
+        Value::Str("A newer version of [ProductName] is already installed.".to_string()),
+    ]))?;
+
     // --- Action sequences (standard MSI sequence numbers) --------------------
     let exec_seq: &[(&str, i32)] = &[
+        ("FindRelatedProducts", 25),
+        ("LaunchConditions", 100),
         ("CostInitialize", 800),
         ("FileCost", 900),
         ("CostFinalize", 1000),
+        ("MigrateFeatureStates", 1200),
         ("InstallValidate", 1400),
+        // Uninstall the old version up front, before the new files go down.
+        ("RemoveExistingProducts", 1401),
         ("InstallInitialize", 1500),
         ("ProcessComponents", 1600),
         ("UnpublishFeatures", 1800),
@@ -416,9 +463,12 @@ pub(crate) fn write<F: Read + Write + Seek>(
     // Minimal UI sequence: cost the install, then hand off to the execute
     // sequence. No Dialog/Control tables — basic-UI msiexec runs use this.
     let ui_seq: &[(&str, i32)] = &[
+        ("FindRelatedProducts", 25),
+        ("LaunchConditions", 100),
         ("CostInitialize", 800),
         ("FileCost", 900),
         ("CostFinalize", 1000),
+        ("MigrateFeatureStates", 1200),
         ("ExecuteAction", 1300),
     ];
     package.insert_rows(
@@ -568,6 +618,48 @@ fn create_schemas<F: Read + Write + Seek>(package: &mut msi::Package<F>) -> Resu
                 .category(Category::Formatted)
                 .string(0),
             Column::build("Component_").id_string(72),
+        ],
+    )?;
+    package.create_table(
+        "Upgrade",
+        vec![
+            Column::build("UpgradeCode")
+                .primary_key()
+                .category(Category::Guid)
+                .string(38),
+            Column::build("VersionMin")
+                .primary_key()
+                .nullable()
+                .category(Category::Text)
+                .string(20),
+            Column::build("VersionMax")
+                .primary_key()
+                .nullable()
+                .category(Category::Text)
+                .string(20),
+            Column::build("Language")
+                .primary_key()
+                .nullable()
+                .category(Category::Text)
+                .string(255),
+            Column::build("Attributes").primary_key().int32(),
+            Column::build("Remove")
+                .nullable()
+                .category(Category::Formatted)
+                .string(255),
+            Column::build("ActionProperty")
+                .category(Category::UpperCase)
+                .string(72),
+        ],
+    )?;
+    package.create_table(
+        "LaunchCondition",
+        vec![
+            Column::build("Condition")
+                .primary_key()
+                .category(Category::Condition)
+                .string(255),
+            Column::build("Description").text_string(255),
         ],
     )?;
     for table in ["InstallExecuteSequence", "InstallUISequence"] {

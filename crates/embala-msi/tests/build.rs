@@ -73,6 +73,88 @@ fn build_is_reproducible_and_structurally_valid() {
 }
 
 #[test]
+fn major_upgrade_tables_are_authored() {
+    let spec = test_spec(&tmp("payload-upgrade"));
+    let out = tmp("upgrade.msi");
+    build(&spec, &out).unwrap();
+    let mut package = msi::Package::open(fs::File::open(&out).unwrap()).unwrap();
+
+    // Upgrade: one remove-older row and one detect-newer (OnlyDetect) row,
+    // both keyed on the stable UpgradeCode. These drive RemoveExistingProducts
+    // and the downgrade LaunchCondition respectively.
+    // Rows rendered as "UpgradeCode min..max attrs -> prop" for comparison.
+    let rows: Vec<String> = package
+        .select_rows(msi::Select::table("Upgrade"))
+        .unwrap()
+        .map(|row| {
+            format!(
+                "{} {}..{} {} -> {}",
+                row[0].as_str().unwrap(),
+                row[1].as_str().unwrap_or(""),
+                row[2].as_str().unwrap_or(""),
+                row[4].as_int().unwrap(),
+                row[6].as_str().unwrap(),
+            )
+        })
+        .collect();
+    let upgrade_code = "{AEEE1525-B29B-5F4D-AA97-3E85DD62F6D2}";
+    // Attributes: 1 = msidbUpgradeAttributesMigrateFeatures,
+    //             2 = msidbUpgradeAttributesOnlyDetect.
+    assert!(
+        rows.contains(&format!("{upgrade_code} ..0.1.0 1 -> OLDPRODUCTFOUND")),
+        "missing remove-older Upgrade row: {rows:?}"
+    );
+    assert!(
+        rows.contains(&format!("{upgrade_code} 0.1.0.. 2 -> NEWERVERSIONDETECTED")),
+        "missing detect-newer Upgrade row: {rows:?}"
+    );
+    assert_eq!(rows.len(), 2);
+
+    // FindRelatedProducts only assigns the action properties if they are
+    // secure; without this the elevated execute sequence can't see them.
+    let secure: Vec<String> = package
+        .select_rows(msi::Select::table("Property"))
+        .unwrap()
+        .filter(|row| row[0].as_str() == Some("SecureCustomProperties"))
+        .map(|row| row[1].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(secure, vec!["OLDPRODUCTFOUND;NEWERVERSIONDETECTED"]);
+
+    // The downgrade guard.
+    let conditions: Vec<String> = package
+        .select_rows(msi::Select::table("LaunchCondition"))
+        .unwrap()
+        .map(|row| row[0].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(conditions, vec!["NOT NEWERVERSIONDETECTED"]);
+
+    // The actions that make the tables take effect must be sequenced:
+    // detection + guard early, RemoveExistingProducts right after
+    // InstallValidate (old product is gone before new files go down).
+    let seq: Vec<(String, i32)> = package
+        .select_rows(msi::Select::table("InstallExecuteSequence"))
+        .unwrap()
+        .map(|row| {
+            (
+                row[0].as_str().unwrap().to_string(),
+                row[2].as_int().unwrap(),
+            )
+        })
+        .collect();
+    for expected in [
+        ("FindRelatedProducts", 25),
+        ("LaunchConditions", 100),
+        ("MigrateFeatureStates", 1200),
+        ("RemoveExistingProducts", 1401),
+    ] {
+        assert!(
+            seq.iter().any(|(a, s)| (a.as_str(), *s) == expected),
+            "InstallExecuteSequence missing {expected:?}: {seq:?}"
+        );
+    }
+}
+
+#[test]
 fn msiextract_round_trips_the_payload() {
     let available = Command::new("msiextract").arg("--version").output().is_ok();
     assert!(
