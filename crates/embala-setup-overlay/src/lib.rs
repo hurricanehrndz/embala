@@ -22,6 +22,9 @@
 //! cycle (the runtime cannot depend on `embala-setup`, which `include_bytes!`s
 //! the runtime).
 
+mod manifest;
+pub use manifest::{Manifest, Package};
+
 /// Trailer magic: "EMBALA SetUp".
 pub const MAGIC: [u8; 8] = *b"EMBALASU";
 

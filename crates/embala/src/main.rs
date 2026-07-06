@@ -263,12 +263,36 @@ fn build_setup(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()
     let base = config_path.parent().unwrap_or(Path::new("."));
     config::validate_setup_paths(section, base)?;
     let package = &config.package;
+    // Phase 3 ships a hand-written script via the `script`/`uninstall-script`
+    // escape hatch; TOML → install.lua lowering is Phase 4. Read the bytes here
+    // (verbatim, spec R7); absence ships the runtime's placeholder.
+    let read_script = |path: &Option<PathBuf>| -> Result<Option<Vec<u8>>> {
+        path.as_ref()
+            .map(|p| std::fs::read(base.join(p)))
+            .transpose()
+            .map_err(Into::into)
+    };
     let spec = embala_setup::SetupSpec {
         arch: match section.arch {
             config::SetupArch::X86_64 => embala_setup::SetupArch::X86_64,
             config::SetupArch::Aarch64 => embala_setup::SetupArch::Aarch64,
         },
-        // Phase 2 ships top-level files only; component files are lowered in
+        install_mode: match section.install_mode {
+            config::InstallMode::PerUser => embala_setup::InstallMode::PerUser,
+            config::InstallMode::PerMachine => embala_setup::InstallMode::PerMachine,
+            config::InstallMode::UserChoice => embala_setup::InstallMode::UserChoice,
+        },
+        product: embala_setup::ProductInfo {
+            name: package.name.clone(),
+            display_name: package.display_name.clone(),
+            version: package.version.clone(),
+            identifier: package.identifier.clone(),
+            publisher: package.publisher.clone(),
+            description: package.description.clone(),
+            homepage: package.homepage.clone(),
+            license: package.license.clone(),
+        },
+        // Phase 3 ships top-level files only; component files are lowered in
         // Phase 4 (their src existence is already validated above).
         files: section
             .files
@@ -278,6 +302,8 @@ fn build_setup(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()
                 dest: f.dest.clone(),
             })
             .collect(),
+        install_lua: read_script(&section.script)?,
+        uninstall_lua: read_script(&section.uninstall_script)?,
     };
     let out = out_dir.join(format!(
         "{}-{}-{}-setup.exe",

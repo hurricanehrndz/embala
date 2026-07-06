@@ -32,4 +32,9 @@ files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
 
 [setup]
 arch = "x86_64"
+# Phase 3 drives a hand-written install.lua via the `script` escape hatch (R7).
+# R20 forbids combining `script` with the main-executable/components/shortcuts
+# sugar the raw script would own, so this fixture stays files + script only.
 files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
+script = "install.lua"
+uninstall-script = "uninstall.lua"

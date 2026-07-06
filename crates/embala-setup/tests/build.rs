@@ -5,14 +5,28 @@
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use embala_setup::{Error, FileSpec, SetupArch, SetupSpec, build};
-use embala_setup_overlay::{TRAILER_LEN, Trailer};
+use embala_setup::{Error, FileSpec, InstallMode, ProductInfo, SetupArch, SetupSpec, build};
+use embala_setup_overlay::{Manifest, TRAILER_LEN, Trailer};
 
 const HELLO: &[u8] = b"MZ fake hello.exe payload";
 const README: &[u8] = b"read me\n";
 
 fn tmp(name: &str) -> PathBuf {
     Path::new(env!("CARGO_TARGET_TMPDIR")).join(name)
+}
+
+/// Product identity used across the writer tests.
+fn product() -> ProductInfo {
+    ProductInfo {
+        name: "hello".to_string(),
+        display_name: "Embala Hello".to_string(),
+        version: "0.1.0".to_string(),
+        identifier: "ca.hrndz.embala.hello".to_string(),
+        publisher: "Carlos Hernandez".to_string(),
+        description: "test fixture".to_string(),
+        homepage: Some("https://example.com".to_string()),
+        license: Some("MIT".to_string()),
+    }
 }
 
 /// Two payload files written under a fresh dir; returns the spec.
@@ -22,6 +36,8 @@ fn two_file_spec(payload_dir: &Path) -> SetupSpec {
     std::fs::write(payload_dir.join("readme.txt"), README).unwrap();
     SetupSpec {
         arch: SetupArch::X86_64,
+        install_mode: InstallMode::PerUser,
+        product: product(),
         files: vec![
             FileSpec {
                 src: payload_dir.join("hello.exe"),
@@ -32,6 +48,8 @@ fn two_file_spec(payload_dir: &Path) -> SetupSpec {
                 dest: "readme.txt".to_string(),
             },
         ],
+        install_lua: None,
+        uninstall_lua: None,
     }
 }
 
@@ -87,9 +105,13 @@ fn overlay_sections_locate_and_payload_round_trips() {
         String::from_utf8_lossy(install)
     );
 
-    // Manifest is deterministic JSON naming the format version and arch.
-    let manifest = std::str::from_utf8(section(&bytes, t.manifest)).unwrap();
-    assert_eq!(manifest, "{\"format_version\":1,\"arch\":\"x86_64\"}");
+    // Manifest deserializes via the shared overlay type with the resolved mode
+    // and full product identity (spec R8).
+    let manifest = Manifest::parse(section(&bytes, t.manifest)).expect("manifest parses");
+    assert_eq!(manifest.format_version, 1);
+    assert_eq!(manifest.arch, "x86_64");
+    assert_eq!(manifest.install_mode, "per-user");
+    assert_eq!(manifest.package.identifier, "ca.hrndz.embala.hello");
 
     // Unzip the payload section and compare each file byte-for-byte.
     let extracted = unzip(section(&bytes, t.payload_zip));
@@ -130,7 +152,11 @@ fn traversal_and_duplicate_dests_are_rejected() {
         build(
             &SetupSpec {
                 arch: SetupArch::X86_64,
+                install_mode: InstallMode::PerUser,
+                product: product(),
                 files,
+                install_lua: None,
+                uninstall_lua: None,
             },
             &tmp("invalid-setup.exe"),
         )
@@ -153,6 +179,30 @@ fn traversal_and_duplicate_dests_are_rejected() {
         fail(vec![file("dup"), file("dup")]),
         Error::DuplicateDest(_)
     ));
+}
+
+#[test]
+fn scripts_ship_verbatim_in_the_overlay() {
+    // Why: install.lua/uninstall.lua ship as plaintext (spec R7) and the runtime
+    // runs them byte-for-byte; a writer that re-encoded or truncated the script
+    // would silently change install behavior. Include spaces/unicode/newlines.
+    let install = "-- install\nembala.log(\"héllo wörld\")\n"
+        .as_bytes()
+        .to_vec();
+    let uninstall = "-- uninstall\nembala.fs.remove(\"a b/c.txt\")\n"
+        .as_bytes()
+        .to_vec();
+    let mut spec = two_file_spec(&tmp("payload-scripts"));
+    spec.install_lua = Some(install.clone());
+    spec.uninstall_lua = Some(uninstall.clone());
+
+    let out = tmp("scripts-setup.exe");
+    build(&spec, &out).unwrap();
+    let bytes = std::fs::read(&out).unwrap();
+    let t = read_trailer(&out);
+
+    assert_eq!(section(&bytes, t.install_lua), install.as_slice());
+    assert_eq!(section(&bytes, t.uninstall_lua), uninstall.as_slice());
 }
 
 /// Slice a section out of the whole-file bytes by its trailer entry.

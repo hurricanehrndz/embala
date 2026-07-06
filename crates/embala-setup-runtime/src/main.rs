@@ -11,8 +11,29 @@
 //! write to the launching shell.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+// Pure-logic modules (no Win32): compiled on Windows (used by the engine) and in
+// `cfg(test)` (their unit tests run on the Linux host, satisfying the plan's
+// host-side coverage for the log format, mode resolution, and CLI parsing). They
+// are absent from a host non-test build, so no dead-code lint fires there.
+#[cfg(any(windows, test))]
+mod cli;
+#[cfg(any(windows, test))]
+mod log;
+#[cfg(any(windows, test))]
+mod mode;
+
+#[cfg(windows)]
+mod api;
 #[cfg(windows)]
 mod app;
+#[cfg(windows)]
+mod host;
+#[cfg(windows)]
+mod install;
+#[cfg(windows)]
+mod sys;
+#[cfg(windows)]
+mod uninstall;
 
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {

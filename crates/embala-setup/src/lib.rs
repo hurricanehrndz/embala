@@ -9,15 +9,16 @@
 //! mtimes and sorts entries, so the whole `setup.exe` is a pure function of
 //! (stub, scripts, manifest, payload).
 //!
-//! Scope for Phase 2: self-extraction only. The stub extracts `payload.zip` to
-//! a target dir; there is no Lua execution yet, so `install.lua` ships as an
-//! extraction-only placeholder and `uninstall.lua` is empty. Product identity
-//! in the manifest and the wizard arrive with later phases.
+//! Scope grows per phase. Phase 3 carries the real manifest (product identity +
+//! resolved install mode, spec R8) and ships the caller's `install.lua` /
+//! `uninstall.lua` bytes verbatim (spec R7) — the runtime's mlua host runs them.
+//! When no `install.lua` is supplied the Phase-2 extraction-only placeholder
+//! still ships. The wizard arrives with Phase 5.
 
 use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 
-use embala_setup_overlay::{FORMAT_VERSION, Section, Trailer};
+use embala_setup_overlay::{FORMAT_VERSION, Manifest, Package, Section, Trailer};
 use zip::write::SimpleFileOptions;
 
 /// The committed runtime stubs, embedded at this crate's compile time (spec R2).
@@ -58,6 +59,41 @@ impl SetupArch {
     }
 }
 
+/// Default install mode baked into the manifest (spec R13). Config-independent,
+/// mirroring the config's own enum; a `/mode=` CLI flag overrides it at install
+/// time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallMode {
+    PerUser,
+    PerMachine,
+    UserChoice,
+}
+
+impl InstallMode {
+    /// The manifest token the runtime parses (matches the spec's CLI vocabulary).
+    fn as_str(self) -> &'static str {
+        match self {
+            InstallMode::PerUser => "per-user",
+            InstallMode::PerMachine => "per-machine",
+            InstallMode::UserChoice => "user-choice",
+        }
+    }
+}
+
+/// Product identity carried into the manifest and, at install time, the
+/// `embala.package` Lua table + the ARP entry. Mirrors `[package]`.
+#[derive(Debug, Clone)]
+pub struct ProductInfo {
+    pub name: String,
+    pub display_name: String,
+    pub version: String,
+    pub identifier: String,
+    pub publisher: String,
+    pub description: String,
+    pub homepage: Option<String>,
+    pub license: Option<String>,
+}
+
 /// A payload file: `src` on disk (already resolved to a real path), `dest` the
 /// `/`-separated install path relative to the install directory.
 #[derive(Debug, Clone)]
@@ -67,12 +103,19 @@ pub struct FileSpec {
 }
 
 /// Everything needed to author one `setup.exe`. Deliberately independent of the
-/// embala config types so the crate is usable on its own. Kept minimal for
-/// Phase 2: product identity, scripts, and install mode land in later phases.
+/// embala config types so the crate is usable on its own.
 #[derive(Debug, Clone)]
 pub struct SetupSpec {
     pub arch: SetupArch,
+    pub install_mode: InstallMode,
+    pub product: ProductInfo,
     pub files: Vec<FileSpec>,
+    /// Raw `install.lua` bytes shipped verbatim (spec R7). `None` ships the
+    /// extraction-only Phase-2 placeholder.
+    pub install_lua: Option<Vec<u8>>,
+    /// Raw `uninstall.lua` bytes shipped verbatim. `None` ships an empty
+    /// section; the runtime then falls back to the log-driven uninstaller.
+    pub uninstall_lua: Option<Vec<u8>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -114,9 +157,14 @@ pub fn build(spec: &SetupSpec, out: &Path) -> Result<()> {
 
     let payload = build_payload_zip(&entries)?;
     let stub = spec.arch.stub();
-    let install = INSTALL_LUA_PLACEHOLDER;
-    let uninstall: &[u8] = b"";
-    let manifest = manifest_json(spec);
+    // Ship the caller's script bytes verbatim (spec R7); fall back to the
+    // Phase-2 extraction-only placeholder when no install.lua was supplied.
+    let install: &[u8] = spec
+        .install_lua
+        .as_deref()
+        .unwrap_or(INSTALL_LUA_PLACEHOLDER);
+    let uninstall: &[u8] = spec.uninstall_lua.as_deref().unwrap_or(b"");
+    let manifest = manifest_bytes(spec);
 
     // Section offsets are cumulative; order matches the trailer's field
     // semantics: [stub][payload.zip][install.lua][uninstall.lua][manifest].
@@ -195,13 +243,24 @@ fn build_payload_zip(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
     Ok(writer.finish()?.into_inner())
 }
 
-/// Minimal deterministic manifest (spec R8). Phase 2 carries only what
-/// `SetupSpec` knows — format version and arch; product identity and the
-/// resolved mode arrive with Phase 3. Stable key order, no timestamps.
-fn manifest_json(spec: &SetupSpec) -> Vec<u8> {
-    format!(
-        "{{\"format_version\":{FORMAT_VERSION},\"arch\":{:?}}}",
-        spec.arch.as_str()
-    )
-    .into_bytes()
+/// Build the deterministic manifest (spec R8) via the shared overlay type: the
+/// runtime deserializes the very same struct. Stable field order, no timestamps.
+fn manifest_bytes(spec: &SetupSpec) -> Vec<u8> {
+    let p = &spec.product;
+    Manifest {
+        format_version: FORMAT_VERSION,
+        arch: spec.arch.as_str().to_string(),
+        install_mode: spec.install_mode.as_str().to_string(),
+        package: Package {
+            name: p.name.clone(),
+            display_name: p.display_name.clone(),
+            version: p.version.clone(),
+            identifier: p.identifier.clone(),
+            publisher: p.publisher.clone(),
+            description: p.description.clone(),
+            homepage: p.homepage.clone(),
+            license: p.license.clone(),
+        },
+    }
+    .to_bytes()
 }

@@ -16,16 +16,44 @@ path = "src/main.rs"
 # Vendored PUC Lua 5.4 host. A normal (not Windows-gated) dep so the C also
 # compiles on this Linux host — proving the vendored build before zig ever runs.
 mlua = { version = "0.12", features = ["lua54", "vendored"] }
-# Shared PE-overlay trailer format (the writer's counterpart).
+# Shared PE-overlay trailer + manifest format (the writer's counterpart).
 embala-setup-overlay = { version = "0.0.1", path = "../embala-setup-overlay" }
+# Install-log records + manifest are (de)serialized as JSON lines / JSON; these
+# power the host-testable pure-logic modules (log/mode), so they are normal deps.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
-# Win32 GUI/console surface; Windows-only so `cargo build --workspace` still
-# links on Linux. `kernel` gives AttachConsole, `user` gives MessageBox.
-winsafe = { version = "0.0.28", features = ["kernel", "user"] }
+# Win32 GUI/console + COM/registry/shell surface; Windows-only so `cargo build
+# --workspace` still links on Linux. kernel: AttachConsole/console-ctrl/version;
+# user: MessageBox/SendMessageTimeout; advapi: registry; shell+ole: IShellLink +
+# ShellExecuteEx (UAC relaunch).
+winsafe = { version = "0.0.28", features = [
+    "kernel",
+    "user",
+    "advapi",
+    "shell",
+    "ole",
+] }
 # Self-extraction reads the payload zip; Windows-only (the extractor runs only
 # there) with just the pure-Rust zlib-rs deflate backend so zig cross-linking
 # stays trivial — no bzip2/zstd/lzma C.
 zip = { version = "8", default-features = false, features = [
     "deflate-flate2-zlib-rs",
+] }
+# WinHTTP (system TLS) for embala.download + sha2 for checksum verify — no
+# rustls/openssl pulled in. windows-sys covers the Win32 bits winsafe 0.0.28
+# lacks: WinHTTP, RtlGetVersion, SetConsoleCtrlHandler, and ShellExecuteExW with
+# a process handle to wait on (winsafe's ShellExecuteEx drops the child handle).
+sha2 = "0.10"
+windows-sys = { version = "0.61", features = [
+    "Wdk_System_SystemServices",       # RtlGetVersion
+    "Win32_Foundation",
+    "Win32_Networking_WinHttp",
+    "Win32_System_Console",
+    "Win32_System_Registry",           # SHELLEXECUTEINFOW carries an hkeyClass
+    "Win32_System_SystemInformation",  # OSVERSIONINFOW
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
