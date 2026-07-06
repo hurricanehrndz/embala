@@ -214,6 +214,8 @@ fn build_nupkg(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()
         project_source_url: section.project_source_url.clone(),
         package_source_url: section.package_source_url.clone(),
         license_url: section.license_url.clone(),
+        icon: package.icon.as_ref().map(|p| base.join(p)),
+        icon_url: section.icon_url.clone(),
         style,
     };
     let out = out_dir.join(format!("{}-{}.nupkg", package.name, package.version));

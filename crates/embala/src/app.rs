@@ -56,7 +56,7 @@ pub fn build(
         builder.set_info_plist_key("LSMinimumSystemVersion", min.as_str())?;
     }
 
-    if let Some(icon) = &section.icon {
+    if let Some(icon) = section.icon.as_ref().or(package.icon.as_ref()) {
         let icon_path = base.join(icon);
         let png = std::fs::read(&icon_path)
             .with_context(|| format!("reading app icon {}", icon_path.display()))?;
@@ -189,6 +189,32 @@ mod tests {
         }
         // The fixture doesn't configure a minimum system version.
         assert!(!dict.contains_key("LSMinimumSystemVersion"));
+    }
+
+    #[test]
+    fn package_icon_is_used_when_the_section_omits_one() {
+        // [app].icon absent, [package].icon set: the package-level icon is the
+        // fallback source, so the bundle still gets its icns.
+        let out = tmp("package-icon");
+        let package = Package {
+            icon: Some(PathBuf::from("icon.png")),
+            ..package()
+        };
+        let section = AppSection {
+            icon: None,
+            ..section()
+        };
+        let bundle = build(&package, &section, &fixture_dir(), &out).expect("bundle builds");
+        assert!(
+            bundle
+                .join("Contents/Resources/Embala Hello.icns")
+                .is_file()
+        );
+        let dict = plist_dict(&bundle);
+        assert_eq!(
+            dict.get("CFBundleIconFile").and_then(|v| v.as_string()),
+            Some("Embala Hello.icns")
+        );
     }
 
     #[test]

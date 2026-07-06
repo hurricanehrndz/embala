@@ -94,6 +94,11 @@ pub struct NupkgSpec {
     pub package_source_url: Option<String>,
     /// nuspec `<licenseUrl>`.
     pub license_url: Option<String>,
+    /// Source image path (already resolved by the caller); packed at the zip
+    /// root as `icon.png`/`icon.jpg`, named by the detected format.
+    pub icon: Option<PathBuf>,
+    /// nuspec `<iconUrl>`.
+    pub icon_url: Option<String>,
     pub style: Style,
 }
 
@@ -109,6 +114,10 @@ pub enum Error {
     ReservedDest(String),
     #[error("nupkg checksum must be 64 hex chars (sha256), got {0:?}")]
     InvalidChecksum(String),
+    #[error("nupkg icon {0:?} must be a PNG or JPEG (magic-byte check)")]
+    InvalidIconFormat(PathBuf),
+    #[error("nupkg icon {0:?} is {1} bytes; NuGet caps embedded icons at 1 MiB")]
+    IconTooLarge(PathBuf, u64),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -153,6 +162,23 @@ pub fn build(spec: &NupkgSpec, out: &Path) -> Result<()> {
     }
     tools.sort_by(|a, b| a.0.cmp(&b.0));
 
+    // Icon: read bytes, sniff PNG/JPEG magic for the in-zip entry name, and
+    // size-gate. Read here (not in the IO-free validate()) since the bytes
+    // are needed anyway, and share the sniffed name with the nuspec below.
+    let icon: Option<(&'static str, Vec<u8>)> = match &spec.icon {
+        Some(path) => {
+            let bytes = std::fs::read(path)?;
+            let name =
+                icon_entry_name(&bytes).ok_or_else(|| Error::InvalidIconFormat(path.clone()))?;
+            let len = bytes.len() as u64;
+            if len > 1_048_576 {
+                return Err(Error::IconTooLarge(path.clone(), len));
+            }
+            Some((name, bytes))
+        }
+        None => None,
+    };
+
     let nuspec_name = format!("{}.nuspec", spec.name);
     let psmdcp_name = format!(
         "package/services/metadata/core-properties/{}.psmdcp",
@@ -172,6 +198,12 @@ pub fn build(spec: &NupkgSpec, out: &Path) -> Result<()> {
             if !ext.is_empty() && !ext.contains('/') {
                 extensions.insert(ext.to_ascii_lowercase());
             }
+        }
+    }
+    // The root icon entry lives outside tools/, so add its extension by hand.
+    if let Some((name, _)) = &icon {
+        if let Some((_, ext)) = name.rsplit_once('.') {
+            extensions.insert(ext.to_string());
         }
     }
 
@@ -204,8 +236,14 @@ pub fn build(spec: &NupkgSpec, out: &Path) -> Result<()> {
         "_rels/.rels",
         &rels_xml(&nuspec_name, &psmdcp_name)?,
     )?;
-    put(&mut writer, &nuspec_name, &nuspec_xml(spec)?)?;
+    let icon_entry = icon.as_ref().map(|(name, _)| *name);
+    put(&mut writer, &nuspec_name, &nuspec_xml(spec, icon_entry)?)?;
     put(&mut writer, &psmdcp_name, &psmdcp_xml(spec)?)?;
+    // Fixed position: after psmdcp, before the tools/ loop, so builds stay
+    // byte-reproducible.
+    if let Some((name, bytes)) = &icon {
+        put(&mut writer, name, bytes)?;
+    }
     for (name, bytes) in &tools {
         put(&mut writer, &format!("tools/{name}"), bytes)?;
     }
@@ -248,6 +286,19 @@ fn validate_dest(dest: &str) -> Result<()> {
         return Err(Error::InvalidDest(dest.to_string()));
     }
     Ok(())
+}
+
+/// In-zip entry name for an icon, sniffed from its magic bytes: PNG →
+/// `icon.png`, JPEG → `icon.jpg`, anything else → None. The name is shared
+/// between the zip entry and the nuspec `<icon>` text so they never diverge.
+fn icon_entry_name(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("icon.png")
+    } else if bytes.starts_with(b"\xFF\xD8\xFF") {
+        Some("icon.jpg")
+    } else {
+        None
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -380,7 +431,7 @@ fn rels_xml(nuspec_name: &str, psmdcp_name: &str) -> XmlResult {
     Ok(finish(writer))
 }
 
-fn nuspec_xml(spec: &NupkgSpec) -> XmlResult {
+fn nuspec_xml(spec: &NupkgSpec, icon_entry: Option<&str>) -> XmlResult {
     let mut writer = xml_writer()?;
     writer
         .create_element("package")
@@ -422,7 +473,14 @@ fn nuspec_xml(spec: &NupkgSpec) -> XmlResult {
                 if let Some(package_source_url) = &spec.package_source_url {
                     text(w, "packageSourceUrl", package_source_url)?;
                 }
-                // icon/iconUrl slot — reserved for a later phase.
+                // <icon> names the in-zip entry (icon.png/icon.jpg), matching
+                // the sniffed name build() packed; <iconUrl> is the fallback URL.
+                if let Some(icon_entry) = icon_entry {
+                    text(w, "icon", icon_entry)?;
+                }
+                if let Some(icon_url) = &spec.icon_url {
+                    text(w, "iconUrl", icon_url)?;
+                }
                 if spec.require_license_acceptance {
                     // false is the nuspec default, so we only emit true.
                     text(w, "requireLicenseAcceptance", "true")?;

@@ -11,6 +11,8 @@ use embala_nupkg::{FileSpec, NupkgSpec, Style, build};
 use sha2::{Digest as _, Sha256};
 
 const PAYLOAD_EXE: &[u8] = b"MZ fake windows executable payload";
+const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+const JPEG_MAGIC: &[u8] = b"\xFF\xD8\xFF";
 
 fn tmp(name: &str) -> PathBuf {
     Path::new(env!("CARGO_TARGET_TMPDIR")).join(name)
@@ -33,6 +35,10 @@ fn base_spec(style: Style) -> NupkgSpec {
         project_source_url: Some("https://github.com/hurricanehrndz/embala".to_string()),
         package_source_url: Some("https://github.com/hurricanehrndz/embala-packages".to_string()),
         license_url: Some("https://github.com/hurricanehrndz/embala/blob/main/LICENSE".to_string()),
+        // Kept None so the exact-entry-set assertions are unaffected; the
+        // icon-packing tests set it explicitly.
+        icon: None,
+        icon_url: Some("https://github.com/hurricanehrndz/embala/raw/main/icon.png".to_string()),
         style,
     }
 }
@@ -46,6 +52,23 @@ fn embedded_spec(payload_dir: &Path) -> NupkgSpec {
             dest: "hello.exe".to_string(),
         }],
     })
+}
+
+/// An embedded spec whose icon points at a file made of `magic` + `tail`,
+/// written into `payload_dir` as `filename`.
+fn embedded_spec_with_icon(
+    payload_dir: &Path,
+    filename: &str,
+    magic: &[u8],
+    tail: &[u8],
+) -> (NupkgSpec, Vec<u8>) {
+    let mut spec = embedded_spec(payload_dir);
+    let icon_path = payload_dir.join(filename);
+    let mut bytes = magic.to_vec();
+    bytes.extend_from_slice(tail);
+    fs::write(&icon_path, &bytes).unwrap();
+    spec.icon = Some(icon_path);
+    (spec, bytes)
 }
 
 fn download_spec() -> NupkgSpec {
@@ -211,6 +234,10 @@ fn nuspec_carries_the_package_metadata() {
         Some("https://github.com/hurricanehrndz/embala-packages")
     );
     assert_eq!(
+        get("package/metadata/iconUrl"),
+        Some("https://github.com/hurricanehrndz/embala/raw/main/icon.png")
+    );
+    assert_eq!(
         get("package/metadata/requireLicenseAcceptance"),
         Some("true")
     );
@@ -252,6 +279,8 @@ fn nuspec_omits_absent_optional_metadata() {
     spec.project_source_url = None;
     spec.package_source_url = None;
     spec.license_url = None;
+    spec.icon = None;
+    spec.icon_url = None;
     let out = tmp("omit.nupkg");
     build(&spec, &out).unwrap();
 
@@ -261,6 +290,10 @@ fn nuspec_omits_absent_optional_metadata() {
         "<licenseUrl",
         "<projectSourceUrl",
         "<packageSourceUrl",
+        // "<icon>" with the closing bracket: "<icon" alone is a prefix of
+        // "<iconUrl". Both must be absent here.
+        "<icon>",
+        "<iconUrl",
         "<releaseNotes",
         "<copyright",
         "<tags",
@@ -291,6 +324,7 @@ fn nuspec_emits_metadata_in_canonical_order() {
         "<projectUrl>",
         "<projectSourceUrl>",
         "<packageSourceUrl>",
+        "<iconUrl>",
         "<requireLicenseAcceptance>",
         "<description>",
         "<releaseNotes>",
@@ -370,9 +404,12 @@ fn download_package_has_only_the_install_script() {
 
 #[test]
 fn builds_are_reproducible() {
+    let (icon_spec, _) =
+        embedded_spec_with_icon(&tmp("payload-repro-icon"), "icon.png", PNG_MAGIC, b"pixels");
     for (label, spec) in [
         ("embedded", embedded_spec(&tmp("payload-repro"))),
         ("download", download_spec()),
+        ("icon", icon_spec),
     ] {
         let out1 = tmp(&format!("repro-{label}-1.nupkg"));
         let out2 = tmp(&format!("repro-{label}-2.nupkg"));
@@ -384,6 +421,104 @@ fn builds_are_reproducible() {
             "two consecutive {label} builds must be byte-identical"
         );
     }
+}
+
+#[test]
+fn png_icon_is_packed_at_the_zip_root() {
+    let (spec, icon_bytes) = embedded_spec_with_icon(
+        &tmp("payload-icon-png"),
+        "app-icon.png",
+        PNG_MAGIC,
+        b"some pixels",
+    );
+    let out = tmp("icon-png.nupkg");
+    build(&spec, &out).unwrap();
+
+    let entries = read_entries(&out);
+    // Icon lives at the ZIP ROOT (not under tools/), byte-identical.
+    assert!(
+        entries.contains_key("icon.png"),
+        "root-level icon.png missing: {:?}",
+        entries.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(entries["icon.png"], icon_bytes);
+
+    // Its extension gets a content-type Default.
+    let types = String::from_utf8(entries["[Content_Types].xml"].clone()).unwrap();
+    assert!(types.contains("Extension=\"png\""), "{types}");
+
+    // nuspec <icon> names the in-zip entry.
+    let texts = nuspec_texts(&entries["hello.nuspec"]);
+    assert_eq!(
+        texts.get("package/metadata/icon").map(String::as_str),
+        Some("icon.png")
+    );
+}
+
+#[test]
+fn jpeg_icon_is_packed_as_icon_jpg() {
+    let (spec, _) = embedded_spec_with_icon(
+        &tmp("payload-icon-jpg"),
+        "app-icon.jpg",
+        JPEG_MAGIC,
+        b"jpeg body",
+    );
+    let out = tmp("icon-jpg.nupkg");
+    build(&spec, &out).unwrap();
+
+    let entries = read_entries(&out);
+    assert!(
+        entries.contains_key("icon.jpg"),
+        "root-level icon.jpg missing: {:?}",
+        entries.keys().collect::<Vec<_>>()
+    );
+    // The nuspec text must match the JPEG entry name.
+    let texts = nuspec_texts(&entries["hello.nuspec"]);
+    assert_eq!(
+        texts.get("package/metadata/icon").map(String::as_str),
+        Some("icon.jpg")
+    );
+}
+
+#[test]
+fn icon_with_unknown_magic_is_rejected() {
+    let (spec, _) = embedded_spec_with_icon(
+        &tmp("payload-icon-bad"),
+        "app-icon.png",
+        b"GIF89a",
+        b" not a supported format",
+    );
+    let err = build(&spec, &tmp("icon-bad.nupkg")).unwrap_err();
+    assert!(
+        matches!(err, embala_nupkg::Error::InvalidIconFormat(_)),
+        "{err}"
+    );
+}
+
+#[test]
+fn icon_size_gate_accepts_1_mib_and_rejects_larger() {
+    let payload = tmp("payload-icon-size");
+    // Exactly 1 MiB (magic + zero padding) is accepted.
+    let (mut at_cap, _) = embedded_spec_with_icon(&payload, "cap.png", PNG_MAGIC, b"");
+    let cap_path = payload.join("cap.png");
+    let mut cap_bytes = PNG_MAGIC.to_vec();
+    cap_bytes.resize(1_048_576, 0);
+    fs::write(&cap_path, &cap_bytes).unwrap();
+    at_cap.icon = Some(cap_path);
+    build(&at_cap, &tmp("icon-cap.nupkg")).expect("exactly 1 MiB is accepted");
+
+    // One byte over the cap is rejected.
+    let mut over = at_cap;
+    let over_path = payload.join("over.png");
+    let mut over_bytes = PNG_MAGIC.to_vec();
+    over_bytes.resize(1_048_577, 0);
+    fs::write(&over_path, &over_bytes).unwrap();
+    over.icon = Some(over_path);
+    let err = build(&over, &tmp("icon-over.nupkg")).unwrap_err();
+    assert!(
+        matches!(err, embala_nupkg::Error::IconTooLarge(_, 1_048_577)),
+        "{err}"
+    );
 }
 
 #[test]
