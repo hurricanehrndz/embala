@@ -34,6 +34,13 @@ pub fn is_cancelled() -> bool {
     CANCEL.load(Ordering::Relaxed)
 }
 
+/// Request cancellation (the wizard's Cancel/[X] during the progress phase, spec
+/// R15). Same flag the console handler sets, so the Lua instruction hook aborts
+/// the script and rollback runs.
+pub fn request_cancel() {
+    CANCEL.store(true, Ordering::Relaxed);
+}
+
 unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> i32 {
     if ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT {
         CANCEL.store(true, Ordering::Relaxed);

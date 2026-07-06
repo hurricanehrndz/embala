@@ -107,6 +107,10 @@ fn run_uninstall_script(dir: &Path, script_path: &Path, attached: bool) -> Resul
         attached,
         true,
         None,
+        // Uninstall never shows the wizard: non-interactive, and elevation is
+        // already resolved by the time uninstall.exe runs.
+        false,
+        false,
     )));
     host::run_script(&engine, &script)
 }

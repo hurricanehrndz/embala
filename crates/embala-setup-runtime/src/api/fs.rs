@@ -20,7 +20,8 @@ pub fn table(lua: &Lua, engine: &Rc<RefCell<Engine>>) -> mlua::Result<Table> {
             let engine = Rc::clone(engine);
             t.set(
                 $name,
-                lua.create_function(move |_, (src, dest): (String, String)| {
+                lua.create_function(move |lua, (src, dest): (String, String)| {
+                    super::gate(&engine, lua)?;
                     engine.borrow_mut().$method(&src, &dest).map_err(to_lua)
                 })?,
             )?;
@@ -31,7 +32,8 @@ pub fn table(lua: &Lua, engine: &Rc<RefCell<Engine>>) -> mlua::Result<Table> {
             let engine = Rc::clone(engine);
             t.set(
                 $name,
-                lua.create_function(move |_, path: String| {
+                lua.create_function(move |lua, path: String| {
+                    super::gate(&engine, lua)?;
                     engine.borrow_mut().$method(&path).map_err(to_lua)
                 })?,
             )?;

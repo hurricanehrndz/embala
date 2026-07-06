@@ -49,7 +49,8 @@ pub fn exec_fn(lua: &Lua) -> mlua::Result<mlua::Function> {
 /// `embala.download` — needs the engine to resolve `dest` and log the file.
 pub fn download_fn(lua: &Lua, engine: &Rc<RefCell<Engine>>) -> mlua::Result<mlua::Function> {
     let engine = Rc::clone(engine);
-    lua.create_function(move |_, spec: Table| {
+    lua.create_function(move |lua, spec: Table| {
+        super::gate(&engine, lua)?;
         let url = spec.get::<String>("url")?;
         let sha256 = spec.get::<String>("sha256")?;
         let dest = spec.get::<String>("dest")?;

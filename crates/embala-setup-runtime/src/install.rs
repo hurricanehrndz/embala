@@ -51,9 +51,21 @@ pub fn run(exe: &Path, trailer: &Trailer, args: &Args, attached: bool) -> ExitCo
     }
 
     match do_install(exe, trailer, args, &manifest, resolved, attached) {
-        Ok(msg) => {
-            report(&msg, attached, args.silent);
+        Ok((msg, ui_handled)) => {
+            // The finish page (interactive) already reported completion; only fall
+            // back to the message box / console line when it did not.
+            if !ui_handled {
+                report(&msg, attached, args.silent);
+            }
             ExitCode::SUCCESS
+        }
+        // mlua prefixes callback errors ("runtime error: ...") and may append a
+        // traceback, so match the cancel sentinel by substring, not equality.
+        Err(e) if e.contains("install cancelled by user") => {
+            // A user-initiated cancel is not a crash: no scary message box (a
+            // console line only, when attached). Rollback has already run.
+            report("Installation cancelled.", attached, true);
+            ExitCode::FAILURE
         }
         Err(e) => {
             report(
@@ -73,7 +85,7 @@ fn do_install(
     manifest: &Manifest,
     resolved: ResolvedMode,
     attached: bool,
-) -> Result<String, String> {
+) -> Result<(String, bool), String> {
     let install_dir = resolve_install_dir(args, resolved, &manifest.package.name)?;
     std::fs::create_dir_all(&install_dir).map_err(|e| e.to_string())?;
 
@@ -90,6 +102,9 @@ fn do_install(
     // R16); `/components=` (when given) picks the component set, else defaults.
     let dir_locked = args.dir.is_some();
     let cli_components = (!args.components.is_empty()).then(|| args.components.clone());
+    // Interactive = not `/S`: the wizard renders (spec R15); `/S` stays headless
+    // (R16). `elevated` drives the mode-page relaunch decision (R13).
+    let interactive = !args.silent;
     let engine = Rc::new(RefCell::new(Engine::new(
         manifest.clone(),
         resolved,
@@ -99,27 +114,38 @@ fn do_install(
         attached,
         dir_locked,
         cli_components,
+        interactive,
+        is_elevated(),
     )));
 
     let result = host::run_script(&engine, &install_lua);
     match result {
         Ok(()) => {
-            write_uninstaller(exe, trailer, &install_dir, manifest, &engine.borrow())?;
+            // The wizard's directory page may have re-pointed install_dir; read
+            // the engine's final value for the uninstaller + completion message.
+            let final_dir = engine.borrow().install_dir().to_path_buf();
+            write_uninstaller(exe, trailer, &final_dir, manifest, &engine.borrow())?;
             let _ = std::fs::remove_dir_all(&payload_dir);
-            Ok(format!(
-                "Installed {} to {}",
-                manifest.package.display_name,
-                install_dir.display()
+            let ui_handled = engine.borrow_mut().finish_ui();
+            Ok((
+                format!(
+                    "Installed {} to {}",
+                    manifest.package.display_name,
+                    final_dir.display()
+                ),
+                ui_handled,
             ))
         }
         Err(e) => {
-            // Reverse everything logged so far, LIFO (spec R14 engine), then drop
-            // the staging dir + any flushed log + the now-empty install dir.
+            // Close the wizard, then reverse everything logged so far, LIFO (spec
+            // R14 engine), and drop the staging dir + flushed log + install dir.
+            engine.borrow_mut().close_ui();
             let records = engine.borrow().records().to_vec();
             api::reverse_all(&records);
-            let _ = std::fs::remove_file(install_dir.join("install.log"));
+            let final_dir = engine.borrow().install_dir().to_path_buf();
+            let _ = std::fs::remove_file(final_dir.join("install.log"));
             let _ = std::fs::remove_dir_all(&payload_dir);
-            let _ = std::fs::remove_dir(&install_dir);
+            let _ = std::fs::remove_dir(&final_dir);
             Err(e)
         }
     }

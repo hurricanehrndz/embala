@@ -31,7 +31,8 @@ pub fn table(lua: &Lua, engine: &Rc<RefCell<Engine>>) -> mlua::Result<Table> {
     let engine = Rc::clone(engine);
     t.set(
         "create",
-        lua.create_function(move |_, spec: Table| {
+        lua.create_function(move |lua, spec: Table| {
+            super::gate(&engine, lua)?;
             let args = ShortcutArgs {
                 name: spec.get::<String>("name")?,
                 target: spec.get::<String>("target")?,

@@ -24,10 +24,10 @@ use mlua::{Lua, Table};
 
 use super::{Engine, to_lua};
 
-/// A wizard page registered by `install.lua`, stored in call order for the
-/// Phase-5 renderer. This headless phase never reads the payload fields back
-/// (it resolves each page's effect eagerly), so they are `dead_code` until then.
-#[allow(dead_code)]
+/// A wizard page registered by `install.lua`, stored in call order and consumed
+/// by the winsafe renderer (`crate::wizard`, spec R15). Under `/S` the page
+/// effects resolve eagerly instead (R16); interactively they are deferred to the
+/// user's choices in the wizard.
 pub enum Page {
     Mode,
     Welcome {
@@ -48,11 +48,11 @@ pub enum Page {
     Finish {
         body: Option<String>,
         run: Option<RunTarget>,
+        links: Vec<(String, String)>,
     },
 }
 
 /// One entry of a `components` page.
-#[allow(dead_code)]
 pub struct ComponentItem {
     pub id: String,
     pub label: String,
@@ -61,7 +61,6 @@ pub struct ComponentItem {
 }
 
 /// The optional "run app on finish" target of a `finish` page.
-#[allow(dead_code)]
 pub struct RunTarget {
     pub target: String,
     pub label: Option<String>,
@@ -105,22 +104,30 @@ fn handle_page(lua: &Lua, engine: &Rc<RefCell<Engine>>, spec: Table) -> mlua::Re
             let text = spec.get::<Option<String>>("text")?;
             let must_accept = spec.get::<Option<bool>>("must_accept")?.unwrap_or(true);
             let mut eng = engine.borrow_mut();
-            eng.accept_license_silent();
+            // Interactive: the wizard gates the must-accept (spec R15). Headless:
+            // auto-accept and log it (spec R16).
+            if !eng.is_interactive() {
+                eng.accept_license_silent();
+            }
             eng.push_page(Page::License { text, must_accept });
         }
         "directory" => {
             let default = spec.get::<Option<String>>("default")?;
             let allow_change = spec.get::<Option<bool>>("allow_change")?.unwrap_or(true);
-            engine
-                .borrow_mut()
-                .apply_directory(default.as_deref())
-                .map_err(to_lua)?;
-            // Re-sync the Lua context so later reads (ARP install_location, etc.)
-            // see the resolved directory.
-            let dir = engine.borrow().install_dir_string();
-            lua.globals()
-                .get::<Table>("embala")?
-                .set("install_dir", dir)?;
+            {
+                let mut eng = engine.borrow_mut();
+                // Interactive: the directory page defers to the wizard. Headless:
+                // re-point install_dir now (spec R16) and re-sync the context.
+                if !eng.is_interactive() {
+                    eng.apply_directory(default.as_deref()).map_err(to_lua)?;
+                }
+            }
+            if !engine.borrow().is_interactive() {
+                let dir = engine.borrow().install_dir_string();
+                lua.globals()
+                    .get::<Table>("embala")?
+                    .set("install_dir", dir)?;
+            }
             engine.borrow_mut().push_page(Page::Directory {
                 default,
                 allow_change,
@@ -129,7 +136,11 @@ fn handle_page(lua: &Lua, engine: &Rc<RefCell<Engine>>, spec: Table) -> mlua::Re
         "components" => {
             let items = parse_items(&spec)?;
             let mut eng = engine.borrow_mut();
-            eng.resolve_components(&items);
+            // Interactive: the wizard resolves the selection; headless: resolve
+            // from defaults/`/components=` now (spec R16).
+            if !eng.is_interactive() {
+                eng.resolve_components(&items);
+            }
             eng.push_page(Page::Components { items });
         }
         "finish" => {
@@ -140,9 +151,11 @@ fn handle_page(lua: &Lua, engine: &Rc<RefCell<Engine>>, spec: Table) -> mlua::Re
                 }),
                 None => None,
             };
+            let links = parse_links(&spec)?;
             let page = Page::Finish {
                 body: spec.get::<Option<String>>("body")?,
                 run,
+                links,
             };
             engine.borrow_mut().push_page(page);
         }
@@ -156,6 +169,18 @@ fn handle_page(lua: &Lua, engine: &Rc<RefCell<Engine>>, spec: Table) -> mlua::Re
         }
     }
     Ok(())
+}
+
+/// Parse a `finish` page's optional `links = { {label=, url=}, ... }` array.
+fn parse_links(spec: &Table) -> mlua::Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    if let Some(links) = spec.get::<Option<Table>>("links")? {
+        for entry in links.sequence_values::<Table>() {
+            let entry = entry?;
+            out.push((entry.get::<String>("label")?, entry.get::<String>("url")?));
+        }
+    }
+    Ok(out)
 }
 
 /// Parse a `components` page's `items = { {...}, ... }` array.
@@ -180,7 +205,7 @@ impl Engine {
     }
 
     /// `install_dir` as a Lua string (for re-syncing the context global).
-    fn install_dir_string(&self) -> String {
+    pub(crate) fn install_dir_string(&self) -> String {
         self.install_dir.to_string_lossy().into_owned()
     }
 

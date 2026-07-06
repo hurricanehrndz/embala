@@ -21,6 +21,11 @@ mod cli;
 mod log;
 #[cfg(any(windows, test))]
 mod mode;
+// Pure wizard page-flow logic (spec R15/R16); host-testable, so its unit tests
+// run on Linux. The winsafe renderer that consumes it is Windows-only.
+#[cfg(any(windows, test))]
+#[path = "wizard/flow.rs"]
+mod wizard_flow;
 
 #[cfg(windows)]
 mod api;
@@ -34,6 +39,8 @@ mod install;
 mod sys;
 #[cfg(windows)]
 mod uninstall;
+#[cfg(windows)]
+mod wizard;
 
 #[cfg(windows)]
 fn main() -> std::process::ExitCode {

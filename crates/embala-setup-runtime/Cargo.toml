@@ -34,6 +34,10 @@ winsafe = { version = "0.0.28", features = [
     "advapi",
     "shell",
     "ole",
+    # gui: the wizard renderer (WindowMain + native controls); transitively pulls
+    # comctl + uxtheme + gdi. The v6 common-controls dependency is already in the
+    # baked manifest (setup.manifest).
+    "gui",
 ] }
 # Self-extraction reads the payload zip; Windows-only (the extractor runs only
 # there) with just the pure-Rust zlib-rs deflate backend so zig cross-linking

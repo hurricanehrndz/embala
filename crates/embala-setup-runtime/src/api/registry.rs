@@ -25,7 +25,8 @@ pub fn registry_table(lua: &Lua, engine: &Rc<RefCell<Engine>>) -> mlua::Result<T
         let engine = Rc::clone(engine);
         t.set(
             "set",
-            lua.create_function(move |_, spec: Table| {
+            lua.create_function(move |lua, spec: Table| {
+                super::gate(&engine, lua)?;
                 let hive = parse_hive(&spec.get::<String>("hive")?)?;
                 let key = spec.get::<String>("key")?;
                 let name = spec.get::<Option<String>>("name")?;
@@ -44,7 +45,8 @@ pub fn registry_table(lua: &Lua, engine: &Rc<RefCell<Engine>>) -> mlua::Result<T
         let engine = Rc::clone(engine);
         t.set(
             "delete",
-            lua.create_function(move |_, spec: Table| {
+            lua.create_function(move |lua, spec: Table| {
+                super::gate(&engine, lua)?;
                 let hive = parse_hive(&spec.get::<String>("hive")?)?;
                 let key = spec.get::<String>("key")?;
                 let name = spec.get::<Option<String>>("name")?;
@@ -63,7 +65,8 @@ pub fn arp_table(lua: &Lua, engine: &Rc<RefCell<Engine>>) -> mlua::Result<Table>
     let engine = Rc::clone(engine);
     t.set(
         "register",
-        lua.create_function(move |_, spec: Table| {
+        lua.create_function(move |lua, spec: Table| {
+            super::gate(&engine, lua)?;
             let a = ArpArgs {
                 display_name: spec.get::<String>("display_name")?,
                 version: spec.get::<String>("version")?,
@@ -86,7 +89,8 @@ pub fn env_table(lua: &Lua, engine: &Rc<RefCell<Engine>>) -> mlua::Result<Table>
     let engine = Rc::clone(engine);
     t.set(
         "set",
-        lua.create_function(move |_, spec: Table| {
+        lua.create_function(move |lua, spec: Table| {
+            super::gate(&engine, lua)?;
             let name = spec.get::<String>("name")?;
             let value = spec.get::<String>("value")?;
             let scope = spec.get::<Option<String>>("scope")?;
