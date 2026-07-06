@@ -366,6 +366,31 @@ mod tests {
         assert!(config.pkg.is_some());
         assert!(config.nupkg.is_some());
         assert!(config.setup.is_some());
+        // Phase 4: the fixture carries the nupkg metadata end-to-end. Keep the
+        // [package].icon fallback path exercised — the fixture no longer sets
+        // [app].icon, so the .app builder must fall back to [package].icon.
+        assert_eq!(
+            config.package.copyright.as_deref(),
+            Some("© 2026 Carlos Hernandez")
+        );
+        assert_eq!(
+            config.package.tags.as_deref(),
+            Some(&["cli".to_string(), "embala".to_string(), "demo".to_string()][..])
+        );
+        assert_eq!(config.package.icon.as_deref(), Some(Path::new("icon.png")));
+        // require-license-acceptance stays unset so the choco-install gate is
+        // acceptance-prompt-free.
+        assert!(!config.package.require_license_acceptance);
+        assert!(config.app.as_ref().unwrap().icon.is_none());
+        let nupkg = config.nupkg.as_ref().unwrap();
+        assert_eq!(
+            nupkg.license_url.as_deref(),
+            Some("https://github.com/hurricanehrndz/embala/blob/main/LICENSE")
+        );
+        assert_eq!(
+            nupkg.icon_url.as_deref(),
+            Some("https://github.com/hurricanehrndz/embala/raw/main/fixtures/hello/icon.png")
+        );
         assert_eq!(config.msi.unwrap().arch, MsiArch::X86_64);
         let setup = config.setup.unwrap();
         assert_eq!(setup.arch, SetupArch::X86_64);
@@ -382,10 +407,34 @@ mod tests {
         assert_eq!(setup.components[0].files[0].dest, "readme.txt");
     }
 
+    /// The fixture with its Phase-4 metadata keys stripped, so the mutation
+    /// tests below can splice their own variants without colliding
+    /// (duplicate-key) with the metadata the fixture now carries end-to-end.
+    fn fixture_toml_without_metadata() -> String {
+        const STRIPPED: &[&str] = &[
+            "copyright =",
+            "tags =",
+            "icon =",
+            "project-source-url =",
+            "package-source-url =",
+            "release-notes =",
+            "icon-url =",
+            "license-url =",
+        ];
+        fixture_toml()
+            .lines()
+            .filter(|line| {
+                let key = line.trim_start();
+                !STRIPPED.iter().any(|prefix| key.starts_with(prefix))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Splice extra keys into the fixture's `[package]` table (after
     /// `license`) and its `[nupkg]` table (after `style`).
     fn with_metadata(package_keys: &str, nupkg_keys: &str) -> String {
-        fixture_toml()
+        fixture_toml_without_metadata()
             .replace(
                 "license = \"MIT\"",
                 &format!("license = \"MIT\"\n{package_keys}"),

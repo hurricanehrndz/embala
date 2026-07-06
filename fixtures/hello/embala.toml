@@ -11,6 +11,9 @@ publisher = "Carlos Hernandez"
 description = "Embala end-to-end test fixture"
 homepage = "https://github.com/hurricanehrndz/embala"
 license = "MIT"
+copyright = "© 2026 Carlos Hernandez"
+tags = ["cli", "embala", "demo"]
+icon = "icon.png"
 
 [msi]
 arch = "x86_64"
@@ -19,7 +22,6 @@ files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
 
 [app]
 executable = "hello.sh"
-icon = "icon.png"
 
 [pkg]
 install-location = "/usr/local"
@@ -28,6 +30,11 @@ files = [{ src = "hello.sh", dest = "bin/embala-hello" }]
 
 [nupkg]
 style = "embedded"
+project-source-url = "https://github.com/hurricanehrndz/embala"
+package-source-url = "https://github.com/hurricanehrndz/embala"
+release-notes = "https://github.com/hurricanehrndz/embala/releases"
+icon-url = "https://github.com/hurricanehrndz/embala/raw/main/fixtures/hello/icon.png"
+license-url = "https://github.com/hurricanehrndz/embala/blob/main/LICENSE"
 files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
 
 [setup]
