@@ -207,6 +207,13 @@ fn build_nupkg(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()
         description: package.description.clone(),
         homepage: package.homepage.clone(),
         license: package.license.clone(),
+        copyright: package.copyright.clone(),
+        tags: package.tags.clone().unwrap_or_default(),
+        release_notes: section.release_notes.clone(),
+        require_license_acceptance: package.require_license_acceptance,
+        project_source_url: section.project_source_url.clone(),
+        package_source_url: section.package_source_url.clone(),
+        license_url: section.license_url.clone(),
         style,
     };
     let out = out_dir.join(format!("{}-{}.nupkg", package.name, package.version));

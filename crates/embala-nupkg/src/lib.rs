@@ -76,9 +76,24 @@ pub struct NupkgSpec {
     pub description: String,
     /// nuspec `<projectUrl>`.
     pub homepage: Option<String>,
-    /// License identifier ("MIT", …) for the generated `tools/LICENSE.txt`
-    /// (embedded style only; we have no URL so no nuspec `<licenseUrl>`).
+    /// License identifier ("MIT", …): emits nuspec `<license type="expression">`
+    /// and names the license in the generated `tools/LICENSE.txt` (embedded
+    /// style only).
     pub license: Option<String>,
+    /// nuspec `<copyright>`.
+    pub copyright: Option<String>,
+    /// nuspec `<tags>` (space-joined; empty = omit).
+    pub tags: Vec<String>,
+    /// nuspec `<releaseNotes>`.
+    pub release_notes: Option<String>,
+    /// nuspec `<requireLicenseAcceptance>` (emitted only when true).
+    pub require_license_acceptance: bool,
+    /// nuspec `<projectSourceUrl>`.
+    pub project_source_url: Option<String>,
+    /// nuspec `<packageSourceUrl>`.
+    pub package_source_url: Option<String>,
+    /// nuspec `<licenseUrl>`.
+    pub license_url: Option<String>,
     pub style: Style,
 }
 
@@ -253,8 +268,8 @@ fn license_txt(spec: &NupkgSpec) -> Option<Vec<u8>> {
         "{} is distributed under the {} license by {}.\n",
         spec.display_name, license, spec.publisher
     );
-    if let Some(homepage) = &spec.homepage {
-        text.push_str(&format!("Full license text: {homepage}\n"));
+    if let Some(url) = spec.license_url.as_ref().or(spec.homepage.as_ref()) {
+        text.push_str(&format!("Full license text: {url}\n"));
     }
     Some(text.into_bytes())
 }
@@ -372,18 +387,55 @@ fn nuspec_xml(spec: &NupkgSpec) -> XmlResult {
         .with_attribute(("xmlns", NUSPEC_XMLNS))
         .write_inner_content(|w| {
             w.create_element("metadata").write_inner_content(|w| {
-                let mut text = |tag: &str, value: &str| {
+                // Free fn (not a closure): the license element borrows `w`
+                // directly between text() calls, which a capturing closure
+                // would forbid.
+                fn text(
+                    w: &mut Writer<Cursor<Vec<u8>>>,
+                    tag: &str,
+                    value: &str,
+                ) -> std::result::Result<(), std::io::Error> {
                     w.create_element(tag)
                         .write_text_content(BytesText::new(value))
                         .map(|_| ())
-                };
-                text("id", &spec.name)?;
-                text("version", &spec.version)?;
-                text("title", &spec.display_name)?;
-                text("authors", &spec.publisher)?;
-                text("description", &spec.description)?;
+                }
+                text(w, "id", &spec.name)?;
+                text(w, "version", &spec.version)?;
+                text(w, "title", &spec.display_name)?;
+                text(w, "authors", &spec.publisher)?;
+                if let Some(license) = &spec.license {
+                    // SPDX identifier; the element carries both the type
+                    // attribute and the id as text content.
+                    w.create_element("license")
+                        .with_attribute(("type", "expression"))
+                        .write_text_content(BytesText::new(license))?;
+                }
+                if let Some(license_url) = &spec.license_url {
+                    text(w, "licenseUrl", license_url)?;
+                }
                 if let Some(homepage) = &spec.homepage {
-                    text("projectUrl", homepage)?;
+                    text(w, "projectUrl", homepage)?;
+                }
+                if let Some(project_source_url) = &spec.project_source_url {
+                    text(w, "projectSourceUrl", project_source_url)?;
+                }
+                if let Some(package_source_url) = &spec.package_source_url {
+                    text(w, "packageSourceUrl", package_source_url)?;
+                }
+                // icon/iconUrl slot — reserved for a later phase.
+                if spec.require_license_acceptance {
+                    // false is the nuspec default, so we only emit true.
+                    text(w, "requireLicenseAcceptance", "true")?;
+                }
+                text(w, "description", &spec.description)?;
+                if let Some(release_notes) = &spec.release_notes {
+                    text(w, "releaseNotes", release_notes)?;
+                }
+                if let Some(copyright) = &spec.copyright {
+                    text(w, "copyright", copyright)?;
+                }
+                if !spec.tags.is_empty() {
+                    text(w, "tags", &spec.tags.join(" "))?;
                 }
                 Ok::<(), std::io::Error>(())
             })?;

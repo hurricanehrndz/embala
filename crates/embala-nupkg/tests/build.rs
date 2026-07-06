@@ -26,6 +26,13 @@ fn base_spec(style: Style) -> NupkgSpec {
         description: "Embala end-to-end test fixture".to_string(),
         homepage: Some("https://github.com/hurricanehrndz/embala".to_string()),
         license: Some("MIT".to_string()),
+        copyright: Some("© 2026 Carlos Hernandez".to_string()),
+        tags: vec!["cli".to_string(), "packaging".to_string()],
+        release_notes: Some("First public release.".to_string()),
+        require_license_acceptance: true,
+        project_source_url: Some("https://github.com/hurricanehrndz/embala".to_string()),
+        package_source_url: Some("https://github.com/hurricanehrndz/embala-packages".to_string()),
+        license_url: Some("https://github.com/hurricanehrndz/embala/blob/main/LICENSE".to_string()),
         style,
     }
 }
@@ -143,9 +150,14 @@ fn embedded_package_has_exact_entries_and_verification_checksum() {
         "VERIFICATION.txt must list the embedded file's sha256:\n{verification}"
     );
 
-    // LICENSE.txt names the license.
+    // LICENSE.txt names the license and points at the license URL (preferred
+    // over the homepage when set).
     let license = String::from_utf8(entries["tools/LICENSE.txt"].clone()).unwrap();
     assert!(license.contains("MIT"), "LICENSE.txt: {license}");
+    assert!(
+        license.contains("https://github.com/hurricanehrndz/embala/blob/main/LICENSE"),
+        "LICENSE.txt must prefer the license URL: {license}"
+    );
 
     // Every extension in the zip has a content-type Default.
     let types = String::from_utf8(entries["[Content_Types].xml"].clone()).unwrap();
@@ -185,6 +197,117 @@ fn nuspec_carries_the_package_metadata() {
         get("package/metadata/projectUrl"),
         Some("https://github.com/hurricanehrndz/embala")
     );
+    assert_eq!(get("package/metadata/license"), Some("MIT"));
+    assert_eq!(
+        get("package/metadata/licenseUrl"),
+        Some("https://github.com/hurricanehrndz/embala/blob/main/LICENSE")
+    );
+    assert_eq!(
+        get("package/metadata/projectSourceUrl"),
+        Some("https://github.com/hurricanehrndz/embala")
+    );
+    assert_eq!(
+        get("package/metadata/packageSourceUrl"),
+        Some("https://github.com/hurricanehrndz/embala-packages")
+    );
+    assert_eq!(
+        get("package/metadata/requireLicenseAcceptance"),
+        Some("true")
+    );
+    assert_eq!(
+        get("package/metadata/releaseNotes"),
+        Some("First public release.")
+    );
+    assert_eq!(
+        get("package/metadata/copyright"),
+        Some("© 2026 Carlos Hernandez")
+    );
+    // Tags are joined with a single space.
+    assert_eq!(get("package/metadata/tags"), Some("cli packaging"));
+}
+
+#[test]
+fn nuspec_license_element_carries_the_type_attribute() {
+    let spec = embedded_spec(&tmp("payload-license-attr"));
+    let out = tmp("license-attr.nupkg");
+    build(&spec, &out).unwrap();
+
+    let raw = String::from_utf8(read_entries(&out)["hello.nuspec"].clone()).unwrap();
+    assert!(
+        raw.contains("<license type=\"expression\">MIT</license>"),
+        "raw nuspec must carry the SPDX license element: {raw}"
+    );
+}
+
+#[test]
+fn nuspec_omits_absent_optional_metadata() {
+    // Pre-Phase-2 shape: only the always-present fields, everything optional
+    // cleared. None of the conditional elements may appear.
+    let mut spec = embedded_spec(&tmp("payload-omit"));
+    spec.license = None;
+    spec.copyright = None;
+    spec.tags = Vec::new();
+    spec.release_notes = None;
+    spec.require_license_acceptance = false;
+    spec.project_source_url = None;
+    spec.package_source_url = None;
+    spec.license_url = None;
+    let out = tmp("omit.nupkg");
+    build(&spec, &out).unwrap();
+
+    let raw = String::from_utf8(read_entries(&out)["hello.nuspec"].clone()).unwrap();
+    for absent in [
+        "<requireLicenseAcceptance",
+        "<licenseUrl",
+        "<projectSourceUrl",
+        "<packageSourceUrl",
+        "<releaseNotes",
+        "<copyright",
+        "<tags",
+        // license is None, so no <license…> at all (guards the
+        // <license>/<licenseUrl> prefix collision: neither is present).
+        "<license",
+    ] {
+        assert!(!raw.contains(absent), "must omit {absent}: {raw}");
+    }
+}
+
+#[test]
+fn nuspec_emits_metadata_in_canonical_order() {
+    let spec = embedded_spec(&tmp("payload-order"));
+    let out = tmp("order.nupkg");
+    build(&spec, &out).unwrap();
+
+    let raw = String::from_utf8(read_entries(&out)["hello.nuspec"].clone()).unwrap();
+    // Every element the fully-populated base_spec emits, in canonical order.
+    // "<license " (trailing space) distinguishes it from "<licenseUrl>".
+    let order = [
+        "<id>",
+        "<version>",
+        "<title>",
+        "<authors>",
+        "<license ",
+        "<licenseUrl>",
+        "<projectUrl>",
+        "<projectSourceUrl>",
+        "<packageSourceUrl>",
+        "<requireLicenseAcceptance>",
+        "<description>",
+        "<releaseNotes>",
+        "<copyright>",
+        "<tags>",
+    ];
+    let mut last = 0;
+    for tag in order {
+        let at = raw
+            .find(tag)
+            .unwrap_or_else(|| panic!("missing {tag}: {raw}"));
+        assert!(
+            at >= last,
+            "tag {tag} at {at} is out of canonical order (previous ended at {last}): {raw}"
+        );
+        last = at;
+    }
 }
 
 #[test]
