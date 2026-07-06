@@ -31,6 +31,11 @@ pub struct Package {
     pub description: String,
     pub homepage: Option<String>,
     pub license: Option<String>,
+    pub copyright: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub icon: Option<PathBuf>,
+    #[serde(default)]
+    pub require_license_acceptance: bool,
 }
 
 /// A payload file: `src` is resolved relative to the config file's directory,
@@ -94,6 +99,11 @@ pub struct NupkgSection {
     pub files: Vec<FileEntry>,
     pub url: Option<String>,
     pub checksum: Option<String>,
+    pub project_source_url: Option<String>,
+    pub package_source_url: Option<String>,
+    pub release_notes: Option<String>,
+    pub icon_url: Option<String>,
+    pub license_url: Option<String>,
 }
 
 /// Windows setup.exe selects the embedded stub by arch; only 64-bit targets
@@ -221,6 +231,16 @@ impl Config {
                 p.identifier
             );
         }
+        // Tags are space-joined into the nuspec <tags> element, so whitespace
+        // inside one tag would silently split it.
+        for tag in p.tags.iter().flatten() {
+            if tag.is_empty() || tag.chars().any(char::is_whitespace) {
+                bail!(
+                    "package.tags entries must be non-empty and contain no whitespace (got {:?})",
+                    tag
+                );
+            }
+        }
         if let Some(nupkg) = &self.nupkg {
             match nupkg.style {
                 NupkgStyle::Download if nupkg.url.is_none() || nupkg.checksum.is_none() => {
@@ -230,6 +250,12 @@ impl Config {
                     bail!("nupkg: url/checksum are only valid with style \"download\"");
                 }
                 _ => {}
+            }
+            if p.require_license_acceptance && nupkg.license_url.is_none() {
+                bail!(
+                    "package.require-license-acceptance = true requires nupkg.license-url \
+                     (Chocolatey rejects the package otherwise)"
+                );
             }
         }
         if let Some(setup) = &self.setup {
@@ -354,6 +380,80 @@ mod tests {
         assert_eq!(setup.components[0].id, "docs");
         assert!(setup.components[0].default);
         assert_eq!(setup.components[0].files[0].dest, "readme.txt");
+    }
+
+    /// Splice extra keys into the fixture's `[package]` table (after
+    /// `license`) and its `[nupkg]` table (after `style`).
+    fn with_metadata(package_keys: &str, nupkg_keys: &str) -> String {
+        fixture_toml()
+            .replace(
+                "license = \"MIT\"",
+                &format!("license = \"MIT\"\n{package_keys}"),
+            )
+            .replace(
+                "style = \"embedded\"",
+                &format!("style = \"embedded\"\n{nupkg_keys}"),
+            )
+    }
+
+    #[test]
+    fn new_metadata_keys_parse() {
+        let config = parse(&with_metadata(
+            "copyright = \"© 2026 Carlos Hernandez\"\n\
+             tags = [\"cli\", \"demo\"]\n\
+             icon = \"icon.png\"\n\
+             require-license-acceptance = true",
+            "project-source-url = \"https://github.com/hurricanehrndz/embala\"\n\
+             package-source-url = \"https://github.com/hurricanehrndz/embala-packages\"\n\
+             release-notes = \"First release.\"\n\
+             icon-url = \"https://example.com/icon.png\"\n\
+             license-url = \"https://example.com/LICENSE\"",
+        ))
+        .expect("new metadata keys must parse");
+        let p = &config.package;
+        assert_eq!(p.copyright.as_deref(), Some("© 2026 Carlos Hernandez"));
+        assert_eq!(
+            p.tags.as_deref(),
+            Some(&["cli".to_string(), "demo".to_string()][..])
+        );
+        assert_eq!(p.icon.as_deref(), Some(Path::new("icon.png")));
+        assert!(p.require_license_acceptance);
+        let n = config.nupkg.unwrap();
+        assert_eq!(
+            n.project_source_url.as_deref(),
+            Some("https://github.com/hurricanehrndz/embala")
+        );
+        assert_eq!(
+            n.package_source_url.as_deref(),
+            Some("https://github.com/hurricanehrndz/embala-packages")
+        );
+        assert_eq!(n.release_notes.as_deref(), Some("First release."));
+        assert_eq!(n.icon_url.as_deref(), Some("https://example.com/icon.png"));
+        assert_eq!(
+            n.license_url.as_deref(),
+            Some("https://example.com/LICENSE")
+        );
+    }
+
+    #[test]
+    fn require_license_acceptance_needs_a_license_url() {
+        let err = parse(&with_metadata("require-license-acceptance = true", ""))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires nupkg.license-url"), "{err}");
+        parse(&with_metadata(
+            "require-license-acceptance = true",
+            "license-url = \"https://example.com/LICENSE\"",
+        ))
+        .expect("license-url satisfies the coupling rule");
+    }
+
+    #[test]
+    fn whitespace_in_a_tag_is_rejected() {
+        let err = parse(&with_metadata("tags = [\"cli tool\"]", ""))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no whitespace"), "{err}");
     }
 
     #[test]

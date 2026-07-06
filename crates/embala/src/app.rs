@@ -115,6 +115,10 @@ mod tests {
             description: "Embala end-to-end test fixture".to_string(),
             homepage: None,
             license: None,
+            copyright: None,
+            tags: None,
+            icon: None,
+            require_license_acceptance: false,
         }
     }
 
