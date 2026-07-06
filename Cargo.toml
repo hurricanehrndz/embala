@@ -5,6 +5,8 @@ members = [
     "crates/embala-msi",
     "crates/embala-nupkg",
     "crates/embala-pkg",
+    "crates/embala-setup",
+    "crates/embala-setup-runtime",
 ]
 
 [workspace.package]

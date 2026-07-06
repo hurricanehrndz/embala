@@ -1,0 +1,11 @@
+[package]
+name = "embala-setup"
+description = "Windows setup.exe builder — appends a payload overlay onto a prebuilt runtime stub, no compile"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

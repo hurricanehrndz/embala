@@ -12,3 +12,10 @@ inputs:
     inputs:
       nixpkgs:
         follows: nixpkgs
+  # Backs `languages.rust.channel = "stable"`, whose toolchain can add the
+  # windows-gnu cross targets the setup.exe stub build (`just stubs`) needs.
+  rust-overlay:
+    url: github:oxalica/rust-overlay
+    inputs:
+      nixpkgs:
+        follows: nixpkgs

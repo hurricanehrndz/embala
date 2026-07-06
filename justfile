@@ -22,6 +22,19 @@ fixtures:
     x86_64-w64-mingw32-cc -DVERSION='"0.1.0"' -o fixtures/hello/dist/hello.exe fixtures/hello/hello.c
     x86_64-w64-mingw32-cc -DVERSION='"0.2.0"' -o fixtures/hello/dist/hello-0.2.0.exe fixtures/hello/hello.c
 
+# Cross-compile the setup.exe runtime stub for both Windows arches via zig and
+# stage the committed artifacts embala-setup include_bytes!-embeds. Dev-shell
+# only (needs zig + cargo-zigbuild) — `embala build` never compiles.
+stubs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for target in x86_64-pc-windows-gnu aarch64-pc-windows-gnullvm; do
+        cargo zigbuild -p embala-setup-runtime --release --target "$target"
+        dest="crates/embala-setup/stubs/$target"
+        mkdir -p "$dest"
+        cp "target/$target/release/setup-stub.exe" "$dest/setup-stub.exe"
+    done
+
 # Differential oracle: build the same install with wixl and with embala,
 # export every table from both, and diff table-by-table. Inspection tool —
 # differences are reported, not fatal. Ids/GUIDs/short-names may differ;

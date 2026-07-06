@@ -1,0 +1,23 @@
+[package]
+name = "embala-setup-runtime"
+description = "Win32 self-extractor stub cross-compiled once and embedded into embala-setup"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "setup-stub"
+path = "src/main.rs"
+
+[dependencies]
+# Vendored PUC Lua 5.4 host. A normal (not Windows-gated) dep so the C also
+# compiles on this Linux host — proving the vendored build before zig ever runs.
+mlua = { version = "0.12", features = ["lua54", "vendored"] }
+
+[target.'cfg(windows)'.dependencies]
+# Win32 GUI/console surface; Windows-only so `cargo build --workspace` still
+# links on Linux. `kernel` gives AttachConsole, `user` gives MessageBox.
+winsafe = { version = "0.0.28", features = ["kernel", "user"] }

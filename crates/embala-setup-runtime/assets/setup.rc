@@ -1,0 +1,5 @@
+// Installer resources for the setup.exe stub.
+// Type 24 (RT_MANIFEST) at id 1 (CREATEPROCESS_MANIFEST_RESOURCE_ID) is the
+// application manifest; the lowest-id ICON is what Explorer shows on the file.
+1 ICON "setup.ico"
+1 24 "setup.manifest"
