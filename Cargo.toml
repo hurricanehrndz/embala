@@ -6,6 +6,7 @@ members = [
     "crates/embala-nupkg",
     "crates/embala-pkg",
     "crates/embala-setup",
+    "crates/embala-setup-overlay",
     "crates/embala-setup-runtime",
 ]
 

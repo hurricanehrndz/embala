@@ -538,6 +538,7 @@ dependencies = [
  "embala-msi",
  "embala-nupkg",
  "embala-pkg",
+ "embala-setup",
  "image",
  "plist",
  "serde",
@@ -586,13 +587,25 @@ dependencies = [
 [[package]]
 name = "embala-setup"
 version = "0.0.1"
+dependencies = [
+ "embala-setup-overlay",
+ "tempfile",
+ "thiserror 2.0.18",
+ "zip",
+]
+
+[[package]]
+name = "embala-setup-overlay"
+version = "0.0.1"
 
 [[package]]
 name = "embala-setup-runtime"
 version = "0.0.1"
 dependencies = [
+ "embala-setup-overlay",
  "mlua",
  "winsafe",
+ "zip",
 ]
 
 [[package]]

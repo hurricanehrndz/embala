@@ -1,0 +1,11 @@
+[package]
+name = "embala-setup-overlay"
+description = "Shared PE-overlay trailer format for embala's setup.exe writer and runtime stub"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]

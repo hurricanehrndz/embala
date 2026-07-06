@@ -9,3 +9,11 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Shared PE-overlay trailer format (the runtime's counterpart).
+embala-setup-overlay = { version = "0.0.1", path = "../embala-setup-overlay" }
+thiserror = "2.0.18"
+# Deterministic payload zip, mirroring embala-nupkg's option style.
+zip = "8"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,4 +1,4 @@
-# Test fixture: one config exercising all four v1 formats.
+# Test fixture: one config exercising all five v1 formats.
 # Payload `src` paths are relative to this file; `just fixtures` builds
 # dist/hello.exe (mingw cross) — hello.sh is the macOS executable stand-in.
 
@@ -28,4 +28,8 @@ files = [{ src = "hello.sh", dest = "bin/embala-hello" }]
 
 [nupkg]
 style = "embedded"
+files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
+
+[setup]
+arch = "x86_64"
 files = [{ src = "dist/hello.exe", dest = "hello.exe" }]

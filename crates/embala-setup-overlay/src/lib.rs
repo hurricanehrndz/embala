@@ -15,15 +15,12 @@
 //!               stub, payload.zip, install.lua, uninstall.lua, manifest
 //! ```
 //!
-//! Phase 1 only *reads* this; the writer lives in Phase 2. It is kept as a
-//! self-contained module (no external deps) so Phase 2 can promote it verbatim
-//! to a shared `embala-setup-overlay` crate that both the writer and this
-//! runtime depend on — avoiding the circular dependency that would arise if the
-//! runtime depended on `embala-setup` (which `include_bytes!`s this stub).
-
-// Read on the Windows install path and exercised by the tests below; a plain
-// build on this Linux host sees the parser/serializer as unused.
-#![allow(dead_code)]
+//! This is the single source of truth shared by both sides of the overlay: the
+//! package-time writer (`embala-setup`, which [`Trailer::to_bytes`]) and the
+//! install-time runtime (`embala-setup-runtime`, which [`Trailer::parse`]). It
+//! is its own crate — with no dependency on the stubs — so the two never form a
+//! cycle (the runtime cannot depend on `embala-setup`, which `include_bytes!`s
+//! the runtime).
 
 /// Trailer magic: "EMBALA SetUp".
 pub const MAGIC: [u8; 8] = *b"EMBALASU";
@@ -103,7 +100,7 @@ impl Trailer {
         })
     }
 
-    /// Serialize to the fixed-size on-disk form. Phase 2's writer uses this.
+    /// Serialize to the fixed-size on-disk form. The writer appends this.
     pub fn to_bytes(self) -> [u8; TRAILER_LEN] {
         let mut out = [0u8; TRAILER_LEN];
         out[0..8].copy_from_slice(&MAGIC);

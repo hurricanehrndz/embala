@@ -17,6 +17,7 @@ pub struct Config {
     pub app: Option<AppSection>,
     pub pkg: Option<PkgSection>,
     pub nupkg: Option<NupkgSection>,
+    pub setup: Option<SetupSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +96,89 @@ pub struct NupkgSection {
     pub checksum: Option<String>,
 }
 
+/// Windows setup.exe selects the embedded stub by arch; only 64-bit targets
+/// exist (unknown variants are rejected at parse time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum SetupArch {
+    #[serde(rename = "x86_64")]
+    X86_64,
+    #[serde(rename = "aarch64")]
+    Aarch64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum InstallMode {
+    #[default]
+    PerUser,
+    PerMachine,
+    UserChoice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShortcutLocation {
+    #[default]
+    StartMenu,
+    Desktop,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Component {
+    pub id: String,
+    pub label: String,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub default: bool,
+    #[serde(default)]
+    pub files: Vec<FileEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Shortcut {
+    pub name: String,
+    /// Dest (relative to install dir) the shortcut targets.
+    pub target: String,
+    pub args: Option<String>,
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub location: ShortcutLocation,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct SetupSection {
+    pub arch: SetupArch,
+    pub files: Vec<FileEntry>,
+    /// Dest of the shortcut target + ARP DisplayIcon, relative to install dir.
+    pub main_executable: Option<String>,
+    #[serde(default)]
+    pub install_mode: InstallMode,
+    /// Path (relative to the config dir) to a license text file.
+    pub license: Option<PathBuf>,
+    #[serde(default)]
+    pub components: Vec<Component>,
+    #[serde(default)]
+    pub shortcuts: Vec<Shortcut>,
+    /// Escape-hatch path to a raw `install.lua` (relative to the config dir).
+    pub script: Option<PathBuf>,
+    pub uninstall_script: Option<PathBuf>,
+}
+
+impl SetupSection {
+    /// Every dest a completed install would carry (top-level + component files).
+    /// Used to check shortcut/main-executable targets resolve (spec R20).
+    fn installed_dests(&self) -> Vec<&str> {
+        self.files
+            .iter()
+            .chain(self.components.iter().flat_map(|c| c.files.iter()))
+            .map(|f| f.dest.as_str())
+            .collect()
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -148,8 +232,84 @@ impl Config {
                 _ => {}
             }
         }
+        if let Some(setup) = &self.setup {
+            validate_setup(setup)?;
+        }
         Ok(())
     }
+}
+
+/// Structural `[setup]` validation (spec R20), no filesystem access. The `src`-
+/// existence and `license`-path checks need the config-dir base and so live in
+/// `build_setup` (`main.rs`), which resolves it.
+fn validate_setup(setup: &SetupSection) -> Result<()> {
+    // A raw script owns install behavior; the declarative sugar it would
+    // conflict with must not also be present (surface it, don't silently drop).
+    if setup.script.is_some()
+        && (!setup.components.is_empty()
+            || !setup.shortcuts.is_empty()
+            || setup.main_executable.is_some())
+    {
+        bail!(
+            "setup: `script` cannot be combined with `components`, `shortcuts`, or \
+             `main-executable` — the raw script owns that behavior"
+        );
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for component in &setup.components {
+        if !ids.insert(component.id.as_str()) {
+            bail!("setup: duplicate component id {:?}", component.id);
+        }
+    }
+    let dests = setup.installed_dests();
+    if let Some(main) = &setup.main_executable {
+        if !dests.contains(&main.as_str()) {
+            bail!(
+                "setup: main-executable {:?} is not among the installed file dests",
+                main
+            );
+        }
+    }
+    for shortcut in &setup.shortcuts {
+        if !dests.contains(&shortcut.target.as_str()) {
+            bail!(
+                "setup: shortcut {:?} target {:?} is not among the installed file dests",
+                shortcut.name,
+                shortcut.target
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Filesystem `[setup]` validation (spec R20): every `src` and the optional
+/// `license`/`script` paths must exist, resolved relative to `base` (the config
+/// file's directory). Called from `build_setup`, which knows `base`.
+pub fn validate_setup_paths(setup: &SetupSection, base: &Path) -> Result<()> {
+    let srcs = setup
+        .files
+        .iter()
+        .chain(setup.components.iter().flat_map(|c| c.files.iter()))
+        .map(|f| &f.src);
+    for src in srcs {
+        let resolved = base.join(src);
+        if !resolved.exists() {
+            bail!("setup: payload src {} does not exist", resolved.display());
+        }
+    }
+    for (field, path) in [
+        ("license", &setup.license),
+        ("script", &setup.script),
+        ("uninstall-script", &setup.uninstall_script),
+    ] {
+        if let Some(path) = path {
+            let resolved = base.join(path);
+            if !resolved.exists() {
+                bail!("setup: {field} path {} does not exist", resolved.display());
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -179,7 +339,12 @@ mod tests {
         assert!(config.app.is_some());
         assert!(config.pkg.is_some());
         assert!(config.nupkg.is_some());
+        assert!(config.setup.is_some());
         assert_eq!(config.msi.unwrap().arch, MsiArch::X86_64);
+        let setup = config.setup.unwrap();
+        assert_eq!(setup.arch, SetupArch::X86_64);
+        // install-mode defaults to per-user when omitted (spec R18).
+        assert_eq!(setup.install_mode, InstallMode::PerUser);
     }
 
     #[test]
@@ -209,5 +374,76 @@ mod tests {
             err.contains("requires both url and checksum"),
             "unexpected error: {err}"
         );
+    }
+
+    /// A `[setup]` block with the full R18 surface for the validation tests.
+    const SETUP_FULL: &str = r#"
+[setup]
+arch = "x86_64"
+main-executable = "hello.exe"
+install-mode = "user-choice"
+files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
+components = [{ id = "core", label = "Core", default = true, files = [{ src = "dist/hello.exe", dest = "extra.exe" }] }]
+shortcuts = [{ name = "Hello", target = "hello.exe", location = "desktop" }]
+"#;
+
+    fn with_setup(block: &str) -> String {
+        // Drop the fixture's own [setup] section, then append the test block.
+        let base = fixture_toml();
+        let cut = base.find("\n[setup]").unwrap_or(base.len());
+        format!("{}{}", &base[..cut], block)
+    }
+
+    #[test]
+    fn full_setup_section_parses() {
+        let config = parse(&with_setup(SETUP_FULL)).expect("full setup section must be valid");
+        let setup = config.setup.unwrap();
+        assert_eq!(setup.install_mode, InstallMode::UserChoice);
+        assert_eq!(setup.components.len(), 1);
+        assert_eq!(setup.shortcuts[0].location, ShortcutLocation::Desktop);
+    }
+
+    #[test]
+    fn unknown_setup_arch_is_rejected() {
+        let text = with_setup(SETUP_FULL).replace("arch = \"x86_64\"", "arch = \"x86\"");
+        assert!(parse(&text).is_err());
+    }
+
+    #[test]
+    fn main_executable_not_in_dests_is_rejected() {
+        let text = with_setup(SETUP_FULL).replace(
+            "main-executable = \"hello.exe\"",
+            "main-executable = \"nope.exe\"",
+        );
+        let err = parse(&text).unwrap_err().to_string();
+        assert!(err.contains("not among the installed file dests"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_component_ids_are_rejected() {
+        let block = r#"
+[setup]
+arch = "x86_64"
+files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
+components = [
+  { id = "core", label = "A" },
+  { id = "core", label = "B" },
+]
+"#;
+        let err = parse(&with_setup(block)).unwrap_err().to_string();
+        assert!(err.contains("duplicate component id"), "{err}");
+    }
+
+    #[test]
+    fn script_with_sugar_is_rejected() {
+        let block = r#"
+[setup]
+arch = "x86_64"
+script = "install.lua"
+files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
+shortcuts = [{ name = "Hello", target = "hello.exe" }]
+"#;
+        let err = parse(&with_setup(block)).unwrap_err().to_string();
+        assert!(err.contains("cannot be combined with"), "{err}");
     }
 }

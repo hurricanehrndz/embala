@@ -39,6 +39,7 @@ enum Format {
     App,
     Pkg,
     Nupkg,
+    Setup,
 }
 
 impl fmt::Display for Format {
@@ -48,6 +49,7 @@ impl fmt::Display for Format {
             Format::App => "app",
             Format::Pkg => "pkg",
             Format::Nupkg => "nupkg",
+            Format::Setup => "setup",
         })
     }
 }
@@ -72,6 +74,7 @@ fn build(config_path: &Path, formats: &[Format], out_dir: &Path) -> Result<()> {
             (Format::App, config.app.is_some()),
             (Format::Pkg, config.pkg.is_some()),
             (Format::Nupkg, config.nupkg.is_some()),
+            (Format::Setup, config.setup.is_some()),
         ];
         let present: Vec<Format> = configured
             .iter()
@@ -80,7 +83,7 @@ fn build(config_path: &Path, formats: &[Format], out_dir: &Path) -> Result<()> {
             .collect();
         if present.is_empty() {
             bail!(
-                "no format sections ([msi], [app], [pkg], [nupkg]) in {}",
+                "no format sections ([msi], [app], [pkg], [nupkg], [setup]) in {}",
                 config_path.display()
             );
         }
@@ -95,6 +98,7 @@ fn build(config_path: &Path, formats: &[Format], out_dir: &Path) -> Result<()> {
             Format::App => config.app.is_some(),
             Format::Pkg => config.pkg.is_some(),
             Format::Nupkg => config.nupkg.is_some(),
+            Format::Setup => config.setup.is_some(),
         };
         if !section_present {
             bail!(
@@ -113,6 +117,7 @@ fn build_format(format: Format, config: &Config, config_path: &Path, out_dir: &P
         Format::App => build_app(config, config_path, out_dir),
         Format::Pkg => build_pkg(config, config_path, out_dir),
         Format::Nupkg => build_nupkg(config, config_path, out_dir),
+        Format::Setup => build_setup(config, config_path, out_dir),
     }
 }
 
@@ -246,5 +251,42 @@ fn build_msi(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> 
     std::fs::create_dir_all(out_dir)?;
     embala_msi::build(&spec, &out)?;
     println!("msi: wrote {}", out.display());
+    Ok(())
+}
+
+fn build_setup(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> {
+    let section = config
+        .setup
+        .as_ref()
+        .expect("caller checked [setup] presence");
+    // FileEntry.src and license/script paths are relative to the config dir.
+    let base = config_path.parent().unwrap_or(Path::new("."));
+    config::validate_setup_paths(section, base)?;
+    let package = &config.package;
+    let spec = embala_setup::SetupSpec {
+        arch: match section.arch {
+            config::SetupArch::X86_64 => embala_setup::SetupArch::X86_64,
+            config::SetupArch::Aarch64 => embala_setup::SetupArch::Aarch64,
+        },
+        // Phase 2 ships top-level files only; component files are lowered in
+        // Phase 4 (their src existence is already validated above).
+        files: section
+            .files
+            .iter()
+            .map(|f| embala_setup::FileSpec {
+                src: base.join(&f.src),
+                dest: f.dest.clone(),
+            })
+            .collect(),
+    };
+    let out = out_dir.join(format!(
+        "{}-{}-{}-setup.exe",
+        package.name,
+        package.version,
+        spec.arch.as_str()
+    ));
+    std::fs::create_dir_all(out_dir)?;
+    embala_setup::build(&spec, &out)?;
+    println!("setup: wrote {}", out.display());
     Ok(())
 }
