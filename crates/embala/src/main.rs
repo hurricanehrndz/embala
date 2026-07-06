@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod lower;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -263,15 +264,40 @@ fn build_setup(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()
     let base = config_path.parent().unwrap_or(Path::new("."));
     config::validate_setup_paths(section, base)?;
     let package = &config.package;
-    // Phase 3 ships a hand-written script via the `script`/`uninstall-script`
-    // escape hatch; TOML → install.lua lowering is Phase 4. Read the bytes here
-    // (verbatim, spec R7); absence ships the runtime's placeholder.
+    // Two front-ends, one substrate (spec R19): a raw `script` ships verbatim
+    // (spec R7); otherwise the declarative `[setup]` is lowered to a generated
+    // install.lua. `uninstall-script` ships verbatim on either path.
     let read_script = |path: &Option<PathBuf>| -> Result<Option<Vec<u8>>> {
         path.as_ref()
             .map(|p| std::fs::read(base.join(p)))
             .transpose()
             .map_err(Into::into)
     };
+    let install_lua = match &section.script {
+        Some(script) => Some(std::fs::read(base.join(script))?),
+        None => {
+            // Embed the license text (config-dir-relative) read at build time so
+            // the generated script is self-contained (spec R7).
+            let license_text = section
+                .license
+                .as_ref()
+                .map(|p| std::fs::read_to_string(base.join(p)))
+                .transpose()?;
+            Some(lower::lower(package, section, license_text.as_deref()).into_bytes())
+        }
+    };
+    // Ship top-level AND component payload files (Phase 2/3 shipped top-level
+    // only); the declarative path installs components under a selected() gate.
+    // Duplicate-dest collisions error in the writer.
+    let files = section
+        .files
+        .iter()
+        .chain(section.components.iter().flat_map(|c| c.files.iter()))
+        .map(|f| embala_setup::FileSpec {
+            src: base.join(&f.src),
+            dest: f.dest.clone(),
+        })
+        .collect();
     let spec = embala_setup::SetupSpec {
         arch: match section.arch {
             config::SetupArch::X86_64 => embala_setup::SetupArch::X86_64,
@@ -292,17 +318,8 @@ fn build_setup(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()
             homepage: package.homepage.clone(),
             license: package.license.clone(),
         },
-        // Phase 3 ships top-level files only; component files are lowered in
-        // Phase 4 (their src existence is already validated above).
-        files: section
-            .files
-            .iter()
-            .map(|f| embala_setup::FileSpec {
-                src: base.join(&f.src),
-                dest: f.dest.clone(),
-            })
-            .collect(),
-        install_lua: read_script(&section.script)?,
+        files,
+        install_lua,
         uninstall_lua: read_script(&section.uninstall_script)?,
     };
     let out = out_dir.join(format!(

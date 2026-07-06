@@ -21,8 +21,10 @@ mod exec;
 mod fs;
 mod registry;
 mod shortcut;
+mod ui;
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -32,6 +34,8 @@ use embala_setup_overlay::Manifest;
 
 use crate::log::{self, Record, Reversal};
 use crate::mode::ResolvedMode;
+
+use ui::Page;
 
 /// Shared, mutable install state threaded through every mutating API call.
 pub struct Engine {
@@ -48,9 +52,21 @@ pub struct Engine {
     log_path: PathBuf,
     /// Buffered `log` lines for the future progress page (spec R11).
     progress: Vec<String>,
+    /// Pages registered by `embala.ui.page{...}`, in call order. Stored for the
+    /// Phase-5 renderer; this headless phase resolves each page's effect eagerly.
+    pages: Vec<Page>,
+    /// `/D=` was given → the directory page cannot re-point install_dir (CLI wins).
+    dir_locked: bool,
+    /// `/components=` ids, when the flag was given (else `None` → use defaults).
+    cli_components: Option<Vec<String>>,
+    /// Every component id declared by the components page (validates `selected`).
+    component_ids: BTreeSet<String>,
+    /// The resolved selected component ids (`ui.selected(id)` reads this).
+    selected_components: BTreeSet<String>,
 }
 
 impl Engine {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         manifest: Manifest,
         mode: ResolvedMode,
@@ -58,6 +74,8 @@ impl Engine {
         install_dir: PathBuf,
         payload_dir: PathBuf,
         attached: bool,
+        dir_locked: bool,
+        cli_components: Option<Vec<String>>,
     ) -> Engine {
         let log_path = install_dir.join("install.log");
         Engine {
@@ -70,6 +88,11 @@ impl Engine {
             records: Vec::new(),
             log_path,
             progress: Vec::new(),
+            pages: Vec::new(),
+            dir_locked,
+            cli_components,
+            component_ids: BTreeSet::new(),
+            selected_components: BTreeSet::new(),
         }
     }
 
@@ -166,6 +189,7 @@ pub fn register(lua: &Lua, engine: &Rc<RefCell<Engine>>) -> mlua::Result<()> {
     embala.set("env", registry::env_table(lua, engine)?)?;
     embala.set("exec", exec::exec_fn(lua)?)?;
     embala.set("download", exec::download_fn(lua, engine)?)?;
+    embala.set("ui", ui::table(lua, engine)?)?;
 
     lua.globals().set("embala", embala)?;
     Ok(())

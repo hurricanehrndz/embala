@@ -86,6 +86,10 @@ fn do_install(
 
     let install_lua = read_section(exe, trailer.install_lua).map_err(|e| e.to_string())?;
 
+    // `/D=` locks the directory (the directory page cannot re-point it, spec
+    // R16); `/components=` (when given) picks the component set, else defaults.
+    let dir_locked = args.dir.is_some();
+    let cli_components = (!args.components.is_empty()).then(|| args.components.clone());
     let engine = Rc::new(RefCell::new(Engine::new(
         manifest.clone(),
         resolved,
@@ -93,6 +97,8 @@ fn do_install(
         install_dir.clone(),
         payload_dir.clone(),
         attached,
+        dir_locked,
+        cli_components,
     )));
 
     let result = host::run_script(&engine, &install_lua);

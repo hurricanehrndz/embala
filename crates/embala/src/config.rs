@@ -345,6 +345,15 @@ mod tests {
         assert_eq!(setup.arch, SetupArch::X86_64);
         // install-mode defaults to per-user when omitted (spec R18).
         assert_eq!(setup.install_mode, InstallMode::PerUser);
+        // The fixture drives the declarative (lowered) path, not the raw-script
+        // escape hatch: main-executable + license + a component, no `script`.
+        assert_eq!(setup.main_executable.as_deref(), Some("hello.exe"));
+        assert_eq!(setup.license.as_deref(), Some(Path::new("license.txt")));
+        assert!(setup.script.is_none());
+        assert_eq!(setup.components.len(), 1);
+        assert_eq!(setup.components[0].id, "docs");
+        assert!(setup.components[0].default);
+        assert_eq!(setup.components[0].files[0].dest, "readme.txt");
     }
 
     #[test]

@@ -1,0 +1,4 @@
+Embala Hello — Test Fixture License
+
+Permission is granted to poke at this fixture for testing purposes.
+Provided "as is", without warranty of any kind.

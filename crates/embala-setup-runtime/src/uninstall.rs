@@ -96,6 +96,8 @@ fn run_uninstall_script(dir: &Path, script_path: &Path, attached: bool) -> Resul
 
     let script = std::fs::read(script_path).map_err(|e| e.to_string())?;
     // No payload at uninstall time; install_dir == the uninstaller's own dir.
+    // Uninstall runs no wizard pages: lock the dir (no re-point) and pass no
+    // component selection; the ui table is still registered for API parity.
     let engine = Rc::new(RefCell::new(Engine::new(
         manifest.clone(),
         resolved,
@@ -103,6 +105,8 @@ fn run_uninstall_script(dir: &Path, script_path: &Path, attached: bool) -> Resul
         dir.to_path_buf(),
         dir.to_path_buf(),
         attached,
+        true,
+        None,
     )));
     host::run_script(&engine, &script)
 }

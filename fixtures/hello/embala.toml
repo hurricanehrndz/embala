@@ -31,10 +31,12 @@ style = "embedded"
 files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
 
 [setup]
+# Declarative sugar: embala lowers this to a generated install.lua over the
+# embala.* API (spec R19). The raw-script escape hatch lives in embala-script.toml.
 arch = "x86_64"
-# Phase 3 drives a hand-written install.lua via the `script` escape hatch (R7).
-# R20 forbids combining `script` with the main-executable/components/shortcuts
-# sugar the raw script would own, so this fixture stays files + script only.
+main-executable = "hello.exe"
+license = "license.txt"
 files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
-script = "install.lua"
-uninstall-script = "uninstall.lua"
+components = [
+  { id = "docs", label = "Documentation", description = "Offline readme", default = true, files = [{ src = "readme.txt", dest = "readme.txt" }] },
+]

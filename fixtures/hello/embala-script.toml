@@ -1,0 +1,19 @@
+# Raw-script variant of the hello fixture: the [setup].script escape hatch ships
+# the hand-written install.lua/uninstall.lua verbatim (spec R7/R19), bypassing
+# the TOML → install.lua lowering the sibling embala.toml exercises.
+
+[package]
+name = "hello"
+display-name = "Embala Hello"
+version = "0.1.0"
+identifier = "ca.hrndz.embala.hello"
+publisher = "Carlos Hernandez"
+description = "Embala end-to-end test fixture"
+homepage = "https://github.com/hurricanehrndz/embala"
+license = "MIT"
+
+[setup]
+arch = "x86_64"
+files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
+script = "install.lua"
+uninstall-script = "uninstall.lua"
