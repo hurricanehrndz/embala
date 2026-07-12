@@ -70,8 +70,12 @@ Uses [devenv](https://devenv.sh) + direnv:
 
 ```sh
 direnv allow   # or: devenv shell
+just stubs     # once per fresh clone: cross-compiles the setup.exe stubs
 cargo check
 ```
+
+The Windows `setup.exe` runtime stubs are build products, not committed. A fresh
+clone must run `just stubs` (dev shell) once before `cargo build` / `just test`.
 
 `msitools` (wixl, msiinfo) is included in the dev shell as the differential-testing
 oracle for MSI table output.

@@ -7,6 +7,9 @@
 # Fixture build products (`just fixtures`)
 /fixtures/hello/dist
 
+# Setup stub build products (`just stubs`)
+/crates/embala-setup/stubs/
+
 # Devenv
 .devenv*
 devenv.local.nix
