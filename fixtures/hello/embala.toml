@@ -1,6 +1,8 @@
 # Test fixture: one config exercising all five v1 formats.
 # Payload `src` paths are relative to this file; `just fixtures` builds
-# dist/hello.exe (mingw cross) — hello.sh is the macOS executable stand-in.
+# dist/hello.exe (mingw cross) and dist/hello-mac (zig cc, arm64 Mach-O —
+# rcodesign refuses to sign a script-backed .app). hello.sh stays the [pkg]
+# payload (XAR signing is content-agnostic).
 
 [package]
 name = "hello"
@@ -21,7 +23,7 @@ main-executable = "hello.exe"
 files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
 
 [app]
-executable = "hello.sh"
+executable = "dist/hello-mac"
 
 [pkg]
 install-location = "/usr/local"
@@ -47,3 +49,14 @@ files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
 components = [
   { id = "docs", label = "Documentation", description = "Offline readme", default = true, files = [{ src = "readme.txt", dest = "readme.txt" }] },
 ]
+
+# User-supplied signing commands (spec R5/R6). Kept commented so the fixture
+# stays unsigned and byte-reproducible for the deterministic build/msi-diff
+# tests. `$f` = the artifact's absolute path; embala only shells out.
+# [sign.windows]
+# osslsigncode refuses in==out, so sign to a sidecar and move it back:
+# command = "osslsigncode sign -pkcs12 certs/test-win.pfx -readpass certs/pw.txt -in $f -out $f.signed && mv $f.signed $f"
+# signed-stub = "signed-stub.exe"   # optional, pre-signed uninstall stub
+#
+# [sign.macos]
+# command = "rcodesign sign --p12-file certs/test-mac.p12 $f"

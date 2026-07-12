@@ -539,6 +539,7 @@ dependencies = [
  "embala-nupkg",
  "embala-pkg",
  "embala-setup",
+ "embala-setup-overlay",
  "image",
  "plist",
  "serde",

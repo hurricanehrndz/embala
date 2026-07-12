@@ -10,6 +10,9 @@
 # Setup stub build products (`just stubs`)
 /crates/embala-setup/stubs/
 
+# Test signing certs (`just test-cert-win` / `test-cert-mac`) — generated, secret
+/fixtures/certs/
+
 # Devenv
 .devenv*
 devenv.local.nix

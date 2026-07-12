@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod lower;
+mod sign;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -146,6 +147,10 @@ fn build_app(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> 
     let base = config_path.parent().unwrap_or(Path::new("."));
     let out = app::build(&config.package, section, base, out_dir)?;
     println!("app: wrote {}", out.display());
+    if let Some(macos) = macos_sign(config) {
+        // `$f` is the `.app` directory path (spec R6).
+        sign::run(&macos.command, &out)?;
+    }
     Ok(())
 }
 
@@ -174,6 +179,9 @@ fn build_pkg(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> 
     std::fs::create_dir_all(out_dir)?;
     embala_pkg::build(&spec, &out)?;
     println!("pkg: wrote {}", out.display());
+    if let Some(macos) = macos_sign(config) {
+        sign::run(&macos.command, &out)?;
+    }
     Ok(())
 }
 
@@ -279,7 +287,49 @@ fn build_msi(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> 
     std::fs::create_dir_all(out_dir)?;
     embala_msi::build(&spec, &out)?;
     println!("msi: wrote {}", out.display());
+    if let Some(windows) = windows_sign(config) {
+        sign::run(&windows.command, &out)?;
+    }
     Ok(())
+}
+
+/// `[sign.windows]` if configured — the guard that keeps unsigned builds on the
+/// exact Phase-2 code path (spec R7).
+fn windows_sign(config: &Config) -> Option<&config::WindowsSign> {
+    config.sign.as_ref().and_then(|s| s.windows.as_ref())
+}
+
+/// `[sign.macos]` if configured.
+fn macos_sign(config: &Config) -> Option<&config::MacosSign> {
+    config.sign.as_ref().and_then(|s| s.macos.as_ref())
+}
+
+/// Obtain the (signed) uninstall stub for the setup.exe overlay when
+/// `[sign.windows]` is configured (spec R6): the pre-signed `signed-stub` file
+/// if given, else the embedded stub signed in place via the user's command.
+fn resolve_signed_stub(
+    windows: &config::WindowsSign,
+    arch: embala_setup::SetupArch,
+    base: &Path,
+    out_dir: &Path,
+) -> Result<Vec<u8>> {
+    if let Some(rel) = &windows.signed_stub {
+        let path = base.join(rel);
+        if !path.exists() {
+            bail!(
+                "sign.windows: signed-stub {} does not exist",
+                path.display()
+            );
+        }
+        return Ok(std::fs::read(&path)?);
+    }
+    std::fs::create_dir_all(out_dir)?;
+    let work = out_dir.join(format!(".embala-stub-{}.exe", arch.as_str()));
+    std::fs::write(&work, embala_setup::stub_bytes(arch))?;
+    sign::run(&windows.command, &work)?;
+    let bytes = std::fs::read(&work)?;
+    std::fs::remove_file(&work)?;
+    Ok(bytes)
 }
 
 fn build_setup(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> {
@@ -325,11 +375,19 @@ fn build_setup(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()
             dest: f.dest.clone(),
         })
         .collect();
+    let arch = match section.arch {
+        config::SetupArch::X86_64 => embala_setup::SetupArch::X86_64,
+        config::SetupArch::Aarch64 => embala_setup::SetupArch::Aarch64,
+    };
+    // Resolve the signed uninstall stub BEFORE assembling setup.exe (spec R6);
+    // no `[sign.windows]` ships a None stub — the exact Phase-2 path (spec R7).
+    let windows = windows_sign(config);
+    let signed_stub = match windows {
+        Some(w) => Some(resolve_signed_stub(w, arch, base, out_dir)?),
+        None => None,
+    };
     let spec = embala_setup::SetupSpec {
-        arch: match section.arch {
-            config::SetupArch::X86_64 => embala_setup::SetupArch::X86_64,
-            config::SetupArch::Aarch64 => embala_setup::SetupArch::Aarch64,
-        },
+        arch,
         install_mode: match section.install_mode {
             config::InstallMode::PerUser => embala_setup::InstallMode::PerUser,
             config::InstallMode::PerMachine => embala_setup::InstallMode::PerMachine,
@@ -348,8 +406,7 @@ fn build_setup(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()
         files,
         install_lua,
         uninstall_lua: read_script(&section.uninstall_script)?,
-        // Phase 3 wires the pre-signed uninstall stub; unsigned builds ship none.
-        signed_stub: None,
+        signed_stub,
     };
     let out = out_dir.join(format!(
         "{}-{}-{}-setup.exe",
@@ -360,5 +417,8 @@ fn build_setup(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()
     std::fs::create_dir_all(out_dir)?;
     embala_setup::build(&spec, &out)?;
     println!("setup: wrote {}", out.display());
+    if let Some(w) = windows {
+        sign::run(&w.command, &out)?;
+    }
     Ok(())
 }

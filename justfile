@@ -16,11 +16,13 @@ fmt:
 lint:
     cargo clippy --workspace -- -D warnings
 
-# Cross-compile the fixture Windows test exes (0.2.0 feeds the upgrade test)
+# Cross-compile the fixture test exes: Windows via mingw (0.2.0 feeds the
+# upgrade test), macOS via zig (rcodesign needs a real Mach-O in the .app).
 fixtures:
     mkdir -p fixtures/hello/dist
     x86_64-w64-mingw32-cc -DVERSION='"0.1.0"' -o fixtures/hello/dist/hello.exe fixtures/hello/hello.c
     x86_64-w64-mingw32-cc -DVERSION='"0.2.0"' -o fixtures/hello/dist/hello-0.2.0.exe fixtures/hello/hello.c
+    zig cc -target aarch64-macos -DVERSION='"0.1.0"' -o fixtures/hello/dist/hello-mac fixtures/hello/hello.c
 
 # Cross-compile the setup.exe runtime stub for both Windows arches via zig and
 # stage the committed artifacts embala-setup include_bytes!-embeds. Dev-shell
@@ -34,6 +36,44 @@ stubs:
         mkdir -p "$dest"
         cp "target/$target/release/setup-stub.exe" "$dest/setup-stub.exe"
     done
+
+# Mint a 10-year self-signed code-signing cert for local osslsigncode tests.
+# Outputs fixtures/certs/test-win.pfx (+ .pem public half). PFX password is the
+# fixed literal `embala-test`. Generated, never committed (.gitignore).
+test-cert-win:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p fixtures/certs
+    # CA:FALSE is required: OpenSSL 3.x `req -x509` defaults to CA:TRUE and
+    # Windows Authenticode rejects a CA cert as leaf signer.
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+        -keyout fixtures/certs/test-win.key -out fixtures/certs/test-win.pem \
+        -subj "/CN=Embala Test" \
+        -addext "basicConstraints=critical,CA:FALSE" \
+        -addext "keyUsage=digitalSignature" \
+        -addext "extendedKeyUsage=codeSigning"
+    openssl pkcs12 -export -passout pass:embala-test \
+        -inkey fixtures/certs/test-win.key -in fixtures/certs/test-win.pem \
+        -out fixtures/certs/test-win.pfx
+    rm -f fixtures/certs/test-win.key
+
+# Mint a self-signed Apple code-signing cert for local rcodesign tests.
+# rcodesign emits PEM (.crt/.key), so openssl bundles them into
+# fixtures/certs/test-mac.p12 (rcodesign has no direct p12 output).
+# Password is the fixed literal `embala-test` (rcodesign rejects empty ones);
+# `-legacy` forces PBE-SHA1-3DES — rcodesign's PKCS12 reader can't decrypt
+# OpenSSL 3.x's default PBES2/AES encryption.
+test-cert-mac:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p fixtures/certs
+    rcodesign generate-self-signed-certificate \
+        --person-name "Embala Test" --validity-days 3650 \
+        --pem-filename fixtures/certs/test-mac
+    openssl pkcs12 -export -legacy -passout pass:embala-test \
+        -inkey fixtures/certs/test-mac.key -in fixtures/certs/test-mac.crt \
+        -out fixtures/certs/test-mac.p12
+    rm -f fixtures/certs/test-mac.key fixtures/certs/test-mac.crt
 
 # Differential oracle: build the same install with wixl and with embala,
 # export every table from both, and diff table-by-table. Inspection tool —

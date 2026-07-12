@@ -16,6 +16,13 @@
     # it only include_bytes!-embeds the committed stubs.
     zig
     cargo-zigbuild
+    # Signing tools the `[sign]` config shells out to in local/e2e tests:
+    # osslsigncode (Authenticode on Linux), rcodesign (Apple code signing),
+    # jsign (Authenticode for .msi — osslsigncode can't parse the msi crate's
+    # CFB v4 output).
+    osslsigncode
+    rcodesign
+    jsign
   ];
 
   languages.rust = {

@@ -18,6 +18,7 @@ pub struct Config {
     pub pkg: Option<PkgSection>,
     pub nupkg: Option<NupkgSection>,
     pub setup: Option<SetupSection>,
+    pub sign: Option<SignSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,6 +192,31 @@ impl SetupSection {
     }
 }
 
+/// User-supplied signing commands (spec R5/R6). embala never implements a
+/// signature format — it only shells out to `command` with `$f` = the
+/// artifact's absolute path.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct SignSection {
+    pub windows: Option<WindowsSign>,
+    pub macos: Option<MacosSign>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct WindowsSign {
+    pub command: String,
+    /// Path (relative to the config dir) to a pre-signed bare uninstall stub;
+    /// when set, embala embeds it instead of signing the embedded stub itself.
+    pub signed_stub: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct MacosSign {
+    pub command: String,
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -262,6 +288,23 @@ impl Config {
         }
         if let Some(setup) = &self.setup {
             validate_setup(setup)?;
+        }
+        if let Some(sign) = &self.sign {
+            // signed-stub existence is a build-time check (needs the config dir);
+            // it lives in `build_setup`, mirroring `validate_setup_paths`.
+            for (platform, command) in [
+                ("windows", sign.windows.as_ref().map(|w| &w.command)),
+                ("macos", sign.macos.as_ref().map(|m| &m.command)),
+            ] {
+                if let Some(command) = command {
+                    if command.is_empty() || !command.contains("$f") {
+                        bail!(
+                            "sign.{platform}: command must be non-empty and contain $f (got {:?})",
+                            command
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -605,5 +648,31 @@ shortcuts = [{ name = "Hello", target = "hello.exe" }]
 "#;
         let err = parse(&with_setup(block)).unwrap_err().to_string();
         assert!(err.contains("cannot be combined with"), "{err}");
+    }
+
+    #[test]
+    fn sign_section_parses() {
+        let text = format!(
+            "{}\n[sign.windows]\ncommand = \"osslsigncode sign -in $f -out $f\"\n\
+             signed-stub = \"signed-stub.exe\"\n[sign.macos]\ncommand = \"rcodesign sign $f\"\n",
+            fixture_toml()
+        );
+        let config = parse(&text).expect("sign section must parse");
+        let sign = config.sign.unwrap();
+        assert_eq!(
+            sign.windows.as_ref().unwrap().signed_stub.as_deref(),
+            Some(Path::new("signed-stub.exe"))
+        );
+        assert_eq!(sign.macos.unwrap().command, "rcodesign sign $f");
+    }
+
+    #[test]
+    fn sign_command_without_placeholder_is_rejected() {
+        let text = format!(
+            "{}\n[sign.windows]\ncommand = \"osslsigncode sign cert.pfx\"\n",
+            fixture_toml()
+        );
+        let err = parse(&text).unwrap_err().to_string();
+        assert!(err.contains("must be non-empty and contain $f"), "{err}");
     }
 }
