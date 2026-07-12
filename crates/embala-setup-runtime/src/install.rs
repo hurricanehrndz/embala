@@ -151,7 +151,8 @@ fn do_install(
     }
 }
 
-/// Write `uninstall.exe` (the stub prefix, no overlay), the optional
+/// Write `uninstall.exe` (the embedded pre-signed stub, or the stub prefix with
+/// no overlay when none is embedded), the optional
 /// `uninstall.lua`, the `manifest.json` sidecar (so `uninstall.lua` can rebuild
 /// its `embala.package` context), and flush `install.log` — all into the install
 /// dir (spec R14).
@@ -162,8 +163,15 @@ fn write_uninstaller(
     manifest: &Manifest,
     engine: &Engine,
 ) -> Result<(), String> {
-    let prefix = read_stub_prefix(exe, trailer).map_err(|e| e.to_string())?;
-    std::fs::write(install_dir.join("uninstall.exe"), &prefix).map_err(|e| e.to_string())?;
+    // Prefer the embedded pre-signed stub (overlay v2): copying our own prefix
+    // would break its Authenticode signature, so a zero-length signed_stub falls
+    // back to the byte-for-byte prefix copy of the (unsigned) engine.
+    let uninstall_exe = if trailer.signed_stub.len > 0 {
+        read_section(exe, trailer.signed_stub).map_err(|e| e.to_string())?
+    } else {
+        read_stub_prefix(exe, trailer).map_err(|e| e.to_string())?
+    };
+    std::fs::write(install_dir.join("uninstall.exe"), &uninstall_exe).map_err(|e| e.to_string())?;
     if trailer.uninstall_lua.len > 0 {
         let script = read_section(exe, trailer.uninstall_lua).map_err(|e| e.to_string())?;
         std::fs::write(install_dir.join("uninstall.lua"), &script).map_err(|e| e.to_string())?;

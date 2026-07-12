@@ -108,11 +108,13 @@ pub struct NupkgSection {
 
 /// Windows setup.exe selects the embedded stub by arch; only 64-bit targets
 /// exist (unknown variants are rejected at parse time).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, clap::ValueEnum)]
 pub enum SetupArch {
     #[serde(rename = "x86_64")]
+    #[value(name = "x86_64")]
     X86_64,
     #[serde(rename = "aarch64")]
+    #[value(name = "aarch64")]
     Aarch64,
 }
 

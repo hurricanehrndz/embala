@@ -50,6 +50,7 @@ fn two_file_spec(payload_dir: &Path) -> SetupSpec {
         ],
         install_lua: None,
         uninstall_lua: None,
+        signed_stub: None,
     }
 }
 
@@ -91,13 +92,16 @@ fn overlay_sections_locate_and_payload_round_trips() {
         t.manifest.offset,
         t.uninstall_lua.offset + t.uninstall_lua.len
     );
-    // The manifest is the last section; a 0–7 byte alignment pad may sit between
+    // No signed stub supplied: a zero-length section pinned at the manifest's end.
+    assert_eq!(t.signed_stub.offset, t.manifest.offset + t.manifest.len);
+    assert_eq!(t.signed_stub.len, 0);
+    // signed_stub is the last section; a 0–7 byte alignment pad may sit between
     // it and the trailer so the unsigned length is 8-byte aligned.
     let trailer_start = (bytes.len() - TRAILER_LEN) as u64;
-    let manifest_end = t.manifest.offset + t.manifest.len;
-    assert!(manifest_end <= trailer_start);
+    let sections_end = t.signed_stub.offset + t.signed_stub.len;
+    assert!(sections_end <= trailer_start);
     assert!(
-        trailer_start - manifest_end < 8,
+        trailer_start - sections_end < 8,
         "alignment pad is under 8 bytes"
     );
 
@@ -113,7 +117,7 @@ fn overlay_sections_locate_and_payload_round_trips() {
     // Manifest deserializes via the shared overlay type with the resolved mode
     // and full product identity (spec R8).
     let manifest = Manifest::parse(section(&bytes, t.manifest)).expect("manifest parses");
-    assert_eq!(manifest.format_version, 1);
+    assert_eq!(manifest.format_version, 2);
     assert_eq!(manifest.arch, "x86_64");
     assert_eq!(manifest.install_mode, "per-user");
     assert_eq!(manifest.package.identifier, "ca.hrndz.embala.hello");
@@ -177,6 +181,7 @@ fn traversal_and_duplicate_dests_are_rejected() {
                 files,
                 install_lua: None,
                 uninstall_lua: None,
+                signed_stub: None,
             },
             &tmp("invalid-setup.exe"),
         )

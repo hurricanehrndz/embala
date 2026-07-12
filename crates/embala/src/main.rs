@@ -32,6 +32,13 @@ enum Command {
         #[arg(long, default_value = "dist")]
         out_dir: PathBuf,
     },
+    /// Write the embedded bare setup stub (for external signing flows)
+    DumpStub {
+        #[arg(long, default_value = "x86_64")]
+        arch: config::SetupArch,
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -63,7 +70,18 @@ fn main() -> Result<()> {
             formats,
             out_dir,
         } => build(&config, &formats, &out_dir),
+        Command::DumpStub { arch, out } => dump_stub(arch, &out),
     }
+}
+
+fn dump_stub(arch: config::SetupArch, out: &Path) -> Result<()> {
+    let arch = match arch {
+        config::SetupArch::X86_64 => embala_setup::SetupArch::X86_64,
+        config::SetupArch::Aarch64 => embala_setup::SetupArch::Aarch64,
+    };
+    std::fs::write(out, embala_setup::stub_bytes(arch))?;
+    println!("dump-stub: wrote {}", out.display());
+    Ok(())
 }
 
 fn build(config_path: &Path, formats: &[Format], out_dir: &Path) -> Result<()> {
@@ -330,6 +348,8 @@ fn build_setup(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()
         files,
         install_lua,
         uninstall_lua: read_script(&section.uninstall_script)?,
+        // Phase 3 wires the pre-signed uninstall stub; unsigned builds ship none.
+        signed_stub: None,
     };
     let out = out_dir.join(format!(
         "{}-{}-{}-setup.exe",

@@ -1,20 +1,21 @@
 //! Fixed-size PE-overlay trailer (spec R5).
 //!
-//! `setup.exe` is `[stub][payload.zip][install.lua][uninstall.lua][manifest]`
+//! `setup.exe` is `[stub][payload.zip][install.lua][uninstall.lua][manifest][signed_stub]`
 //! followed by (optional alignment padding and) this fixed-size trailer. The
 //! runtime locates the trailer at `overlay_end − TRAILER_LEN` — the overlay end
 //! being the raw EOF for an unsigned file but the Authenticode certificate-table
 //! offset once signed (see [`pe::overlay_end`]) — reads these bytes, validates
 //! [`MAGIC`], and then locates every other section from the offset/length table.
 //!
-//! Byte layout (little-endian, [`TRAILER_LEN`] = 92 bytes):
+//! Byte layout (little-endian, [`TRAILER_LEN`] = 108 bytes):
 //!
 //! ```text
 //! offset  size  field
 //!   0       8   magic                = b"EMBALASU"
 //!   8       4   format version (u32) = FORMAT_VERSION
-//!  12    5×16   section table: (offset u64, len u64) for
-//!               stub, payload.zip, install.lua, uninstall.lua, manifest
+//!  12    6×16   section table: (offset u64, len u64) for
+//!               stub, payload.zip, install.lua, uninstall.lua, manifest,
+//!               signed_stub (zero-length = none embedded)
 //! ```
 //!
 //! This is the single source of truth shared by both sides of the overlay: the
@@ -32,12 +33,12 @@ pub use manifest::{Manifest, Package};
 pub const MAGIC: [u8; 8] = *b"EMBALASU";
 
 /// Overlay format version. Bumped on any incompatible layout change.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Sections described by the table, in serialized order.
-pub const SECTION_COUNT: usize = 5;
+pub const SECTION_COUNT: usize = 6;
 
-/// Total trailer size: magic (8) + version (4) + 5 × (offset u64 + len u64).
+/// Total trailer size: magic (8) + version (4) + 6 × (offset u64 + len u64).
 pub const TRAILER_LEN: usize = 8 + 4 + SECTION_COUNT * 16;
 
 /// A byte range of one overlay section within the `setup.exe` file.
@@ -59,6 +60,9 @@ pub struct Trailer {
     pub install_lua: Section,
     pub uninstall_lua: Section,
     pub manifest: Section,
+    /// Pre-signed bare uninstall stub. Zero-length = none embedded; the runtime
+    /// then falls back to prefix-copying its own (unsigned) stub.
+    pub signed_stub: Section,
 }
 
 /// Why a trailer failed to parse.
@@ -103,6 +107,7 @@ impl Trailer {
             install_lua: section(),
             uninstall_lua: section(),
             manifest: section(),
+            signed_stub: section(),
         })
     }
 
@@ -118,6 +123,7 @@ impl Trailer {
             self.install_lua,
             self.uninstall_lua,
             self.manifest,
+            self.signed_stub,
         ] {
             out[off..off + 8].copy_from_slice(&s.offset.to_le_bytes());
             out[off + 8..off + 16].copy_from_slice(&s.len.to_le_bytes());
@@ -162,12 +168,16 @@ mod tests {
                 offset: 1073,
                 len: 99,
             },
+            signed_stub: Section {
+                offset: 1172,
+                len: 512,
+            },
         }
     }
 
     #[test]
     fn trailer_len_is_fixed() {
-        assert_eq!(TRAILER_LEN, 92);
+        assert_eq!(TRAILER_LEN, 108);
         assert_eq!(sample().to_bytes().len(), TRAILER_LEN);
     }
 

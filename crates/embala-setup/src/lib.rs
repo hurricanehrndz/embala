@@ -4,7 +4,7 @@
 //! Win32 runtime stub (`embala-setup-runtime`) is cross-compiled once by
 //! `just stubs` and committed under `stubs/<target>/setup-stub.exe`; this crate
 //! `include_bytes!`-embeds it and appends `payload.zip + install.lua +
-//! uninstall.lua + manifest + pad + trailer` as a PE overlay — pure byte-writing,
+//! uninstall.lua + manifest + signed_stub + pad + trailer` as a PE overlay — pure byte-writing,
 //! no compile, no network. The `pad` is zero-to-seven bytes so the unsigned file
 //! length is 8-byte aligned: an appended Authenticode cert table then starts at
 //! the security-directory offset the runtime reads as the overlay end. Output is
@@ -60,6 +60,13 @@ impl SetupArch {
             SetupArch::Aarch64 => STUB_AARCH64,
         }
     }
+}
+
+/// The committed bare setup stub for `arch` — the exact bytes external signing
+/// flows sign out-of-band (see `embala dump-stub`) and feed back as
+/// [`SetupSpec::signed_stub`].
+pub fn stub_bytes(arch: SetupArch) -> &'static [u8] {
+    arch.stub()
 }
 
 /// Default install mode baked into the manifest (spec R13). Config-independent,
@@ -119,6 +126,10 @@ pub struct SetupSpec {
     /// Raw `uninstall.lua` bytes shipped verbatim. `None` ships an empty
     /// section; the runtime then falls back to the log-driven uninstaller.
     pub uninstall_lua: Option<Vec<u8>>,
+    /// A pre-signed bare uninstall stub. `Some` embeds it so the installer writes
+    /// a SIGNED `uninstall.exe` instead of prefix-copying its own stub; `None`
+    /// ships a zero-length section and the runtime falls back to the prefix copy.
+    pub signed_stub: Option<Vec<u8>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -168,9 +179,11 @@ pub fn build(spec: &SetupSpec, out: &Path) -> Result<()> {
         .unwrap_or(INSTALL_LUA_PLACEHOLDER);
     let uninstall: &[u8] = spec.uninstall_lua.as_deref().unwrap_or(b"");
     let manifest = manifest_bytes(spec);
+    // A pre-signed uninstall stub, if supplied; else a zero-length section.
+    let signed_stub: &[u8] = spec.signed_stub.as_deref().unwrap_or(b"");
 
     // Section offsets are cumulative; order matches the trailer's field
-    // semantics: [stub][payload.zip][install.lua][uninstall.lua][manifest].
+    // semantics: [stub][payload.zip][install.lua][uninstall.lua][manifest][signed_stub].
     let stub_sec = Section {
         offset: 0,
         len: stub.len() as u64,
@@ -179,6 +192,7 @@ pub fn build(spec: &SetupSpec, out: &Path) -> Result<()> {
     let install_sec = after(&payload_sec, install.len());
     let uninstall_sec = after(&install_sec, uninstall.len());
     let manifest_sec = after(&uninstall_sec, manifest.len());
+    let signed_stub_sec = after(&manifest_sec, signed_stub.len());
     let trailer = Trailer {
         version: FORMAT_VERSION,
         stub: stub_sec,
@@ -186,21 +200,23 @@ pub fn build(spec: &SetupSpec, out: &Path) -> Result<()> {
         install_lua: install_sec,
         uninstall_lua: uninstall_sec,
         manifest: manifest_sec,
+        signed_stub: signed_stub_sec,
     };
 
     // Pad before the trailer so the unsigned file length is 8-byte aligned. An
     // Authenticode cert table is then appended at an 8-aligned offset, which is
     // exactly the security-directory offset the runtime reads as the overlay end.
-    let manifest_end = manifest_sec.offset + manifest_sec.len;
-    let pad = (8 - (manifest_end + TRAILER_LEN as u64) % 8) % 8;
+    let sections_end = signed_stub_sec.offset + signed_stub_sec.len;
+    let pad = (8 - (sections_end + TRAILER_LEN as u64) % 8) % 8;
 
     let mut bytes =
-        Vec::with_capacity(manifest_end as usize + pad as usize + trailer.to_bytes().len());
+        Vec::with_capacity(sections_end as usize + pad as usize + trailer.to_bytes().len());
     bytes.extend_from_slice(stub);
     bytes.extend_from_slice(&payload);
     bytes.extend_from_slice(install);
     bytes.extend_from_slice(uninstall);
     bytes.extend_from_slice(&manifest);
+    bytes.extend_from_slice(signed_stub);
     bytes.resize(bytes.len() + pad as usize, 0);
     bytes.extend_from_slice(&trailer.to_bytes());
 
