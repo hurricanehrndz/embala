@@ -91,9 +91,14 @@ fn overlay_sections_locate_and_payload_round_trips() {
         t.manifest.offset,
         t.uninstall_lua.offset + t.uninstall_lua.len
     );
-    assert_eq!(
-        t.manifest.offset + t.manifest.len,
-        (bytes.len() - TRAILER_LEN) as u64
+    // The manifest is the last section; a 0–7 byte alignment pad may sit between
+    // it and the trailer so the unsigned length is 8-byte aligned.
+    let trailer_start = (bytes.len() - TRAILER_LEN) as u64;
+    let manifest_end = t.manifest.offset + t.manifest.len;
+    assert!(manifest_end <= trailer_start);
+    assert!(
+        trailer_start - manifest_end < 8,
+        "alignment pad is under 8 bytes"
     );
 
     // uninstall.lua is empty this phase; install.lua is the plaintext placeholder.
@@ -118,6 +123,21 @@ fn overlay_sections_locate_and_payload_round_trips() {
     assert_eq!(extracted.len(), 2);
     assert_eq!(extracted["bin/hello.exe"], HELLO);
     assert_eq!(extracted["readme.txt"], README);
+}
+
+#[test]
+fn output_is_8_byte_aligned_and_trailer_round_trips() {
+    // Why: signtool appends the cert table at the unsigned length; that length
+    // must be 8-byte aligned so the table starts at the security-directory offset
+    // the runtime reads as the overlay end. The trailer must still parse from the
+    // last TRAILER_LEN bytes.
+    let spec = two_file_spec(&tmp("payload-align"));
+    let out = tmp("align-setup.exe");
+    build(&spec, &out).unwrap();
+
+    let bytes = std::fs::read(&out).unwrap();
+    assert_eq!(bytes.len() % 8, 0, "unsigned length must be 8-byte aligned");
+    Trailer::parse(&bytes[bytes.len() - TRAILER_LEN..]).expect("trailer round-trips at EOF");
 }
 
 #[test]

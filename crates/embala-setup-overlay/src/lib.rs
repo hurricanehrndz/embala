@@ -1,9 +1,11 @@
 //! Fixed-size PE-overlay trailer (spec R5).
 //!
 //! `setup.exe` is `[stub][payload.zip][install.lua][uninstall.lua][manifest]`
-//! followed by this fixed-size trailer. The runtime seeks to `EOF −
-//! TRAILER_LEN`, reads these bytes, validates [`MAGIC`], and then locates every
-//! other section from the offset/length table.
+//! followed by (optional alignment padding and) this fixed-size trailer. The
+//! runtime locates the trailer at `overlay_end − TRAILER_LEN` — the overlay end
+//! being the raw EOF for an unsigned file but the Authenticode certificate-table
+//! offset once signed (see [`pe::overlay_end`]) — reads these bytes, validates
+//! [`MAGIC`], and then locates every other section from the offset/length table.
 //!
 //! Byte layout (little-endian, [`TRAILER_LEN`] = 92 bytes):
 //!
@@ -23,6 +25,7 @@
 //! the runtime).
 
 mod manifest;
+pub mod pe;
 pub use manifest::{Manifest, Package};
 
 /// Trailer magic: "EMBALA SetUp".

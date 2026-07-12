@@ -4,8 +4,11 @@
 //! Win32 runtime stub (`embala-setup-runtime`) is cross-compiled once by
 //! `just stubs` and committed under `stubs/<target>/setup-stub.exe`; this crate
 //! `include_bytes!`-embeds it and appends `payload.zip + install.lua +
-//! uninstall.lua + manifest + trailer` as a PE overlay — pure byte-writing, no
-//! compile, no network. Output is byte-reproducible: the payload zip pins entry
+//! uninstall.lua + manifest + pad + trailer` as a PE overlay — pure byte-writing,
+//! no compile, no network. The `pad` is zero-to-seven bytes so the unsigned file
+//! length is 8-byte aligned: an appended Authenticode cert table then starts at
+//! the security-directory offset the runtime reads as the overlay end. Output is
+//! byte-reproducible: the payload zip pins entry
 //! mtimes and sorts entries, so the whole `setup.exe` is a pure function of
 //! (stub, scripts, manifest, payload).
 //!
@@ -18,7 +21,7 @@
 use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 
-use embala_setup_overlay::{FORMAT_VERSION, Manifest, Package, Section, Trailer};
+use embala_setup_overlay::{FORMAT_VERSION, Manifest, Package, Section, TRAILER_LEN, Trailer};
 use zip::write::SimpleFileOptions;
 
 /// The committed runtime stubs, embedded at this crate's compile time (spec R2).
@@ -185,14 +188,20 @@ pub fn build(spec: &SetupSpec, out: &Path) -> Result<()> {
         manifest: manifest_sec,
     };
 
-    let mut bytes = Vec::with_capacity(
-        manifest_sec.offset as usize + manifest.len() + trailer.to_bytes().len(),
-    );
+    // Pad before the trailer so the unsigned file length is 8-byte aligned. An
+    // Authenticode cert table is then appended at an 8-aligned offset, which is
+    // exactly the security-directory offset the runtime reads as the overlay end.
+    let manifest_end = manifest_sec.offset + manifest_sec.len;
+    let pad = (8 - (manifest_end + TRAILER_LEN as u64) % 8) % 8;
+
+    let mut bytes =
+        Vec::with_capacity(manifest_end as usize + pad as usize + trailer.to_bytes().len());
     bytes.extend_from_slice(stub);
     bytes.extend_from_slice(&payload);
     bytes.extend_from_slice(install);
     bytes.extend_from_slice(uninstall);
     bytes.extend_from_slice(&manifest);
+    bytes.resize(bytes.len() + pad as usize, 0);
     bytes.extend_from_slice(&trailer.to_bytes());
 
     if let Some(parent) = out.parent() {

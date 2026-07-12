@@ -53,11 +53,13 @@ pub fn run() -> ExitCode {
 /// overlay (bare stub / uninstall.exe); `Err` is I/O or a corrupt trailer.
 pub fn read_trailer(exe: &Path) -> Result<Option<Trailer>, String> {
     let mut file = std::fs::File::open(exe).map_err(|e| e.to_string())?;
-    let len = file.metadata().map_err(|e| e.to_string())?.len();
-    if len < TRAILER_LEN as u64 {
+    // Locate the trailer relative to the overlay end (raw EOF when unsigned, the
+    // Authenticode cert-table offset once signed), not the raw file EOF.
+    let end = embala_setup_overlay::pe::overlay_end(&mut file).map_err(|e| e.to_string())?;
+    if end < TRAILER_LEN as u64 {
         return Ok(None);
     }
-    file.seek(SeekFrom::End(-(TRAILER_LEN as i64)))
+    file.seek(SeekFrom::Start(end - TRAILER_LEN as u64))
         .map_err(|e| e.to_string())?;
     let mut buf = [0u8; TRAILER_LEN];
     file.read_exact(&mut buf).map_err(|e| e.to_string())?;
