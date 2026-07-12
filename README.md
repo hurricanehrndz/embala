@@ -33,18 +33,36 @@ Windows 11, the `.app` launches via `open` and the `.pkg` installs via
 differential-tested against Apple's `pkgbuild`/`productbuild`/`mkbom` and
 against msitools respectively.
 
-## Unsigned artifacts on Windows — SmartScreen
+## Signing — SmartScreen & Gatekeeper
 
-Like the `.app` bundles below, **embala's MSIs are unsigned** (signing is v2
-scope). Windows SmartScreen shows "Windows protected your PC" for unsigned
-MSIs downloaded via a browser; **More info → Run anyway** proceeds. Files
-arriving via other channels (network share, `scp`, CI artifacts) install
-without the prompt.
+embala artifacts are **signable**: an optional `[sign]` section in `embala.toml`
+runs your own signing tool (osslsigncode, signtool, jsign, rcodesign) on each
+built `.msi` / `setup.exe` / `.app` / `.pkg`, including the embedded uninstaller.
+embala never implements a signature format — it only shells out. Full guide:
+**[Code Signing](https://github.com/hurricanehrndz/embala/wiki/Code-Signing)**.
 
-## macOS `.app` bundles and Gatekeeper — read this
+```toml
+[sign.windows]
+command = "jsign --keystore cert.pfx --storepass pw --storetype PKCS12 $f"
 
-**embala's `.app` bundles are unsigned and not notarized** (signing/notarization
-is v2 scope). What that means in practice:
+[sign.macos]
+command = "rcodesign sign --p12-file devid.p12 $f"
+```
+
+Read this honestly: signing removes the *unknown-publisher* prompt only for a
+certificate the target machine already trusts. **A self-signed cert changes
+neither SmartScreen nor Gatekeeper** for outside users. What clears those
+prompts is earned reputation (SignPath's OSS program or an EV cert on Windows)
+and an Apple Developer ID + notarization on macOS.
+
+If you ship **unsigned** (or self-signed to outside users), the escape hatches
+still apply:
+
+Windows SmartScreen shows "Windows protected your PC" for MSIs downloaded via a
+browser; **More info → Run anyway** proceeds. Files arriving via other channels
+(network share, `scp`, CI artifacts) install without the prompt.
+
+macOS `.app` bundles that aren't signed with a Developer ID and notarized:
 
 - Bundles **downloaded via a browser** get the `com.apple.quarantine` xattr and
   Gatekeeper refuses to launch them with a "cannot be opened" dialog.
