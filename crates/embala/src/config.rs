@@ -178,6 +178,12 @@ pub struct SetupSection {
     pub files: Vec<FileEntry>,
     /// Dest of the shortcut target + ARP DisplayIcon, relative to install dir.
     pub main_executable: Option<String>,
+    /// Stub icon (PNG/ICO), relative to the config dir; falls back to
+    /// `[package].icon` (the `[app]` convention) when unset (spec R7).
+    pub icon: Option<PathBuf>,
+    /// Wizard banner (BMP, magic `BM`), relative to the config dir, patched as
+    /// the `EMBALA_BANNER` resource (spec R7).
+    pub banner: Option<PathBuf>,
     #[serde(default)]
     pub install_mode: InstallMode,
     /// Path (relative to the config dir) to a license text file.
@@ -404,12 +410,26 @@ pub fn validate_setup_paths(setup: &SetupSection, base: &Path) -> Result<()> {
         ("license", &setup.license),
         ("script", &setup.script),
         ("uninstall-script", &setup.uninstall_script),
+        ("icon", &setup.icon),
+        ("banner", &setup.banner),
     ] {
         if let Some(path) = path {
             let resolved = base.join(path);
             if !resolved.exists() {
                 bail!("setup: {field} path {} does not exist", resolved.display());
             }
+        }
+    }
+    // The banner is patched as a raw bitmap resource, so reject anything that is
+    // not a BMP up front rather than shipping a broken wizard (spec R7).
+    if let Some(banner) = &setup.banner {
+        let resolved = base.join(banner);
+        let head = std::fs::read(&resolved)?;
+        if !head.starts_with(b"BM") {
+            bail!(
+                "setup: banner {} must be a BMP (magic \"BM\")",
+                resolved.display()
+            );
         }
     }
     Ok(())
@@ -730,6 +750,34 @@ uninstall-options = [{ id = "purge-data", label = "" }]
                 .to_string()
                 .contains("label must be non-empty")
         );
+    }
+
+    #[test]
+    fn banner_without_bm_magic_is_rejected() {
+        // Why: the banner is patched into the stub as a raw bitmap resource, so a
+        // non-BMP would ship a broken wizard; reject it at validation (spec R7).
+        let dir = std::env::temp_dir().join("embala-banner-magic-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        std::fs::write(dir.join("dist/hello.exe"), b"MZ").unwrap();
+        std::fs::write(dir.join("bad.bmp"), b"NOTBMP").unwrap();
+        std::fs::write(dir.join("good.bmp"), b"BM and pixels").unwrap();
+
+        let block = r#"
+[setup]
+arch = "x86_64"
+banner = "bad.bmp"
+files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
+"#;
+        let config: Config = toml::from_str(&with_setup(block)).unwrap();
+        let err = validate_setup_paths(config.setup.as_ref().unwrap(), &dir)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be a BMP"), "{err}");
+
+        let good = with_setup(block).replace("bad.bmp", "good.bmp");
+        let config: Config = toml::from_str(&good).unwrap();
+        validate_setup_paths(config.setup.as_ref().unwrap(), &dir).expect("BM magic accepted");
     }
 
     #[test]

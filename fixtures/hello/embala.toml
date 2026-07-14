@@ -45,6 +45,8 @@ files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
 arch = "x86_64"
 main-executable = "hello.exe"
 license = "license.txt"
+icon = "icon.png"
+banner = "banner.bmp"
 files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
 components = [
   { id = "docs", label = "Documentation", description = "Offline readme", default = true, files = [{ src = "readme.txt", dest = "readme.txt" }] },

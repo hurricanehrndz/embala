@@ -5,8 +5,10 @@
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use embala_setup::{Error, FileSpec, InstallMode, ProductInfo, SetupArch, SetupSpec, build};
-use embala_setup_overlay::{Manifest, TRAILER_LEN, Trailer};
+use embala_setup::{
+    Branding, Error, FileSpec, InstallMode, ProductInfo, SetupArch, SetupSpec, build,
+};
+use embala_setup_overlay::{Manifest, TRAILER_LEN, Trailer, pe};
 
 const HELLO: &[u8] = b"MZ fake hello.exe payload";
 const README: &[u8] = b"read me\n";
@@ -29,6 +31,32 @@ fn product() -> ProductInfo {
     }
 }
 
+/// Branding for the writer tests: a real BMP banner so the patched stub carries
+/// the EMBALA_BANNER resource; the icon path uses the fixture PNG.
+fn branding() -> Branding {
+    Branding {
+        icon: Some(
+            std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fixtures/hello/icon.png"
+            ))
+            .unwrap(),
+        ),
+        banner: Some(
+            std::fs::read(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fixtures/hello/banner.bmp"
+            ))
+            .unwrap(),
+        ),
+        display_name: "Embala Hello".to_string(),
+        publisher: "Carlos Hernandez".to_string(),
+        description: "test fixture".to_string(),
+        version: "0.1.0".to_string(),
+        copyright: None,
+    }
+}
+
 /// Two payload files written under a fresh dir; returns the spec.
 fn two_file_spec(payload_dir: &Path) -> SetupSpec {
     std::fs::create_dir_all(payload_dir).unwrap();
@@ -38,6 +66,7 @@ fn two_file_spec(payload_dir: &Path) -> SetupSpec {
         arch: SetupArch::X86_64,
         install_mode: InstallMode::PerUser,
         product: product(),
+        branding: branding(),
         uninstall_options: vec![],
         files: vec![
             FileSpec {
@@ -146,6 +175,30 @@ fn output_is_8_byte_aligned_and_trailer_round_trips() {
 }
 
 #[test]
+fn patched_stub_overlay_end_is_file_length() {
+    // Why: build() now brands the stub before overlaying (spec R7). The patched
+    // stub must stay a valid unsigned PE whose security directory is empty, so
+    // the runtime reads the overlay end as the raw file length and finds the
+    // trailer there (spec R8) — the same contract signing later relies on.
+    let spec = two_file_spec(&tmp("payload-overlay-end"));
+    let out = tmp("overlay-end-setup.exe");
+    build(&spec, &out).unwrap();
+
+    let bytes = std::fs::read(&out).unwrap();
+    // The stub was patched (grew past the raw committed bytes), yet the file
+    // still starts with a PE and the overlay end is the full length.
+    assert_eq!(&bytes[0..2], b"MZ");
+    let end = pe::overlay_end(&mut std::io::Cursor::new(&bytes)).unwrap();
+    assert_eq!(
+        end,
+        bytes.len() as u64,
+        "unsigned overlay end is file length"
+    );
+    Trailer::parse(&bytes[end as usize - TRAILER_LEN..end as usize])
+        .expect("trailer sits at the overlay end");
+}
+
+#[test]
 fn builds_are_byte_reproducible() {
     // Why: byte-reproducibility is the invariant that makes signing/caching
     // viable later; it fails the moment a wall-clock/mtime leaks into the
@@ -179,6 +232,7 @@ fn traversal_and_duplicate_dests_are_rejected() {
                 arch: SetupArch::X86_64,
                 install_mode: InstallMode::PerUser,
                 product: product(),
+                branding: branding(),
                 uninstall_options: vec![],
                 files,
                 install_lua: None,

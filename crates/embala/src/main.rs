@@ -6,7 +6,7 @@ mod sign;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use config::Config;
@@ -33,10 +33,16 @@ enum Command {
         #[arg(long, default_value = "dist")]
         out_dir: PathBuf,
     },
-    /// Write the embedded bare setup stub (for external signing flows)
+    /// Write the setup stub (for external signing flows). Bare by default; with
+    /// `--config` the stub is branded exactly as `build` would patch it.
     DumpStub {
-        #[arg(long, default_value = "x86_64")]
-        arch: config::SetupArch,
+        /// Arch selecting the stub; defaults to `[setup].arch` with `--config`,
+        /// else x86_64.
+        #[arg(long)]
+        arch: Option<config::SetupArch>,
+        /// Config to brand the stub from (icon, banner, VERSIONINFO).
+        #[arg(long)]
+        config: Option<PathBuf>,
         #[arg(long)]
         out: PathBuf,
     },
@@ -71,16 +77,44 @@ fn main() -> Result<()> {
             formats,
             out_dir,
         } => build(&config, &formats, &out_dir),
-        Command::DumpStub { arch, out } => dump_stub(arch, &out),
+        Command::DumpStub { arch, config, out } => dump_stub(arch, config.as_deref(), &out),
     }
 }
 
-fn dump_stub(arch: config::SetupArch, out: &Path) -> Result<()> {
-    let arch = match arch {
+fn setup_arch(arch: config::SetupArch) -> embala_setup::SetupArch {
+    match arch {
         config::SetupArch::X86_64 => embala_setup::SetupArch::X86_64,
         config::SetupArch::Aarch64 => embala_setup::SetupArch::Aarch64,
+    }
+}
+
+fn dump_stub(
+    arch: Option<config::SetupArch>,
+    config_path: Option<&Path>,
+    out: &Path,
+) -> Result<()> {
+    let bytes = match config_path {
+        // With `--config`: brand the stub exactly as `build` would (spec R9),
+        // arch from `[setup].arch` unless `--arch` overrides it.
+        Some(path) => {
+            let config = Config::load(path)?;
+            let section = config
+                .setup
+                .as_ref()
+                .with_context(|| format!("{} has no [setup] section", path.display()))?;
+            let base = path.parent().unwrap_or(Path::new("."));
+            config::validate_setup_paths(section, base)?;
+            let arch = setup_arch(arch.unwrap_or(section.arch));
+            let branding = assemble_branding(&config.package, section, base)?;
+            embala_setup::patched_stub_bytes(arch, &branding)?
+        }
+        // Bare stub, today's behavior; arch defaults to x86_64.
+        None => {
+            let arch = setup_arch(arch.unwrap_or(config::SetupArch::X86_64));
+            embala_setup::stub_bytes(arch).to_vec()
+        }
     };
-    std::fs::write(out, embala_setup::stub_bytes(arch))?;
+    std::fs::write(out, bytes)?;
     println!("dump-stub: wrote {}", out.display());
     Ok(())
 }
@@ -306,10 +340,12 @@ fn macos_sign(config: &Config) -> Option<&config::MacosSign> {
 
 /// Obtain the (signed) uninstall stub for the setup.exe overlay when
 /// `[sign.windows]` is configured (spec R6): the pre-signed `signed-stub` file
-/// if given, else the embedded stub signed in place via the user's command.
+/// if given, else the *patched* stub (spec R9) signed in place via the user's
+/// command.
 fn resolve_signed_stub(
     windows: &config::WindowsSign,
     arch: embala_setup::SetupArch,
+    branding: &embala_setup::Branding,
     base: &Path,
     out_dir: &Path,
 ) -> Result<Vec<u8>> {
@@ -325,11 +361,36 @@ fn resolve_signed_stub(
     }
     std::fs::create_dir_all(out_dir)?;
     let work = out_dir.join(format!(".embala-stub-{}.exe", arch.as_str()));
-    std::fs::write(&work, embala_setup::stub_bytes(arch))?;
+    std::fs::write(&work, embala_setup::patched_stub_bytes(arch, branding)?)?;
     sign::run(&windows.command, &work)?;
     let bytes = std::fs::read(&work)?;
     std::fs::remove_file(&work)?;
     Ok(bytes)
+}
+
+/// Assemble the stub [`Branding`] from `[package]`/`[setup]` (spec R7). Icon
+/// falls back from `[setup].icon` to `[package].icon`, mirroring `[app]`
+/// (`app.rs:59`). Paths are resolved relative to the config dir.
+fn assemble_branding(
+    package: &config::Package,
+    section: &config::SetupSection,
+    base: &Path,
+) -> Result<embala_setup::Branding> {
+    let read = |path: &Option<PathBuf>| -> Result<Option<Vec<u8>>> {
+        path.as_ref()
+            .map(|p| std::fs::read(base.join(p)))
+            .transpose()
+            .map_err(Into::into)
+    };
+    Ok(embala_setup::Branding {
+        icon: read(&section.icon.as_ref().or(package.icon.as_ref()).cloned())?,
+        banner: read(&section.banner)?,
+        display_name: package.display_name.clone(),
+        publisher: package.publisher.clone(),
+        description: package.description.clone(),
+        version: package.version.clone(),
+        copyright: package.copyright.clone(),
+    })
 }
 
 fn build_setup(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> {
@@ -379,15 +440,17 @@ fn build_setup(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()
         config::SetupArch::X86_64 => embala_setup::SetupArch::X86_64,
         config::SetupArch::Aarch64 => embala_setup::SetupArch::Aarch64,
     };
+    let branding = assemble_branding(package, section, base)?;
     // Resolve the signed uninstall stub BEFORE assembling setup.exe (spec R6);
     // no `[sign.windows]` ships a None stub — the exact Phase-2 path (spec R7).
     let windows = windows_sign(config);
     let signed_stub = match windows {
-        Some(w) => Some(resolve_signed_stub(w, arch, base, out_dir)?),
+        Some(w) => Some(resolve_signed_stub(w, arch, &branding, base, out_dir)?),
         None => None,
     };
     let spec = embala_setup::SetupSpec {
         arch,
+        branding,
         install_mode: match section.install_mode {
             config::InstallMode::PerUser => embala_setup::InstallMode::PerUser,
             config::InstallMode::PerMachine => embala_setup::InstallMode::PerMachine,

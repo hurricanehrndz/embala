@@ -21,6 +21,9 @@
 use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 
+mod brand;
+pub use brand::Branding;
+
 use embala_setup_overlay::{
     FORMAT_VERSION, Manifest, Package, Section, TRAILER_LEN, Trailer, UninstallOption,
 };
@@ -74,6 +77,12 @@ pub fn stub_bytes(arch: SetupArch) -> &'static [u8] {
     arch.stub()
 }
 
+/// The `arch` stub with `branding` patched into its PE resources (spec R7/R9) —
+/// the exact bytes `build()` overlays and the in-build signing path signs.
+pub fn patched_stub_bytes(arch: SetupArch, branding: &Branding) -> Result<Vec<u8>> {
+    brand::patch_stub(arch.stub(), branding)
+}
+
 /// Default install mode baked into the manifest (spec R13). Config-independent,
 /// mirroring the config's own enum; a `/mode=` CLI flag overrides it at install
 /// time.
@@ -124,6 +133,9 @@ pub struct SetupSpec {
     pub arch: SetupArch,
     pub install_mode: InstallMode,
     pub product: ProductInfo,
+    /// Icon / banner / product identity patched into the stub before overlaying
+    /// (spec R7). Always sets VERSIONINFO; icon and banner are optional.
+    pub branding: Branding,
     /// Declarative uninstall options (spec R2), carried into the overlay manifest
     /// and shown by the uninstaller's confirm dialog.
     pub uninstall_options: Vec<UninstallOption>,
@@ -154,6 +166,8 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Zip(#[from] zip::result::ZipError),
+    #[error("setup: branding the stub failed: {0}")]
+    Brand(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -178,7 +192,10 @@ pub fn build(spec: &SetupSpec, out: &Path) -> Result<()> {
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     let payload = build_payload_zip(&entries)?;
-    let stub = spec.arch.stub();
+    // Brand the stub before overlaying so both the prefix section and every
+    // offset are computed over the patched bytes (spec R7/R8).
+    let stub = brand::patch_stub(spec.arch.stub(), &spec.branding)?;
+    let stub: &[u8] = &stub;
     // Ship the caller's script bytes verbatim (spec R7); fall back to the
     // Phase-2 extraction-only placeholder when no install.lua was supplied.
     let install: &[u8] = spec
