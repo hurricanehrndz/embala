@@ -79,8 +79,8 @@ impl Confirm {
 
         let wnd = gui::WindowMain::new(gui::WindowMainOpts {
             title: &format!("Uninstall {display_name}"),
-            // Baked installer icon (resource id 1) → title bar + taskbar (R10).
-            class_icon: gui::Icon::Id(1),
+            // Patched main icon (or the stub's built-in) → title bar + taskbar (R10).
+            class_icon: super::module_icon(),
             size: xy(WIN_W, win_h),
             ..Default::default()
         });

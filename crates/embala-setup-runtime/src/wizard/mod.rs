@@ -54,7 +54,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use winsafe::{self as w, co, gui, prelude::*};
+use winsafe::{self as w, co, gui, msg, prelude::*};
 
 // The pure page-flow logic lives in `wizard/flow.rs`, mounted at crate root as
 // `wizard_flow` so its unit tests also build on the (non-winsafe) host.
@@ -279,6 +279,11 @@ const BTN_Y: i32 = 340;
 /// Pre-allocated finish-page link buttons (the real link count is unknown when
 /// the window is built); extra links are dropped.
 const MAX_FINISH_LINKS: usize = 3;
+/// NSIS MUI2 welcome/finish banner box, in DIP (scaled through gui::dpi). When
+/// an `EMBALA_BANNER` resource is present it fills the left column of the
+/// welcome + finish pages and their text lays out to its right.
+const BANNER_W: i32 = 164;
+const BANNER_H: i32 = 314;
 
 /// `IDOK` — `IsDialogMessage` maps Enter to a `WM_COMMAND` with this id.
 const ID_NEXT: u16 = 1;
@@ -331,6 +336,12 @@ struct Inner {
     finish_run: gui::CheckBox,
     finish_link_btns: Vec<gui::Button>,
 
+    // Branding banner (spec R10): the SS_BITMAP static shared by the welcome +
+    // finish pages, and the pre-scaled bitmap it displays. Both `None` when the
+    // stub carries no `EMBALA_BANNER` resource — then the layout is today's.
+    banner_static: Option<gui::Label>,
+    banner_bmp: Option<w::guard::DeleteObjectGuard<w::HBITMAP>>,
+
     // Session plumbing.
     tx: Sender<PreOutcome>,
     shared: Arc<Shared>,
@@ -349,11 +360,44 @@ impl Wizard {
     fn build(model: &WizardModel, tx: Sender<PreOutcome>, shared: Arc<Shared>) -> Wizard {
         let wnd = gui::WindowMain::new(gui::WindowMainOpts {
             title: &format!("{} Setup", model.display_name),
-            // Baked installer icon (resource id 1) → title bar + taskbar (R17).
-            class_icon: gui::Icon::Id(1),
+            // Patched main icon (or the stub's built-in) → title bar + taskbar (R10/R17).
+            class_icon: module_icon(),
             size: xy(WIN_W, WIN_H),
             ..Default::default()
         });
+
+        // Branding banner (spec R10): probe the running module for the patched
+        // EMBALA_BANNER resource. When present, build the SS_BITMAP static and
+        // pre-scale the bitmap; the welcome/finish text then lays out to its
+        // right. When absent, `content_x`/`content_w` fall back to today's values
+        // and no banner control exists, so those pages are pixel-identical.
+        let banner_bmp = load_banner_resource()
+            .and_then(|bmp| banner_bitmap(&bmp, gui::dpi_x(BANNER_W), gui::dpi_y(BANNER_H)));
+        let banner_static = banner_bmp.as_ref().map(|_| {
+            gui::Label::new(
+                &wnd,
+                gui::LabelOpts {
+                    text: "",
+                    position: xy(0, 0),
+                    size: xy(BANNER_W, BANNER_H),
+                    control_style: co::SS::BITMAP,
+                    ..Default::default()
+                },
+            )
+        });
+        let has_banner = banner_static.is_some();
+        // Left inset + width of welcome/finish content: shifted past the banner
+        // when present, else the usual full-width margin box.
+        let content_x = if has_banner {
+            BANNER_W + MARGIN
+        } else {
+            MARGIN
+        };
+        let content_w = if has_banner {
+            WIN_W - BANNER_W - 2 * MARGIN
+        } else {
+            WIN_W - 2 * MARGIN
+        };
 
         let heading = gui::Label::new(
             &wnd,
@@ -382,12 +426,17 @@ impl Wizard {
             let mut group: Vec<Box<dyn GuiWindow>> = Vec::new();
             match step {
                 Step::Welcome { body, .. } => {
+                    // The banner (when present) shares the welcome page: show it
+                    // in the left column alongside the text shifted right.
+                    if let Some(banner) = &banner_static {
+                        group.push(Box::new(banner.clone()));
+                    }
                     let lbl = gui::Label::new(
                         &wnd,
                         gui::LabelOpts {
                             text: body,
-                            position: xy(MARGIN, CONTENT_Y + 15),
-                            size: xy(WIN_W - 2 * MARGIN, 230),
+                            position: xy(content_x, CONTENT_Y + 15),
+                            size: xy(content_w, 230),
                             ..Default::default()
                         },
                     );
@@ -587,8 +636,8 @@ impl Wizard {
             &wnd,
             gui::LabelOpts {
                 text: "",
-                position: xy(MARGIN, CONTENT_Y + 15),
-                size: xy(WIN_W - 2 * MARGIN, 100),
+                position: xy(content_x, CONTENT_Y + 15),
+                size: xy(content_w, 100),
                 ..Default::default()
             },
         );
@@ -598,8 +647,8 @@ impl Wizard {
                 text: "",
                 // Fixed size: the default (0,0) auto-fits the empty creation text
                 // and would render zero-wide for the real label set at finish.
-                position: xy(MARGIN, CONTENT_Y + 130),
-                size: xy(WIN_W - 2 * MARGIN, 24),
+                position: xy(content_x, CONTENT_Y + 130),
+                size: xy(content_w, 24),
                 check_state: co::BST::CHECKED,
                 ..Default::default()
             },
@@ -610,7 +659,7 @@ impl Wizard {
                 &wnd,
                 gui::ButtonOpts {
                     text: "",
-                    position: xy(MARGIN, CONTENT_Y + 165 + (i as i32) * 30),
+                    position: xy(content_x, CONTENT_Y + 165 + (i as i32) * 30),
                     width: gui::dpi_x(220),
                     height: gui::dpi_y(24),
                     ..Default::default()
@@ -622,6 +671,9 @@ impl Wizard {
         for b in &finish_link_btns {
             finish_group.push(Box::new(b.clone()));
         }
+        // The banner shares the finish page too (left column, same as welcome),
+        // but it lives in the welcome step group — hide_all_groups covers it and
+        // enter_finish re-shows it explicitly, so it's not duplicated here.
 
         // --- buttons ------------------------------------------------------------
         let btn_back = gui::Button::new(
@@ -684,6 +736,8 @@ impl Wizard {
                 finish_body,
                 finish_run,
                 finish_link_btns,
+                banner_static,
+                banner_bmp,
                 tx,
                 shared,
                 display_name: model.display_name.clone(),
@@ -719,6 +773,15 @@ impl Wizard {
                     }
                     if let Some(browse) = &w2.inner.dir_browse {
                         browse.hwnd().EnableWindow(false);
+                    }
+                }
+                // Attach the pre-scaled banner bitmap to its SS_BITMAP static now
+                // that the control exists (a build-time hwnd() is a NULL no-op).
+                if let (Some(banner), Some(bmp)) = (&w2.inner.banner_static, &w2.inner.banner_bmp) {
+                    unsafe {
+                        let _ = banner.hwnd().SendMessage(msg::StmSetImage {
+                            image: w::BmpIconCurMeta::Bmp(bmp.raw_copy()),
+                        });
                     }
                 }
                 w2.show_step(0);
@@ -871,6 +934,9 @@ impl Wizard {
             .heading
             .hwnd()
             .SetWindowText(&self.inner.headings[idx]);
+        // A banner welcome page pushes the heading into the right column so it
+        // clears the bitmap; every other page keeps the full-width heading.
+        self.position_heading(matches!(self.inner.step_kinds[idx], StepKind::Welcome));
 
         show_ctrl(self.inner.btn_back.hwnd(), true);
         show_ctrl(self.inner.btn_next.hwnd(), true);
@@ -897,6 +963,29 @@ impl Wizard {
             _ => true,
         };
         self.inner.btn_next.hwnd().EnableWindow(enabled);
+    }
+
+    /// Move the shared heading into the banner's right column, or back to the
+    /// full-width margin box. A no-op without a banner, so banner-less pages
+    /// never touch the heading and their layout is exactly today's.
+    fn position_heading(&self, beside_banner: bool) {
+        if self.inner.banner_static.is_none() {
+            return;
+        }
+        let (pos, size) = if beside_banner {
+            (
+                xy(BANNER_W + MARGIN, 15),
+                xy(WIN_W - BANNER_W - 2 * MARGIN, 26),
+            )
+        } else {
+            (xy(MARGIN, 15), xy(WIN_W - 2 * MARGIN, 26))
+        };
+        let _ = self.inner.heading.hwnd().SetWindowPos(
+            w::HwndPlace::None,
+            w::POINT::with(pos.0, pos.1),
+            w::SIZE::with(size.0, size.1),
+            co::SWP::NOZORDER | co::SWP::NOACTIVATE,
+        );
     }
 
     fn on_back(&self) {
@@ -1099,6 +1188,10 @@ impl Wizard {
     fn enter_finish(&self, data: FinishData) {
         self.inner.progress_bar.set_position(100);
         self.hide_all_groups();
+        // Finish shares the welcome layout: re-show the banner in the left column.
+        if let Some(banner) = &self.inner.banner_static {
+            show_ctrl(banner.hwnd(), true);
+        }
 
         let body = data
             .body
@@ -1127,6 +1220,8 @@ impl Wizard {
             .heading
             .hwnd()
             .SetWindowText(&format!("{} Setup Complete", self.inner.display_name));
+        // Finish is a banner page too (welcome/finish share the layout).
+        self.position_heading(true);
         show_ctrl(self.inner.btn_back.hwnd(), false);
         show_ctrl(self.inner.btn_cancel.hwnd(), false);
         show_ctrl(self.inner.btn_next.hwnd(), true);
@@ -1160,6 +1255,101 @@ fn step_heading(step: &Step, display_name: &str) -> String {
         Step::Components { .. } => "Select Components".to_string(),
         Step::Directory { .. } => "Choose Install Location".to_string(),
     }
+}
+
+/// The window/title-bar/taskbar icon (spec R10). editpe patches the main icon as
+/// the *named* group `MAINICON` (which sorts ahead of the stub's original id-1
+/// icon, so Explorer shows it too); load that when present, else fall back to the
+/// stub's built-in id-1 icon. Resolved to a handle here rather than passed as
+/// `Icon::Str`, so an absent `MAINICON` (banner-less / icon-less build) falls
+/// back cleanly instead of panicking winsafe's class-icon load.
+pub(crate) fn module_icon() -> gui::Icon {
+    let Ok(hinst) = w::HINSTANCE::GetModuleHandle(None) else {
+        return gui::Icon::Id(1);
+    };
+    hinst
+        .LoadIcon(w::IdIdiStr::from_str("MAINICON"))
+        .map(|mut icon| gui::Icon::Handle(icon.leak()))
+        .unwrap_or(gui::Icon::Id(1))
+}
+
+/// Probe the running module for the `EMBALA_BANNER` RCDATA resource patched into
+/// the stub at build time (spec R10). `None` when built without a banner.
+fn load_banner_resource() -> Option<Vec<u8>> {
+    let hinst = w::HINSTANCE::GetModuleHandle(None).ok()?;
+    let res = hinst
+        .FindResource(
+            w::IdStr::from_str("EMBALA_BANNER"),
+            w::RtStr::Rt(co::RT::RCDATA),
+        )
+        .ok()?;
+    let loaded = hinst.LoadResource(&res).ok()?;
+    hinst.LockResource(&res, &loaded).ok().map(<[u8]>::to_vec)
+}
+
+/// Turn the raw `EMBALA_BANNER` BMP *file* bytes into an HBITMAP pre-scaled to
+/// `dst_w`×`dst_h` device pixels (SS_BITMAP does not stretch, so it must arrive
+/// at the control's size). The resource is a BITMAPFILEHEADER-prefixed BMP: skip
+/// the 14-byte file header, load the DIB at its native size, then HALFTONE
+/// StretchBlt it down to the target box.
+///
+/// ponytail: 24/32-bit BI_RGB banners only — winsafe's `BITMAPINFO` carries a
+/// single-entry color table, so a palettized (≤8-bit) BMP would need the file's
+/// palette copied in first. The fixture and NSIS MUI banners are 24-bit; upgrade
+/// path is a hand-built raw BITMAPINFO buffer if a palettized banner is ever set.
+fn banner_bitmap(
+    bmp_file: &[u8],
+    dst_w: i32,
+    dst_h: i32,
+) -> Option<w::guard::DeleteObjectGuard<w::HBITMAP>> {
+    // BITMAPFILEHEADER (14) + at least a BITMAPINFOHEADER (40).
+    if bmp_file.len() < 54 || &bmp_file[..2] != b"BM" {
+        return None;
+    }
+    let off_bits = u32::from_le_bytes(bmp_file[10..14].try_into().ok()?) as usize;
+    // BITMAPINFOHEADER fields (at offset 14): width/height/bit-count.
+    let src_w = i32::from_le_bytes(bmp_file[18..22].try_into().ok()?);
+    let src_h = i32::from_le_bytes(bmp_file[22..26].try_into().ok()?);
+    let bit_count = u16::from_le_bytes(bmp_file[28..30].try_into().ok()?);
+    let rows = src_h.unsigned_abs();
+    let pixels = bmp_file.get(off_bits..)?;
+
+    let screen = w::HWND::GetDesktopWindow().GetDC().ok()?;
+
+    // Load the file's pixel bits into a native-size, screen-compatible DIB.
+    let src_bmp = screen.CreateCompatibleBitmap(src_w, rows as i32).ok()?;
+    let mut bmi = w::BITMAPINFO::default();
+    bmi.bmiHeader.biWidth = src_w;
+    bmi.bmiHeader.biHeight = src_h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = bit_count;
+    bmi.bmiHeader.biCompression = co::BI::RGB;
+    screen
+        .SetDIBits(&src_bmp, 0, rows, pixels, &bmi, co::DIB::RGB_COLORS)
+        .ok()?;
+
+    // HALFTONE-downscale the native bitmap into the destination-size bitmap.
+    let dst_bmp = screen.CreateCompatibleBitmap(dst_w, dst_h).ok()?;
+    let src_dc = screen.CreateCompatibleDC().ok()?;
+    let dst_dc = screen.CreateCompatibleDC().ok()?;
+    {
+        let _s = src_dc.SelectObject(&*src_bmp).ok()?;
+        let _d = dst_dc.SelectObject(&*dst_bmp).ok()?;
+        dst_dc.SetStretchBltMode(co::STRETCH_MODE::HALFTONE).ok()?;
+        dst_dc
+            .StretchBlt(
+                w::POINT::with(0, 0),
+                w::SIZE::with(dst_w, dst_h),
+                &src_dc,
+                w::POINT::with(0, 0),
+                w::SIZE::with(src_w, rows as i32),
+                co::ROP::SRCCOPY,
+            )
+            .ok()?;
+    }
+    // Guards deselect the bitmaps on scope exit above, so `dst_bmp` is now free
+    // to hand to STM_SETIMAGE; `src_bmp` is deleted when its guard drops here.
+    Some(dst_bmp)
 }
 
 fn set_group(group: &[Box<dyn GuiWindow>], show: bool) {
