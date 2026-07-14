@@ -38,6 +38,7 @@ fn two_file_spec(payload_dir: &Path) -> SetupSpec {
         arch: SetupArch::X86_64,
         install_mode: InstallMode::PerUser,
         product: product(),
+        uninstall_options: vec![],
         files: vec![
             FileSpec {
                 src: payload_dir.join("hello.exe"),
@@ -178,6 +179,7 @@ fn traversal_and_duplicate_dests_are_rejected() {
                 arch: SetupArch::X86_64,
                 install_mode: InstallMode::PerUser,
                 product: product(),
+                uninstall_options: vec![],
                 files,
                 install_lua: None,
                 uninstall_lua: None,

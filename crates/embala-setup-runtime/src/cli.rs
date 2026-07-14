@@ -25,6 +25,10 @@ pub struct Args {
     pub mode: Option<ResolvedMode>,
     /// `/components=` value, split on commas. Stored only; unused this phase.
     pub components: Vec<String>,
+    /// `/options=` value (uninstall options, spec R4): `None` = flag absent,
+    /// `Some([])` = given but empty. Split on commas like `/components=`. Parsed
+    /// at install time too but only consumed by the uninstaller.
+    pub options: Option<Vec<String>>,
 }
 
 /// Parse installer args from an argv iterator (excluding argv[0]).
@@ -50,6 +54,15 @@ where
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect();
+        } else if let Some(ids) = a.strip_prefix("/options=") {
+            // `Some(_)` even when empty: the flag's *presence* means "options were
+            // resolved by the parent" (spec R4/R6), distinct from `None` = absent.
+            out.options = Some(
+                ids.split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            );
         }
         // else: unknown arg, ignored by design.
     }
@@ -79,12 +92,26 @@ mod tests {
             r"/D=C:\Program Files\Hello",
             "/mode=per-machine",
             "/components=core,docs",
+            "/options=purge-data",
         ])
         .unwrap();
         assert!(args.silent);
         assert_eq!(args.dir, Some(PathBuf::from(r"C:\Program Files\Hello")));
         assert_eq!(args.mode, Some(ResolvedMode::PerMachine));
         assert_eq!(args.components, vec!["core", "docs"]);
+        assert_eq!(args.options, Some(vec!["purge-data".to_string()]));
+    }
+
+    #[test]
+    fn options_flag_absent_vs_empty() {
+        // Why: `/S` uninstall must distinguish "no /options=" (use defaults) from
+        // "/options=" given empty (parent resolved to no options) — spec R4/R6.
+        assert_eq!(parse(["/S"]).unwrap().options, None);
+        assert_eq!(parse(["/options="]).unwrap().options, Some(vec![]));
+        assert_eq!(
+            parse(["/options=a,b"]).unwrap().options,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
     }
 
     #[test]

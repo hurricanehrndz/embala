@@ -11,3 +11,10 @@ embala.log("Uninstalling " .. embala.package.display_name)
 
 -- Idempotent with the engine's log replay (remove-if-exists).
 embala.fs.remove("hello.exe")
+
+-- Uninstall option (spec R2/R4): only wipe the data dir when the user ticked
+-- "purge-data" in the confirm dialog (or passed /options=purge-data).
+if embala.ui.selected("purge-data") then
+  embala.log("Deleting all Hello data")
+  embala.fs.remove_tree("data")
+end

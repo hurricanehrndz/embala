@@ -21,7 +21,12 @@
 use std::io::{Cursor, Write as _};
 use std::path::{Path, PathBuf};
 
-use embala_setup_overlay::{FORMAT_VERSION, Manifest, Package, Section, TRAILER_LEN, Trailer};
+use embala_setup_overlay::{
+    FORMAT_VERSION, Manifest, Package, Section, TRAILER_LEN, Trailer, UninstallOption,
+};
+// Re-export so `embala build` can assemble the spec without depending on the
+// overlay crate directly (spec R2).
+pub use embala_setup_overlay::UninstallOption as UninstallOptionSpec;
 use zip::write::SimpleFileOptions;
 
 /// The committed runtime stubs, embedded at this crate's compile time (spec R2).
@@ -119,6 +124,9 @@ pub struct SetupSpec {
     pub arch: SetupArch,
     pub install_mode: InstallMode,
     pub product: ProductInfo,
+    /// Declarative uninstall options (spec R2), carried into the overlay manifest
+    /// and shown by the uninstaller's confirm dialog.
+    pub uninstall_options: Vec<UninstallOption>,
     pub files: Vec<FileSpec>,
     /// Raw `install.lua` bytes shipped verbatim (spec R7). `None` ships the
     /// extraction-only Phase-2 placeholder.
@@ -286,6 +294,7 @@ fn manifest_bytes(spec: &SetupSpec) -> Vec<u8> {
             homepage: p.homepage.clone(),
             license: p.license.clone(),
         },
+        uninstall_options: spec.uninstall_options.clone(),
     }
     .to_bytes()
 }

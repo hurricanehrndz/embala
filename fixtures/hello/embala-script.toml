@@ -17,3 +17,6 @@ arch = "x86_64"
 files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
 script = "install.lua"
 uninstall-script = "uninstall.lua"
+uninstall-options = [
+  { id = "purge-data", label = "Delete all Hello data", default = false },
+]

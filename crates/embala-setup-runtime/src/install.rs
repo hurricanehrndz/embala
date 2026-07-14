@@ -176,7 +176,14 @@ fn write_uninstaller(
         let script = read_section(exe, trailer.uninstall_lua).map_err(|e| e.to_string())?;
         std::fs::write(install_dir.join("uninstall.lua"), &script).map_err(|e| e.to_string())?;
     }
-    std::fs::write(install_dir.join("manifest.json"), manifest.to_bytes())
+    // Record the *resolved* mode (spec R5): the wizard/`/mode=` may have chosen
+    // per-machine from a `user-choice` default, and the uninstaller must know to
+    // elevate. Never write `user-choice` into the sidecar.
+    let sidecar = Manifest {
+        install_mode: engine.resolved_mode_str().to_string(),
+        ..manifest.clone()
+    };
+    std::fs::write(install_dir.join("manifest.json"), sidecar.to_bytes())
         .map_err(|e| e.to_string())?;
     engine.flush_log().map_err(|e| e.to_string())?;
     Ok(())
@@ -224,8 +231,9 @@ fn extract_zip(bytes: &[u8], target: &Path) -> std::io::Result<()> {
 }
 
 /// Detect process elevation via the access token (spec R13). A failure to query
-/// is treated as *not* elevated, so per-machine still relaunches.
-fn is_elevated() -> bool {
+/// is treated as *not* elevated, so per-machine still relaunches. Shared with the
+/// uninstaller's per-machine elevation path (spec R6).
+pub(crate) fn is_elevated() -> bool {
     let Ok(token) = w::HPROCESS::GetCurrentProcess().OpenProcessToken(co::TOKEN::QUERY) else {
         return false;
     };

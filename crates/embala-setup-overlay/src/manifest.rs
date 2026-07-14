@@ -27,6 +27,20 @@ pub struct Manifest {
     pub install_mode: String,
     /// Product identity mirrored from `[package]`.
     pub package: Package,
+    /// Declarative uninstall options (spec R2), shown as checkboxes by the
+    /// uninstaller's confirm dialog. `#[serde(default)]`: an older sidecar
+    /// without the field parses to an empty list (no `FORMAT_VERSION` bump).
+    #[serde(default)]
+    pub uninstall_options: Vec<UninstallOption>,
+}
+
+/// One declarative uninstall option (spec R2). `default` pre-ticks its checkbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UninstallOption {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub default: bool,
 }
 
 /// Product identity, mirrored from the embala `[package]` section.
@@ -75,6 +89,11 @@ mod tests {
                 homepage: Some("https://example.com".to_string()),
                 license: None,
             },
+            uninstall_options: vec![UninstallOption {
+                id: "purge-data".to_string(),
+                label: "Delete all data".to_string(),
+                default: false,
+            }],
         }
     }
 
@@ -93,5 +112,15 @@ mod tests {
         // Why: byte-reproducibility of the whole setup.exe depends on the
         // manifest bytes being a pure function of the struct — no map ordering.
         assert_eq!(sample().to_bytes(), sample().to_bytes());
+    }
+
+    #[test]
+    fn json_without_uninstall_options_parses() {
+        // Why: a sidecar written by a pre-Phase-2 installer has no
+        // `uninstall_options` field; `#[serde(default)]` must let it parse to an
+        // empty list so old uninstall.exe sidecars keep working (spec R2 compat).
+        let json = br#"{"format_version":2,"arch":"x86_64","install_mode":"per-user","package":{"name":"hello","display_name":"Embala Hello","version":"0.1.0","identifier":"ca.hrndz.embala.hello","publisher":"Carlos Hernandez","description":"test","homepage":null,"license":null}}"#;
+        let parsed = Manifest::parse(json).expect("old sidecar must still parse");
+        assert!(parsed.uninstall_options.is_empty());
     }
 }

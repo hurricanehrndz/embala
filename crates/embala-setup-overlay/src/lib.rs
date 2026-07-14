@@ -27,7 +27,7 @@
 
 mod manifest;
 pub mod pe;
-pub use manifest::{Manifest, Package};
+pub use manifest::{Manifest, Package, UninstallOption};
 
 /// Trailer magic: "EMBALA SetUp".
 pub const MAGIC: [u8; 8] = *b"EMBALASU";

@@ -49,6 +49,9 @@ files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
 components = [
   { id = "docs", label = "Documentation", description = "Offline readme", default = true, files = [{ src = "readme.txt", dest = "readme.txt" }] },
 ]
+uninstall-options = [
+  { id = "purge-data", label = "Delete all Hello data", default = false },
+]
 
 # User-supplied signing commands (spec R5/R6). Kept commented so the fixture
 # stays unsigned and byte-reproducible for the deterministic build/msi-diff

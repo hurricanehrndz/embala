@@ -45,6 +45,8 @@
 //! [`gui::dpi`], which scales by the process's initial DPI. Per-monitor changes
 //! mid-session are not re-scaled (v1 limitation — documented).
 
+pub mod confirm;
+
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;

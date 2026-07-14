@@ -130,6 +130,22 @@ impl Engine {
         &self.install_dir
     }
 
+    /// The resolved install mode string (`per-user`/`per-machine`) — never
+    /// `user-choice`. The uninstaller sidecar records this so a per-machine
+    /// uninstall knows to elevate (spec R5).
+    pub fn resolved_mode_str(&self) -> &'static str {
+        self.mode.as_str()
+    }
+
+    /// Seed the declared/selected sets directly (spec R4) so `ui.selected(id)`
+    /// works at uninstall time, where there is no components page to declare them.
+    /// `ids` are every declared uninstall-option id; `selected` the resolved
+    /// subset. Reuses the component machinery `is_selected` already reads.
+    pub fn seed_options(&mut self, ids: BTreeSet<String>, selected: BTreeSet<String>) {
+        self.component_ids = ids;
+        self.selected_components = selected;
+    }
+
     /// Flush the whole log to `<install_dir>\install.log` (spec R12). Called at
     /// the end of a successful install; also best-effort after each record.
     pub fn flush_log(&self) -> std::io::Result<()> {

@@ -403,6 +403,15 @@ fn build_setup(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()
             homepage: package.homepage.clone(),
             license: package.license.clone(),
         },
+        uninstall_options: section
+            .uninstall_options
+            .iter()
+            .map(|o| embala_setup::UninstallOptionSpec {
+                id: o.id.clone(),
+                label: o.label.clone(),
+                default: o.default,
+            })
+            .collect(),
         files,
         install_lua,
         uninstall_lua: read_script(&section.uninstall_script)?,

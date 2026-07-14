@@ -148,6 +148,17 @@ pub struct Component {
     pub files: Vec<FileEntry>,
 }
 
+/// A declarative uninstall option (spec R2): a labelled checkbox the uninstaller
+/// confirm dialog shows, readable from `uninstall.lua` via `ui.selected(id)`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct UninstallOptionEntry {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub default: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Shortcut {
@@ -175,6 +186,10 @@ pub struct SetupSection {
     pub components: Vec<Component>,
     #[serde(default)]
     pub shortcuts: Vec<Shortcut>,
+    /// Declarative uninstall options (spec R2). Allowed with both declarative and
+    /// raw-`script` configs (they concern uninstall, not install lowering).
+    #[serde(default)]
+    pub uninstall_options: Vec<UninstallOptionEntry>,
     /// Escape-hatch path to a raw `install.lua` (relative to the config dir).
     pub script: Option<PathBuf>,
     pub uninstall_script: Option<PathBuf>,
@@ -330,6 +345,23 @@ fn validate_setup(setup: &SetupSection) -> Result<()> {
     for component in &setup.components {
         if !ids.insert(component.id.as_str()) {
             bail!("setup: duplicate component id {:?}", component.id);
+        }
+    }
+    // Uninstall options: non-empty unique ids, non-empty labels (spec R2). The
+    // ids reach `ui.selected(id)` at uninstall, so a blank/dup id is a hard error.
+    let mut opt_ids = std::collections::BTreeSet::new();
+    for option in &setup.uninstall_options {
+        if option.id.is_empty() {
+            bail!("setup: uninstall-option id must be non-empty");
+        }
+        if option.label.is_empty() {
+            bail!(
+                "setup: uninstall-option {:?} label must be non-empty",
+                option.id
+            );
+        }
+        if !opt_ids.insert(option.id.as_str()) {
+            bail!("setup: duplicate uninstall-option id {:?}", option.id);
         }
     }
     let dests = setup.installed_dests();
@@ -635,6 +667,69 @@ components = [
 "#;
         let err = parse(&with_setup(block)).unwrap_err().to_string();
         assert!(err.contains("duplicate component id"), "{err}");
+    }
+
+    #[test]
+    fn uninstall_options_parse() {
+        let block = r#"
+[setup]
+arch = "x86_64"
+main-executable = "hello.exe"
+files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
+uninstall-options = [
+  { id = "purge-data", label = "Delete all data", default = false },
+  { id = "keep-logs", label = "Keep logs" },
+]
+"#;
+        let config = parse(&with_setup(block)).expect("uninstall-options must parse");
+        let setup = config.setup.unwrap();
+        assert_eq!(setup.uninstall_options.len(), 2);
+        assert_eq!(setup.uninstall_options[0].id, "purge-data");
+        assert!(!setup.uninstall_options[0].default);
+        assert_eq!(setup.uninstall_options[1].label, "Keep logs");
+    }
+
+    #[test]
+    fn duplicate_uninstall_option_ids_are_rejected() {
+        let block = r#"
+[setup]
+arch = "x86_64"
+files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
+uninstall-options = [
+  { id = "purge-data", label = "A" },
+  { id = "purge-data", label = "B" },
+]
+"#;
+        let err = parse(&with_setup(block)).unwrap_err().to_string();
+        assert!(err.contains("duplicate uninstall-option id"), "{err}");
+    }
+
+    #[test]
+    fn empty_uninstall_option_id_or_label_is_rejected() {
+        let empty_id = r#"
+[setup]
+arch = "x86_64"
+files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
+uninstall-options = [{ id = "", label = "A" }]
+"#;
+        assert!(
+            parse(&with_setup(empty_id))
+                .unwrap_err()
+                .to_string()
+                .contains("id must be non-empty")
+        );
+        let empty_label = r#"
+[setup]
+arch = "x86_64"
+files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
+uninstall-options = [{ id = "purge-data", label = "" }]
+"#;
+        assert!(
+            parse(&with_setup(empty_label))
+                .unwrap_err()
+                .to_string()
+                .contains("label must be non-empty")
+        );
     }
 
     #[test]
