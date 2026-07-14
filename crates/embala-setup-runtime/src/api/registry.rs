@@ -1,6 +1,6 @@
-//! `embala.registry.*`, `embala.arp.register`, `embala.env.set` (spec R11) plus
-//! their reversal executors. All three are registry-backed, so they share the
-//! winsafe `HKEY` plumbing here.
+//! `embala.registry.*` (including the read-only `get`), `embala.arp.register`,
+//! `embala.env.set` (spec R11) plus their reversal executors. All are
+//! registry-backed, so they share the winsafe `HKEY` plumbing here.
 
 use std::cell::RefCell;
 use std::io;
@@ -38,6 +38,29 @@ pub fn registry_table(lua: &Lua, engine: &Rc<RefCell<Engine>>) -> mlua::Result<T
                     .borrow_mut()
                     .registry_set(hive, &key, name.as_deref(), value)
                     .map_err(to_lua)
+            })?,
+        )?;
+    }
+    {
+        // Read-only: no `super::gate` and no `record()`. `get` runs before the
+        // wizard gate opens (WebView2/previous-install checks) and journals
+        // nothing, so it neither waits on the gate nor takes part in reversal.
+        t.set(
+            "get",
+            lua.create_function(move |lua, spec: Table| {
+                let hive = parse_hive(&spec.get::<String>("hive")?)?;
+                let key = spec.get::<String>("key")?;
+                let name = spec.get::<Option<String>>("name")?;
+                Ok(
+                    match registry_get(hive, &key, name.as_deref()).map_err(to_lua)? {
+                        Some(w::RegistryValue::Sz(s) | w::RegistryValue::ExpandSz(s)) => {
+                            mlua::Value::String(lua.create_string(&s)?)
+                        }
+                        Some(w::RegistryValue::Dword(d)) => mlua::Value::Integer(d as i64),
+                        // Missing value, or a kind we don't map (spec R1) → nil.
+                        _ => mlua::Value::Nil,
+                    },
+                )
             })?,
         )?;
     }
@@ -267,6 +290,23 @@ fn hive_key(hive: Hive) -> w::HKEY {
     match hive {
         Hive::Hkcu => w::HKEY::CURRENT_USER,
         Hive::Hklm => w::HKEY::LOCAL_MACHINE,
+    }
+}
+
+/// Read a single value. `Ok(None)` when the key or value is absent — an
+/// ordinary branch condition for callers, not an error (spec R1). Any other
+/// failure propagates.
+fn registry_get(hive: Hive, key: &str, name: Option<&str>) -> io::Result<Option<w::RegistryValue>> {
+    let guard =
+        match hive_key(hive).RegOpenKeyEx(Some(key), co::REG_OPTION::default(), co::KEY::READ) {
+            Ok(g) => g,
+            Err(co::ERROR::FILE_NOT_FOUND) => return Ok(None),
+            Err(e) => return Err(win(e)),
+        };
+    match guard.RegQueryValueEx(name) {
+        Ok(v) => Ok(Some(v)),
+        Err(co::ERROR::FILE_NOT_FOUND) => Ok(None),
+        Err(e) => Err(win(e)),
     }
 }
 
