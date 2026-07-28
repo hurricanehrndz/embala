@@ -1,0 +1,168 @@
+name: release
+# Tag-driven: `git tag v0.1.0 && git push --tags`. The tag must match the
+# workspace version — the `meta` job fails the run otherwise.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned to the versions devenv.nix puts in the dev shell, so a local
+  # cross-build and a release build use the same toolchain.
+  ZIG_VERSION: 0.16.0
+  CARGO_ZIGBUILD_VERSION: 0.23.0
+  JUST_VERSION: 1.57.0
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: version
+        name: Resolve version and check it against the tag
+        run: |
+          version=$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "embala") | .version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "embala $version"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the workspace version (expected v$version)"
+            exit 1
+          fi
+  # crates/embala-setup `include_bytes!`-embeds a setup.exe stub for each
+  # Windows arch, so *every* build job needs both before the CLI will compile
+  # — and no single job can produce the other arch's. Build them once here and
+  # hand them to the matrix.
+  stubs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the zig cross toolchain and just
+        run: |
+          # A plain venv rather than pipx: cargo-zigbuild finds zig by running
+          # `python3 -m ziglang`, so the interpreter carrying `ziglang` has to
+          # be the one on PATH — pipx would hide it in an isolated venv.
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet \
+            "ziglang==$ZIG_VERSION" \
+            "cargo-zigbuild==$CARGO_ZIGBUILD_VERSION" \
+            "rust-just==$JUST_VERSION"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - run: rustup target add x86_64-pc-windows-gnu aarch64-pc-windows-gnullvm
+      - run: just stubs
+      - uses: actions/upload-artifact@v7
+        with:
+          name: setup-stubs
+          path: crates/embala-setup/stubs/
+          if-no-files-found: error
+  build:
+    needs: [meta, stubs]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux and Windows cross-compile cleanly from one Linux host via
+          # zig; macOS does not (cargo-zigbuild needs a macOS SDK for it), so
+          # darwin builds natively on an arm64 runner.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cargo: zigbuild
+            archive: tar
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cargo: zigbuild
+            archive: tar
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-latest
+            cargo: zigbuild
+            archive: zip
+            suffix: .exe
+          - target: aarch64-pc-windows-gnullvm
+            os: ubuntu-latest
+            cargo: zigbuild
+            archive: zip
+            suffix: .exe
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cargo: build
+            archive: tar
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: setup-stubs
+          path: crates/embala-setup/stubs/
+      - run: rustup target add ${{ matrix.target }}
+      - name: Install the zig cross toolchain
+        if: matrix.cargo == 'zigbuild'
+        run: |
+          # See the stubs job: `ziglang` must sit in the PATH interpreter.
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet \
+            "ziglang==$ZIG_VERSION" "cargo-zigbuild==$CARGO_ZIGBUILD_VERSION"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: cargo ${{ matrix.cargo }} -p embala --release --target ${{ matrix.target }}
+      # The musl targets are the ones that can be fully static, and a silent
+      # regression to dynamic linking is exactly the kind of thing nobody
+      # notices until a binary fails to start on someone else's distro.
+      - name: Check linkage
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/embala${{ matrix.suffix }}"
+          file "$bin"
+          case "${{ matrix.target }}" in
+            *-linux-musl)
+              file "$bin" | grep -q "statically linked" \
+                || { echo "::error::${{ matrix.target }} binary is not statically linked"; exit 1; }
+              ;;
+            *-apple-darwin)
+              # Cannot be static — macOS only supports linking libSystem
+              # dynamically. Print it so the dependency set stays visible.
+              otool -L "$bin"
+              ;;
+          esac
+      - name: Package
+        shell: bash
+        run: |
+          name="embala-${{ needs.meta.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "staging/$name"
+          cp "target/${{ matrix.target }}/release/embala${{ matrix.suffix }}" "staging/$name/"
+          cp README.md LICENSE "staging/$name/"
+          if [ "${{ matrix.archive }}" = zip ]; then
+            (cd staging && zip -qr "../$name.zip" "$name")
+          else
+            tar -czf "$name.tar.gz" -C staging "$name"
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: embala-${{ matrix.target }}
+          path: |
+            embala-*.tar.gz
+            embala-*.zip
+          if-no-files-found: error
+  release:
+    needs: [meta, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: embala-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums
+        run: cd dist && sha256sum embala-* | tee SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "embala ${{ needs.meta.outputs.version }}" \
+            --generate-notes \
+            dist/*
