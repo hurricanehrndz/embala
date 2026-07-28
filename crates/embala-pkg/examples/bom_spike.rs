@@ -14,8 +14,19 @@
 //!
 //! Usage: `cargo run -p embala-pkg --example bom_spike <TREE> [OUTPUT] [UID] [GID]`
 
+//!
+//! Unix-only: `write_bom` reads mode bits off the filesystem, which is what
+//! makes it comparable to `mkbom` in the first place.
+
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("bom_spike is a mkbom/lsbom oracle — Unix hosts only");
+}
+
+#[cfg(unix)]
 use embala_pkg::write_bom;
 
+#[cfg(unix)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let tree = args

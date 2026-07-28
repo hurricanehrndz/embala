@@ -39,9 +39,12 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, VecDeque},
     ffi::CString,
-    io::{Cursor, Read, Write},
-    path::Path,
+    io::{Cursor, Write},
 };
+
+// Only the staged-tree BOM writer touches the filesystem.
+#[cfg(unix)]
+use std::{io::Read, path::Path};
 
 use apple_bom::{
     BomPath, BomPathType,
@@ -63,56 +66,77 @@ use crate::{Error, Result};
 /// `mkbom`/`pkgbuild` store — and `lsbom` prints — is the `cksum(1)`
 /// algorithm (verified against both oracles: IEEE gives 0xe990f0b2 where
 /// Apple tooling records 0x1a06f7cd for the same bytes).
-fn cksum_path(path: &Path) -> std::io::Result<(u32, usize)> {
-    const fn table() -> [u32; 256] {
-        let mut table = [0u32; 256];
-        let mut i = 0;
-        while i < 256 {
-            let mut crc = (i as u32) << 24;
-            let mut bit = 0;
-            while bit < 8 {
-                crc = if crc & 0x8000_0000 != 0 {
-                    (crc << 1) ^ 0x04C1_1DB7
-                } else {
-                    crc << 1
-                };
-                bit += 1;
-            }
-            table[i] = crc;
-            i += 1;
+const fn cksum_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = (i as u32) << 24;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ 0x04C1_1DB7
+            } else {
+                crc << 1
+            };
+            bit += 1;
         }
-        table
+        table[i] = crc;
+        i += 1;
     }
-    const TABLE: [u32; 256] = table();
+    table
+}
 
-    let update =
-        |crc: u32, byte: u8| -> u32 { (crc << 8) ^ TABLE[(((crc >> 24) as u8) ^ byte) as usize] };
+const CKSUM_TABLE: [u32; 256] = cksum_table();
 
+/// Running `cksum` state, so one implementation serves both a streamed file
+/// and an in-memory payload.
+#[derive(Default)]
+struct Cksum {
+    crc: u32,
+    len: usize,
+}
+
+impl Cksum {
+    fn step(crc: u32, byte: u8) -> u32 {
+        (crc << 8) ^ CKSUM_TABLE[(((crc >> 24) as u8) ^ byte) as usize]
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.crc = Self::step(self.crc, *byte);
+        }
+        self.len += bytes.len();
+    }
+
+    /// Append the message length, least-significant byte first, using the
+    /// minimum number of bytes, then complement.
+    fn finish(self) -> (u32, usize) {
+        let mut crc = self.crc;
+        let mut length = self.len;
+        while length != 0 {
+            crc = Self::step(crc, (length & 0xff) as u8);
+            length >>= 8;
+        }
+        (!crc, self.len)
+    }
+}
+
+/// Streaming variant, for BOMs built by walking a staged tree.
+#[cfg(unix)]
+fn cksum_path(path: &Path) -> std::io::Result<(u32, usize)> {
     let mut fh = std::fs::File::open(path)?;
     let mut buffer = [0u8; 32768];
-    let mut file_size = 0usize;
-    let mut crc = 0u32;
+    let mut cksum = Cksum::default();
 
     loop {
         let bytes_read = fh.read(&mut buffer)?;
         if bytes_read == 0 {
             break;
         }
-        file_size += bytes_read;
-        for byte in &buffer[0..bytes_read] {
-            crc = update(crc, *byte);
-        }
+        cksum.update(&buffer[..bytes_read]);
     }
 
-    // Append the message length, least-significant byte first, using the
-    // minimum number of bytes.
-    let mut length = file_size;
-    while length != 0 {
-        crc = update(crc, (length & 0xff) as u8);
-        length >>= 8;
-    }
-
-    Ok((!crc, file_size))
+    Ok(cksum.finish())
 }
 
 /// Serialize the BOM variables index.
@@ -218,15 +242,38 @@ impl BomBuilder {
     ///
     /// A mutable reference to the just-added entry is returned to allow
     /// for further customization.
+    #[cfg(unix)]
     pub fn add_file_from_path(
         &mut self,
         bom_path: impl ToString,
         path: impl AsRef<Path>,
     ) -> Result<&mut BomPath> {
+        let (cksum, file_size) = cksum_path(path.as_ref())?;
+        self.add_file(bom_path, cksum, file_size)
+    }
+
+    /// Add a file to this BOM from its content in memory — the path the
+    /// payload tree is built from, with no staging round-trip through the
+    /// filesystem (and so no host-OS path separators or permissions).
+    pub fn add_file_from_bytes(
+        &mut self,
+        bom_path: impl ToString,
+        bytes: &[u8],
+    ) -> Result<&mut BomPath> {
+        let mut cksum = Cksum::default();
+        cksum.update(bytes);
+        let (cksum, file_size) = cksum.finish();
+        self.add_file(bom_path, cksum, file_size)
+    }
+
+    fn add_file(
+        &mut self,
+        bom_path: impl ToString,
+        cksum: u32,
+        file_size: usize,
+    ) -> Result<&mut BomPath> {
         let bom_path = bom_path.to_string();
         validate_bom_path(&bom_path)?;
-
-        let (cksum, file_size) = cksum_path(path.as_ref())?;
 
         let mut path = self.default_file_path()?;
         path.set_size(file_size);

@@ -4,6 +4,10 @@
 //! an independent xar/BOM implementation with names, sizes, content, and
 //! ownership intact — the same properties `xar(1)` and `lsbom(8)` verify
 //! on macOS.
+//!
+//! Unix-only: the BOM half stages a tree with real mode bits, which no other
+//! host can supply.
+#![cfg(unix)]
 
 use std::io::Cursor;
 use std::os::unix::fs::PermissionsExt;

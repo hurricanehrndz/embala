@@ -162,10 +162,8 @@ pub fn build(spec: &PkgSpec, out: &Path) -> Result<()> {
     let number_of_files = 1 + nodes.len() as u32;
     let install_kbytes = blocks.div_ceil(2);
 
-    // Stage the tree on disk for the BOM writer (root:wheel, 0:0).
-    let staging = tempfile::tempdir()?;
-    stage_tree(staging.path(), &nodes)?;
-    let bom = write_bom(staging.path(), 0, 0)?;
+    // BOM over the payload tree (root:wheel, 0:0).
+    let bom = bom_from_nodes(&nodes, 0, 0)?;
 
     let payload = gzip(&payload_cpio(&nodes))?;
     let package_info = package_info_xml(spec, number_of_files, install_kbytes)?;
@@ -262,24 +260,58 @@ fn ancestors(dest: &str) -> impl Iterator<Item = &str> {
         .map(|(i, _)| &dest[..i])
 }
 
+/// Does this payload file install as `0o755` rather than `0o644`?
+///
+/// The source's own exec bit is authoritative wherever the host records one.
+#[cfg(unix)]
 fn executable(path: &Path) -> Result<bool> {
     use std::os::unix::fs::PermissionsExt;
     Ok(std::fs::metadata(path)?.permissions().mode() & 0o111 != 0)
 }
 
-fn stage_tree(root: &Path, nodes: &BTreeMap<String, Node>) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    for (path, node) in nodes {
-        let full = root.join(path);
-        match node {
-            Node::Dir => std::fs::create_dir_all(&full)?,
-            Node::File { bytes, mode } => {
-                std::fs::write(&full, bytes)?;
-                std::fs::set_permissions(&full, std::fs::Permissions::from_mode(*mode))?;
-            }
+/// Windows has no exec bit to read, so fall back to sniffing the content for
+/// the two things a macOS payload actually needs `+x` on: a Mach-O image
+/// (thin or universal) and a `#!` script.
+///
+/// SHORTCUT: this is a heuristic, and it makes the mode host-dependent — a
+/// non-Mach-O, non-script file that is `chmod +x` on Unix installs as `0o644`
+/// when the same config is built on Windows. The upgrade path is an explicit
+/// per-file `mode` (or `executable`) key in the `[[pkg.files]]` config, which
+/// would make the mode host-independent on every platform and let this
+/// function go away.
+#[cfg(windows)]
+fn executable(path: &Path) -> Result<bool> {
+    use std::io::Read;
+
+    let mut head = [0u8; 4];
+    let mut fh = std::fs::File::open(path)?;
+    let mut filled = 0;
+    while filled < head.len() {
+        match fh.read(&mut head[filled..])? {
+            0 => break,
+            n => filled += n,
         }
     }
-    Ok(())
+    Ok(looks_executable(&head[..filled]))
+}
+
+/// The sniff itself, kept host-independent so it stays under test on hosts
+/// that never call it.
+#[cfg(any(windows, test))]
+fn looks_executable(head: &[u8]) -> bool {
+    if head.starts_with(b"#!") {
+        return true;
+    }
+    let Some(magic) = head.get(..4) else {
+        return false;
+    };
+    matches!(
+        u32::from_be_bytes(magic.try_into().expect("4 bytes")),
+        // Mach-O thin, 32- and 64-bit, both endiannesses, plus the universal
+        // ("fat") wrappers — including the 0xcafebabe form Java class files
+        // share, which is why a `.class` payload would false-positive here.
+        0xfeed_face | 0xcefa_edfe | 0xfeed_facf | 0xcffa_edfe | 0xcafe_babe | 0xbeba_feca
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -637,12 +669,45 @@ fn toc_file(entry: &XarEntry<'_>, next_id: &mut u64, heap: &mut Vec<u8>) -> Resu
 // ---------------------------------------------------------------------------
 // BOM writer
 
+/// Build a BOM over the in-memory payload tree, recording `uid:gid` as the
+/// owner of every entry.
+///
+/// Modes come from the tree itself rather than from a staged copy on disk:
+/// the host filesystem cannot round-trip them (Windows has no mode bits) and
+/// its path separators are not BOM path separators.
+fn bom_from_nodes(nodes: &BTreeMap<String, Node>, uid: u32, gid: u32) -> Result<Vec<u8>> {
+    let mtime = chrono::DateTime::from_timestamp(EPOCH_2000, 0).expect("fixed timestamp is valid");
+
+    let mut builder = bom_builder::BomBuilder::default();
+    builder.default_user_id(uid);
+    builder.default_group_id(gid);
+    builder.default_mtime(mtime);
+
+    // BTreeMap order already matches the BOM's sorted-path convention;
+    // directories are derived from file paths by the builder.
+    for (path, node) in nodes {
+        let Node::File { bytes, mode } = node else {
+            continue;
+        };
+        let entry = builder.add_file_from_bytes(path, bytes)?;
+        entry.set_file_mode((0o100000 | (mode & 0o7777)) as u16);
+        entry.set_modified_time(mtime);
+    }
+
+    builder.build_bom()
+}
+
 /// Build a BOM over the file tree rooted at `root`, recording `uid:gid` as
 /// the owner of every entry (pkgbuild's convention is `0:0`, root:wheel).
 ///
 /// Files record their on-disk permission bits (plus `S_IFREG`), size, and
 /// CRC32; directories are derived from file paths and recorded as `40755`.
 /// Output is deterministic: a fixed mtime is used and entries are sorted.
+///
+/// Unix-only: it reads mode bits off the filesystem, which is exactly what
+/// makes it a faithful oracle against `mkbom` and exactly what no other host
+/// can supply. [`build`] uses [`bom_from_nodes`] instead.
+#[cfg(unix)]
 pub fn write_bom(root: &Path, uid: u32, gid: u32) -> Result<Vec<u8>> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -670,6 +735,7 @@ pub fn write_bom(root: &Path, uid: u32, gid: u32) -> Result<Vec<u8>> {
 }
 
 /// Collect regular files under `dir` as paths relative to the walk root.
+#[cfg(unix)]
 fn collect_files(dir: &Path, prefix: PathBuf, files: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -684,4 +750,25 @@ fn collect_files(dir: &Path, prefix: PathBuf, files: &mut Vec<PathBuf>) -> Resul
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_executable;
+
+    /// The mode a Windows-hosted build assigns is decided entirely by this
+    /// sniff — on a host with no exec bit to read, a miss here ships a
+    /// `.pkg` whose binary installs non-executable.
+    #[test]
+    fn sniff_accepts_mach_o_and_scripts_only() {
+        // Mach-O 64-bit little-endian (the shape every arm64 binary has).
+        assert!(looks_executable(&[0xcf, 0xfa, 0xed, 0xfe]));
+        // Universal binary.
+        assert!(looks_executable(&[0xca, 0xfe, 0xba, 0xbe]));
+        assert!(looks_executable(b"#!/bin/sh\necho hi\n"));
+
+        assert!(!looks_executable(b"read me\n"));
+        assert!(!looks_executable(b"#"), "a lone '#' is not a shebang");
+        assert!(!looks_executable(b""));
+    }
 }
