@@ -10,8 +10,14 @@ members = [
     "crates/embala-setup-runtime",
 ]
 
+[profile.release]
+# Release artifacts ship without debug symbols. This is not just the CLI: the
+# setup-exe stubs `embala-setup` embeds are built with this profile too, so
+# every setup.exe a user produces carries the smaller stub.
+strip = true
+
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 authors = ["Carlos Hernandez <carlos@hrndz.ca>"]
 repository = "https://github.com/hurricanehrndz/embala"
