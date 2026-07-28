@@ -9,6 +9,36 @@ binaries** (Go, Rust, Zig, C, .NET AOT, Deno/Bun, …).
 **Status: v1 in progress.** Every backend is embala's own code on top of small
 format-primitive crates — no packager frameworks underneath.
 
+## Install
+
+Prebuilt binaries are attached to each
+[release](https://github.com/hurricanehrndz/embala/releases), alongside a
+`SHA256SUMS`:
+
+| Platform | Archive |
+|---|---|
+| Linux x86_64 | `embala-<version>-x86_64-unknown-linux-musl.tar.gz` |
+| Linux aarch64 | `embala-<version>-aarch64-unknown-linux-musl.tar.gz` |
+| macOS Apple silicon | `embala-<version>-aarch64-apple-darwin.tar.gz` |
+| Windows x86_64 | `embala-<version>-x86_64-pc-windows-gnu.zip` |
+| Windows aarch64 | `embala-<version>-aarch64-pc-windows-gnullvm.zip` |
+
+The Linux builds are static musl — no glibc version to match, no runtime
+dependencies at all. The Windows builds import only OS DLLs. The macOS build
+links `libSystem` and friends, as every Mach-O binary must.
+
+```sh
+tar -xzf embala-0.1.0-x86_64-unknown-linux-musl.tar.gz
+./embala-0.1.0-x86_64-unknown-linux-musl/embala --version
+```
+
+Building from source needs the dev shell once, to cross-compile the embedded
+`setup.exe` stubs — see [Development](#development):
+
+```sh
+just stubs && cargo install --path crates/embala
+```
+
 ## Why
 
 Every existing packager punts on the hard installer formats: cargo-packager and
