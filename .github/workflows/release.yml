@@ -50,6 +50,12 @@ jobs:
             "ziglang==$ZIG_VERSION" \
             "cargo-zigbuild==$CARGO_ZIGBUILD_VERSION" \
             "rust-just==$JUST_VERSION"
+          # The wheel exposes zig only as `python -m ziglang`, but
+          # embala-setup-runtime's build.rs shells out to a real `zig` for
+          # `zig rc`. Shim it so both entry points hit the same pinned zig.
+          printf '#!/bin/sh\nexec "%s/bin/python3" -m ziglang "$@"\n' \
+            "$RUNNER_TEMP/venv" > "$RUNNER_TEMP/venv/bin/zig"
+          chmod +x "$RUNNER_TEMP/venv/bin/zig"
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
       - run: rustup target add x86_64-pc-windows-gnu aarch64-pc-windows-gnullvm
       - run: just stubs
@@ -100,10 +106,14 @@ jobs:
       - name: Install the zig cross toolchain
         if: matrix.cargo == 'zigbuild'
         run: |
-          # See the stubs job: `ziglang` must sit in the PATH interpreter.
+          # See the stubs job for why this is a venv and not pipx, and why
+          # `zig` needs a shim on top of the wheel.
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install --quiet \
             "ziglang==$ZIG_VERSION" "cargo-zigbuild==$CARGO_ZIGBUILD_VERSION"
+          printf '#!/bin/sh\nexec "%s/bin/python3" -m ziglang "$@"\n' \
+            "$RUNNER_TEMP/venv" > "$RUNNER_TEMP/venv/bin/zig"
+          chmod +x "$RUNNER_TEMP/venv/bin/zig"
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
       - name: Build
         run: cargo ${{ matrix.cargo }} -p embala --release --target ${{ matrix.target }}
