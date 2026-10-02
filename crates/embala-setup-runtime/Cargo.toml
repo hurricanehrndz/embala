@@ -17,7 +17,7 @@ path = "src/main.rs"
 # compiles on this Linux host — proving the vendored build before zig ever runs.
 mlua = { version = "0.12", features = ["lua54", "vendored"] }
 # Shared PE-overlay trailer + manifest format (the writer's counterpart).
-embala-setup-overlay = { version = "0.1.0", path = "../embala-setup-overlay" }
+embala-setup-overlay = { version = "0.2.0", path = "../embala-setup-overlay" }
 # Install-log records + manifest are (de)serialized as JSON lines / JSON; these
 # power the host-testable pure-logic modules (log/mode), so they are normal deps.
 serde = { version = "1", features = ["derive"] }

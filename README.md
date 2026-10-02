@@ -28,8 +28,8 @@ dependencies at all. The Windows builds import only OS DLLs. The macOS build
 links `libSystem` and friends, as every Mach-O binary must.
 
 ```sh
-tar -xzf embala-0.1.0-x86_64-unknown-linux-musl.tar.gz
-./embala-0.1.0-x86_64-unknown-linux-musl/embala --version
+tar -xzf embala-0.2.0-x86_64-unknown-linux-musl.tar.gz
+./embala-0.2.0-x86_64-unknown-linux-musl/embala --version
 ```
 
 Building from source needs the dev shell once, to cross-compile the embedded
