@@ -157,4 +157,18 @@ mod tests {
         );
         assert_eq!(ManifestMode::parse("bogus"), None);
     }
+
+    #[test]
+    fn lua_mode_strings_match_the_manifest_vocabulary() {
+        // Why: install.lua branches on `embala.mode`; it must report the same
+        // strings a manifest declares, or scripts silently take the wrong path.
+        assert_eq!(
+            ManifestMode::parse(ResolvedMode::PerUser.as_str()),
+            Some(ManifestMode::PerUser)
+        );
+        assert_eq!(
+            ManifestMode::parse(ResolvedMode::PerMachine.as_str()),
+            Some(ManifestMode::PerMachine)
+        );
+    }
 }
