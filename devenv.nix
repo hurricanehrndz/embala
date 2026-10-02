@@ -51,6 +51,7 @@
   # mlua's vendored Lua fails to compile natively. Pin the host-target compiler
   # to native `cc`; cargo-zigbuild sets its own per-target CC for the stubs.
   env.CC_x86_64_unknown_linux_gnu = "cc";
+  env.CC_aarch64_apple_darwin = "cc";
 
   treefmt = {
     enable = true;
