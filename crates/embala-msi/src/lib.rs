@@ -5,7 +5,8 @@
 //! build on any OS with no WiX, Wine, or .NET.
 //!
 //! Scope for v1: install files to Program Files, Start-menu shortcut,
-//! Add/Remove Programs entry, clean uninstall, MajorUpgrade. Nothing else.
+//! Add/Remove Programs entry, clean uninstall, MajorUpgrade, and optionally
+//! the main executable as a Windows service. Nothing else.
 //
 // Portions ported from deno desktop (cli/tools/desktop.rs),
 // Copyright 2018-2026 the Deno authors, MIT license.
@@ -44,6 +45,31 @@ impl MsiArch {
     }
 }
 
+/// Service start type: `ServiceInstall.StartType` (SERVICE_AUTO_START,
+/// SERVICE_DEMAND_START, SERVICE_DISABLED).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceStart {
+    Auto,
+    Demand,
+    Disabled,
+}
+
+/// Installs the main executable as an own-process service via the native
+/// ServiceInstall/ServiceControl tables (no custom actions). Mirrors WiX
+/// `<ServiceInstall Type="ownProcess" ErrorControl="normal">` plus
+/// `<ServiceControl Start="install" Stop="both" Remove="uninstall" Wait="yes">`;
+/// a `Disabled` service is not started (StartServices would fail on it).
+#[derive(Debug, Clone)]
+pub struct ServiceSpec {
+    /// SCM service (key) name.
+    pub name: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub start: ServiceStart,
+    /// Command-line arguments the SCM passes to the executable.
+    pub arguments: Option<String>,
+}
+
 /// A payload file: `src` on disk (already resolved to a real path), `dest`
 /// the `/`-separated install path relative to the install directory.
 #[derive(Debug, Clone)]
@@ -74,6 +100,8 @@ pub struct MsiSpec {
     /// Dest of the file the Start-menu shortcut targets.
     pub main_executable: String,
     pub files: Vec<FileSpec>,
+    /// Register `main_executable` as a Windows service.
+    pub service: Option<ServiceSpec>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -89,6 +117,11 @@ pub enum Error {
     MainExecutableNotFound(String),
     #[error("msi: two files share the dest {0:?}")]
     DuplicateDest(String),
+    #[error(
+        "msi service name {0:?} must be 1-256 characters without '/' or '\\' \
+         (Windows SCM rules)"
+    )]
+    InvalidServiceName(String),
     #[error("msi payload too large (File.FileSize is a 32-bit int): {0}")]
     FileTooLarge(PathBuf),
     #[error(transparent)]
@@ -170,6 +203,26 @@ fn validate(spec: &MsiSpec) -> Result<()> {
     }
     if !spec.files.iter().any(|f| f.dest == spec.main_executable) {
         return Err(Error::MainExecutableNotFound(spec.main_executable.clone()));
+    }
+    if let Some(service) = &spec.service {
+        ensure_ascii("service name", &service.name)?;
+        // CreateService: at most 256 chars, no slashes. Brackets would be
+        // expanded as properties (ServiceInstall.Name is Formatted).
+        if service.name.is_empty()
+            || service.name.len() > 256
+            || service.name.contains(['/', '\\', '[', ']'])
+        {
+            return Err(Error::InvalidServiceName(service.name.clone()));
+        }
+        for (field, value) in [
+            ("service display-name", &service.display_name),
+            ("service description", &service.description),
+            ("service arguments", &service.arguments),
+        ] {
+            if let Some(value) = value {
+                ensure_ascii(field, value)?;
+            }
+        }
     }
     Ok(())
 }

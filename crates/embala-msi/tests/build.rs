@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use embala_msi::{FileSpec, MsiArch, MsiSpec, build};
+use embala_msi::{FileSpec, MsiArch, MsiSpec, ServiceSpec, ServiceStart, build};
 
 const PAYLOAD_EXE: &[u8] = b"MZ fake windows executable payload";
 const PAYLOAD_TXT: &[u8] = b"readme contents\n";
@@ -40,6 +40,7 @@ fn test_spec(payload_dir: &Path) -> MsiSpec {
                 dest: "data/readme.txt".to_string(),
             },
         ],
+        service: None,
     }
 }
 
@@ -200,6 +201,101 @@ fn non_ascii_spec_is_rejected() {
         matches!(err, embala_msi::Error::NonAscii { .. }),
         "unexpected error: {err}"
     );
+}
+
+fn service_spec(start: ServiceStart) -> ServiceSpec {
+    ServiceSpec {
+        name: "foo".to_string(),
+        display_name: Some("Foo".to_string()),
+        description: Some("Foo service".to_string()),
+        start,
+        arguments: Some("--service".to_string()),
+    }
+}
+
+/// Every row of `table`, rendered tab-separated (NULL = empty), the shape
+/// `msiinfo export` prints.
+fn rows(package: &mut msi::Package<fs::File>, table: &str) -> Vec<String> {
+    package
+        .select_rows(msi::Select::table(table))
+        .unwrap()
+        .map(|row| {
+            (0..row.len())
+                .map(|i| match &row[i] {
+                    msi::Value::Null => String::new(),
+                    msi::Value::Int(n) => n.to_string(),
+                    msi::Value::Str(s) => s.clone(),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join("\t")
+        })
+        .collect()
+}
+
+#[test]
+fn service_tables_match_wixl() {
+    let mut spec = test_spec(&tmp("payload-service"));
+    spec.service = Some(service_spec(ServiceStart::Auto));
+    let out = tmp("service.msi");
+    build(&spec, &out).unwrap();
+    let mut package = msi::Package::open(fs::File::open(&out).unwrap()).unwrap();
+
+    // Expected rows are wixl's output for <ServiceInstall Type="ownProcess"
+    // Start="auto" ErrorControl="normal"> and <ServiceControl Start="install"
+    // Stop="both" Remove="uninstall" Wait="yes">, on the component whose
+    // KeyPath is the main executable (c1: components follow sorted dests,
+    // and data/readme.txt sorts first).
+    assert_eq!(
+        rows(&mut package, "ServiceInstall"),
+        vec!["AppService\tfoo\tFoo\t16\t2\t1\t\t\t\t\t--service\tc1\tFoo service"]
+    );
+    assert_eq!(
+        rows(&mut package, "ServiceControl"),
+        vec!["AppServiceControl\tfoo\t163\t\t1\tc1"]
+    );
+    let seq = rows(&mut package, "InstallExecuteSequence");
+    for expected in [
+        "StopServices\tVersionNT\t1900",
+        "DeleteServices\tVersionNT\t2000",
+        "InstallServices\tVersionNT\t5800",
+        "StartServices\tVersionNT\t5900",
+    ] {
+        assert!(seq.contains(&expected.to_string()), "{expected}: {seq:?}");
+    }
+
+    // A disabled service cannot be started: StartServices would fail the
+    // install, so the Start-on-install bit (0x1) is dropped.
+    spec.service = Some(service_spec(ServiceStart::Disabled));
+    build(&spec, &out).unwrap();
+    let mut package = msi::Package::open(fs::File::open(&out).unwrap()).unwrap();
+    assert_eq!(
+        rows(&mut package, "ServiceControl"),
+        vec!["AppServiceControl\tfoo\t162\t\t1\tc1"]
+    );
+    assert!(rows(&mut package, "ServiceInstall")[0].contains("\t16\t4\t1\t"));
+
+    // No service: no service tables at all.
+    spec.service = None;
+    build(&spec, &out).unwrap();
+    let package = msi::Package::open(fs::File::open(&out).unwrap()).unwrap();
+    assert!(!package.has_table("ServiceInstall"));
+    assert!(!package.has_table("ServiceControl"));
+}
+
+#[test]
+fn invalid_service_name_is_rejected() {
+    let mut spec = test_spec(&tmp("payload-service-name"));
+    for bad in ["", "a/b", "a\\b", "[PROP]", &"x".repeat(257)] {
+        let mut service = service_spec(ServiceStart::Auto);
+        service.name = bad.to_string();
+        spec.service = Some(service);
+        let err = build(&spec, &tmp("service-name.msi")).unwrap_err();
+        assert!(
+            matches!(err, embala_msi::Error::InvalidServiceName(_)),
+            "{bad:?}: {err}"
+        );
+    }
 }
 
 fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {

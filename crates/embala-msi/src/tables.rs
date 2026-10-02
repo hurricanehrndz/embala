@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use msi::{Category, Column, Insert, Value};
 
-use crate::{Error, MsiSpec, Result, guids};
+use crate::{Error, MsiSpec, Result, ServiceStart, guids};
 
 /// Name of the CFB stream holding the embedded cabinet. The Media table
 /// references it as `#embala.cab` (the `#` marks an internal stream).
@@ -179,6 +179,9 @@ pub(crate) fn write<F: Read + Write + Seek>(
     staged: &Staged,
 ) -> Result<()> {
     create_schemas(package)?;
+    if spec.service.is_some() {
+        create_service_schemas(package)?;
+    }
 
     // --- Directory ----------------------------------------------------------
     let mut directory_rows = vec![
@@ -446,20 +449,34 @@ pub(crate) fn write<F: Read + Write + Seek>(
         ("PublishProduct", 6400),
         ("InstallFinalize", 6600),
     ];
-    package.insert_rows(
-        Insert::into("InstallExecuteSequence").rows(
-            exec_seq
-                .iter()
-                .map(|(action, seq)| {
-                    vec![
-                        Value::Str(action.to_string()),
-                        Value::Null,
-                        Value::Int(*seq),
-                    ]
-                })
-                .collect(),
-        ),
-    )?;
+    let mut exec_rows: Vec<Vec<Value>> = exec_seq
+        .iter()
+        .map(|(action, seq)| {
+            vec![
+                Value::Str(action.to_string()),
+                Value::Null,
+                Value::Int(*seq),
+            ]
+        })
+        .collect();
+    if let Some(service) = &spec.service {
+        write_service(package, service, staged)?;
+        // Standard sequence numbers, with the `VersionNT` condition wixl
+        // emits for <ServiceInstall>/<ServiceControl>.
+        for (action, seq) in [
+            ("StopServices", 1900),
+            ("DeleteServices", 2000),
+            ("InstallServices", 5800),
+            ("StartServices", 5900),
+        ] {
+            exec_rows.push(vec![
+                Value::Str(action.to_string()),
+                Value::Str("VersionNT".to_string()),
+                Value::Int(seq),
+            ]);
+        }
+    }
+    package.insert_rows(Insert::into("InstallExecuteSequence").rows(exec_rows))?;
     // Minimal UI sequence: cost the install, then hand off to the execute
     // sequence. No Dialog/Control tables — basic-UI msiexec runs use this.
     let ui_seq: &[(&str, i32)] = &[
@@ -486,6 +503,112 @@ pub(crate) fn write<F: Read + Write + Seek>(
         ),
     )?;
 
+    Ok(())
+}
+
+/// ServiceInstall + ServiceControl rows on the main executable's component,
+/// so the service lives and dies with the file it runs.
+fn write_service<F: Read + Write + Seek>(
+    package: &mut msi::Package<F>,
+    service: &crate::ServiceSpec,
+    staged: &Staged,
+) -> Result<()> {
+    let component = staged
+        .files
+        .iter()
+        .find(|f| f.key == staged.shortcut_file_key)
+        .map(|f| f.component.clone())
+        .expect("stage() resolved the main executable");
+    const SERVICE_WIN32_OWN_PROCESS: i32 = 0x10;
+    const SERVICE_ERROR_NORMAL: i32 = 1;
+    let start_type = match service.start {
+        ServiceStart::Auto => 2,     // SERVICE_AUTO_START
+        ServiceStart::Demand => 3,   // SERVICE_DEMAND_START
+        ServiceStart::Disabled => 4, // SERVICE_DISABLED
+    };
+    let opt = |v: &Option<String>| v.clone().map_or(Value::Null, Value::Str);
+    package.insert_rows(Insert::into("ServiceInstall").row(vec![
+        Value::Str("AppService".to_string()),
+        Value::Str(service.name.clone()),
+        opt(&service.display_name),
+        Value::Int(SERVICE_WIN32_OWN_PROCESS),
+        Value::Int(start_type),
+        Value::Int(SERVICE_ERROR_NORMAL),
+        Value::Null, // LoadOrderGroup
+        Value::Null, // Dependencies
+        Value::Null, // StartName: LocalSystem
+        Value::Null, // Password
+        opt(&service.arguments),
+        Value::Str(component.clone()),
+        opt(&service.description),
+    ]))?;
+
+    // msidbServiceControlEvent*: Start on install, Stop on install and
+    // uninstall, Remove on uninstall (WiX Start="install" Stop="both"
+    // Remove="uninstall" = 0xA3). A disabled service cannot be started.
+    const START_INSTALL: i32 = 0x01;
+    const STOP_INSTALL: i32 = 0x02;
+    const STOP_UNINSTALL: i32 = 0x20;
+    const REMOVE_UNINSTALL: i32 = 0x80;
+    let mut event = STOP_INSTALL | STOP_UNINSTALL | REMOVE_UNINSTALL;
+    if service.start != ServiceStart::Disabled {
+        event |= START_INSTALL;
+    }
+    package.insert_rows(Insert::into("ServiceControl").row(vec![
+        Value::Str("AppServiceControl".to_string()),
+        Value::Str(service.name.clone()),
+        Value::Int(event),
+        Value::Null,   // Arguments
+        Value::Int(1), // Wait: block until the SCM reports the state change
+        Value::Str(component),
+    ]))?;
+    Ok(())
+}
+
+/// Column types match wixl's (`msiinfo export` `_Columns`).
+fn create_service_schemas<F: Read + Write + Seek>(package: &mut msi::Package<F>) -> Result<()> {
+    package.create_table(
+        "ServiceInstall",
+        vec![
+            Column::build("ServiceInstall").primary_key().id_string(72),
+            Column::build("Name").formatted_string(255),
+            Column::build("DisplayName")
+                .nullable()
+                .localizable()
+                .formatted_string(255),
+            Column::build("ServiceType").int32(),
+            Column::build("StartType").int32(),
+            Column::build("ErrorControl").int32(),
+            Column::build("LoadOrderGroup")
+                .nullable()
+                .formatted_string(255),
+            Column::build("Dependencies")
+                .nullable()
+                .formatted_string(255),
+            Column::build("StartName").nullable().formatted_string(255),
+            Column::build("Password").nullable().formatted_string(255),
+            Column::build("Arguments").nullable().formatted_string(255),
+            Column::build("Component_").id_string(72),
+            Column::build("Description")
+                .nullable()
+                .localizable()
+                .formatted_string(255),
+        ],
+    )?;
+    package.create_table(
+        "ServiceControl",
+        vec![
+            Column::build("ServiceControl").primary_key().id_string(72),
+            Column::build("Name").localizable().formatted_string(255),
+            Column::build("Event").int16(),
+            Column::build("Arguments")
+                .nullable()
+                .localizable()
+                .formatted_string(255),
+            Column::build("Wait").nullable().int16(),
+            Column::build("Component_").id_string(72),
+        ],
+    )?;
     Ok(())
 }
 

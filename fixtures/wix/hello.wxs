@@ -28,6 +28,14 @@
                      Win64="yes">
             <File Id="helloexe" Name="hello.exe"
                   Source="fixtures/hello/dist/hello.exe" KeyPath="yes"/>
+            <!-- [msi] service: start = "disabled", so no Start event. -->
+            <ServiceInstall Id="AppService" Name="embala-hello"
+                            DisplayName="Embala Hello"
+                            Description="Embala test service"
+                            Type="ownProcess" Start="disabled"
+                            ErrorControl="normal"/>
+            <ServiceControl Id="AppServiceControl" Name="embala-hello"
+                            Stop="both" Remove="uninstall" Wait="yes"/>
           </Component>
         </Directory>
       </Directory>

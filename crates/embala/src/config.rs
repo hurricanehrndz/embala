@@ -64,6 +64,27 @@ pub struct MsiSection {
     pub arch: MsiArch,
     pub files: Vec<FileEntry>,
     pub main_executable: String,
+    /// Installs `main-executable` as a Windows service (ServiceInstall/
+    /// ServiceControl tables; name rules are checked by embala-msi).
+    pub service: Option<MsiService>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceStart {
+    Auto,
+    Demand,
+    Disabled,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct MsiService {
+    pub name: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub start: ServiceStart,
+    pub arguments: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -83,6 +104,9 @@ pub struct PkgSection {
     /// (`installer -target CurrentUserHomeDirectory`) — the sudo-free test hook.
     #[serde(default)]
     pub enable_user_home: bool,
+    /// `pkgbuild --scripts` directory (relative to the config dir): packed
+    /// whole; top-level `preinstall`/`postinstall` run as install hooks.
+    pub scripts: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -488,7 +512,17 @@ mod tests {
             nupkg.icon_url.as_deref(),
             Some("https://github.com/hurricanehrndz/embala/raw/main/fixtures/hello/icon.png")
         );
-        assert_eq!(config.msi.unwrap().arch, MsiArch::X86_64);
+        let msi = config.msi.unwrap();
+        assert_eq!(msi.arch, MsiArch::X86_64);
+        // Disabled, so installing the (non-service) fixture exe never tries
+        // to start it.
+        let service = msi.service.unwrap();
+        assert_eq!(service.name, "embala-hello");
+        assert_eq!(service.start, ServiceStart::Disabled);
+        assert_eq!(
+            config.pkg.unwrap().scripts.as_deref(),
+            Some(Path::new("scripts"))
+        );
         let setup = config.setup.unwrap();
         assert_eq!(setup.arch, SetupArch::X86_64);
         // install-mode defaults to per-user when omitted (spec R18).
@@ -619,6 +653,17 @@ mod tests {
     fn thirty_two_bit_arch_is_rejected() {
         let text = fixture_toml().replace("arch = \"x86_64\"", "arch = \"x86\"");
         assert!(parse(&text).is_err());
+    }
+
+    #[test]
+    fn unknown_service_start_is_rejected() {
+        // Why: the start type maps onto a fixed SCM enum; a typo must not
+        // silently become some default.
+        let text = fixture_toml().replace("start = \"disabled\"", "start = \"boot\"");
+        assert!(parse(&text).is_err());
+        let text = fixture_toml().replace("start = \"disabled\"", "start = \"auto\"");
+        let service = parse(&text).unwrap().msi.unwrap().service.unwrap();
+        assert_eq!(service.start, ServiceStart::Auto);
     }
 
     #[test]

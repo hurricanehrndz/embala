@@ -1,0 +1,5 @@
+#!/bin/sh
+# [pkg] scripts fixture: proves installer ran the hook. $2 is the install
+# location (under ~ for `installer -target CurrentUserHomeDirectory`). Not
+# $TMPDIR: installer points it into a sandbox it deletes afterwards.
+echo "embala-hello postinstall: $2" > /tmp/embala-hello-postinstall

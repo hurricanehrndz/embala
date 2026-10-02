@@ -208,6 +208,7 @@ fn build_pkg(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> 
                 dest: f.dest.clone(),
             })
             .collect(),
+        scripts: section.scripts.as_ref().map(|s| base.join(s)),
     };
     let out = out_dir.join(format!("{}-{}.pkg", package.name, package.version));
     std::fs::create_dir_all(out_dir)?;
@@ -311,6 +312,17 @@ fn build_msi(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> 
                 dest: f.dest.clone(),
             })
             .collect(),
+        service: section.service.as_ref().map(|s| embala_msi::ServiceSpec {
+            name: s.name.clone(),
+            display_name: s.display_name.clone(),
+            description: s.description.clone(),
+            start: match s.start {
+                config::ServiceStart::Auto => embala_msi::ServiceStart::Auto,
+                config::ServiceStart::Demand => embala_msi::ServiceStart::Demand,
+                config::ServiceStart::Disabled => embala_msi::ServiceStart::Disabled,
+            },
+            arguments: s.arguments.clone(),
+        }),
     };
     let out = out_dir.join(format!(
         "{}-{}-{}.msi",

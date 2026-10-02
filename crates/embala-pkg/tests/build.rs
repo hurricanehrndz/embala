@@ -44,6 +44,7 @@ fn spec(src_dir: &Path) -> PkgSpec {
                 dest: "share/doc/hello/README".to_string(),
             },
         ],
+        scripts: None,
     }
 }
 
@@ -92,6 +93,12 @@ struct CpioEntry {
 /// `070707` magic, 0:0 ownership, `TRAILER!!!` terminator, zero padding to
 /// a 512-byte boundary.
 fn parse_odc(archive: &[u8]) -> Vec<CpioEntry> {
+    parse_odc_owned(archive, true)
+}
+
+/// `parse_odc`, optionally skipping the 0:0 ownership checks: pkgbuild's own
+/// Scripts archive records the builder's uid and real dev numbers.
+fn parse_odc_owned(archive: &[u8], root_owned: bool) -> Vec<CpioEntry> {
     let mut entries = Vec::new();
     let mut rest = archive;
     loop {
@@ -100,10 +107,12 @@ fn parse_odc(archive: &[u8]) -> Vec<CpioEntry> {
         let field = |lo: usize, hi: usize| {
             u64::from_str_radix(std::str::from_utf8(&header[lo..hi]).unwrap(), 8).unwrap()
         };
-        assert_eq!(field(6, 12), 0, "dev");
-        assert_eq!(field(24, 30), 0, "uid");
-        assert_eq!(field(30, 36), 0, "gid");
-        assert_eq!(field(42, 48), 0, "rdev");
+        if root_owned {
+            assert_eq!(field(6, 12), 0, "dev");
+            assert_eq!(field(24, 30), 0, "uid");
+            assert_eq!(field(30, 36), 0, "gid");
+            assert_eq!(field(42, 48), 0, "rdev");
+        }
         let (inode, mode, nlink) = (field(12, 18), field(18, 24), field(36, 42));
         let (name_size, file_size) = (field(59, 65) as usize, field(65, 76) as usize);
         let name = std::str::from_utf8(&rest[76..76 + name_size - 1])
@@ -389,4 +398,191 @@ fn rejects_bad_specs() {
 
     // Nothing above may leave a partial artifact behind.
     assert!(!out.exists());
+}
+
+/// A pkgbuild `--scripts` dir: both hooks, a non-executable helper the hooks
+/// would source, and a nested resource — pkgbuild ships all of it.
+fn scripts_dir(dir: &Path) -> PathBuf {
+    let scripts = dir.join("scripts");
+    std::fs::create_dir_all(scripts.join("lib")).unwrap();
+    write_src(&scripts, "preinstall", b"#!/bin/sh\necho pre\n", 0o755);
+    write_src(&scripts, "postinstall", b"#!/bin/sh\necho post\n", 0o755);
+    write_src(&scripts, "helper.sh", b"helper\n", 0o644);
+    write_src(&scripts, "lib/inner.txt", b"x\n", 0o644);
+    scripts
+}
+
+fn component_file(archive: &[u8], path: &str) -> Option<Vec<u8>> {
+    let mut reader = XarReader::new(Cursor::new(archive.to_vec())).unwrap();
+    reader.get_file_data_from_path(path).unwrap()
+}
+
+fn gunzip(gz: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    flate2::read::GzDecoder::new(gz)
+        .read_to_end(&mut out)
+        .unwrap();
+    out
+}
+
+/// `(name, mode, data)` per entry, sorted, without the trailer.
+fn cpio_listing(cpio: &[u8], root_owned: bool) -> Vec<(String, u64, Vec<u8>)> {
+    let mut listed: Vec<_> = parse_odc_owned(cpio, root_owned)
+        .into_iter()
+        .filter(|e| e.name != "TRAILER!!!")
+        .map(|e| (e.name, e.mode, e.data))
+        .collect();
+    listed.sort();
+    listed
+}
+
+#[test]
+fn scripts_ship_as_pkgbuild_scripts_archive() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut with_scripts = spec(dir.path());
+    with_scripts.scripts = Some(scripts_dir(dir.path()));
+    let out = dir.path().join("scripts.pkg");
+    build(&with_scripts, &out).unwrap();
+    let archive = std::fs::read(&out).unwrap();
+
+    // Scripts sits between Payload and PackageInfo, as in pkgbuild output.
+    let reader = XarReader::new(Cursor::new(archive.clone())).unwrap();
+    let names: Vec<String> = reader
+        .files()
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "hello.pkg",
+            "hello.pkg/Bom",
+            "hello.pkg/Payload",
+            "hello.pkg/Scripts",
+            "hello.pkg/PackageInfo",
+            "Distribution"
+        ]
+    );
+
+    // Every file ships, helpers included, with exec bits preserved: a hook
+    // that lands 0644 never runs.
+    let cpio = gunzip(&component_file(&archive, "hello.pkg/Scripts").unwrap());
+    assert_eq!(cpio.len() % 512, 0);
+    let listed: Vec<(String, u64)> = cpio_listing(&cpio, true)
+        .into_iter()
+        .map(|(n, m, _)| (n, m))
+        .collect();
+    let expected = [
+        (".", 0o40755),
+        ("./helper.sh", 0o100644),
+        ("./lib", 0o40755),
+        ("./lib/inner.txt", 0o100644),
+        ("./postinstall", 0o100755),
+        ("./preinstall", 0o100755),
+    ];
+    assert_eq!(listed, expected.map(|(n, m)| (n.to_string(), m)).to_vec());
+
+    // PackageInfo names exactly the two hooks, pkgbuild's attributes.
+    let xml = component_file(&archive, "hello.pkg/PackageInfo").unwrap();
+    let hooks: Vec<_> = ["preinstall", "postinstall"]
+        .iter()
+        .flat_map(|tag| element_attrs(&xml, tag))
+        .collect();
+    assert_eq!(hooks.len(), 2);
+    assert_eq!(hooks[0]["file"], "./preinstall");
+    assert_eq!(hooks[1]["file"], "./postinstall");
+    assert!(hooks.iter().all(|h| h["timeout"] == "600"));
+
+    // No scripts: no Scripts entry and no <scripts> element.
+    let plain = build_archive(dir.path(), "plain.pkg");
+    assert!(component_file(&plain, "hello.pkg/Scripts").is_none());
+    let xml = component_file(&plain, "hello.pkg/PackageInfo").unwrap();
+    assert!(element_attrs(&xml, "scripts").is_empty());
+}
+
+#[test]
+fn bad_scripts_dirs_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.pkg");
+
+    let mut missing = spec(dir.path());
+    missing.scripts = Some(dir.path().join("nope"));
+    assert!(matches!(
+        build(&missing, &out),
+        Err(Error::ScriptsNotDir(_))
+    ));
+
+    // pkgbuild archives a 0644 hook silently and `installer` then fails on
+    // the target machine; refuse it at build time instead.
+    let mut not_exec = spec(dir.path());
+    let scripts = scripts_dir(dir.path());
+    std::fs::set_permissions(
+        scripts.join("postinstall"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    not_exec.scripts = Some(scripts);
+    assert!(matches!(
+        build(&not_exec, &out),
+        Err(Error::ScriptNotExecutable(_))
+    ));
+    assert!(!out.exists());
+}
+
+/// Differential oracle: the same scripts dir through Apple's `pkgbuild`
+/// must yield the same PackageInfo `<scripts>` block and the same Scripts
+/// entries (names, modes, contents). Ownership, inode, and order differ by
+/// design (pkgbuild records the builder's uid and readdir order).
+#[cfg(target_os = "macos")]
+#[test]
+fn scripts_match_pkgbuild() {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().unwrap();
+    let scripts = scripts_dir(dir.path());
+    let root = dir.path().join("root/bin");
+    std::fs::create_dir_all(&root).unwrap();
+    write_src(&root, "embala-hello", HELLO, 0o755);
+    let reference = dir.path().join("ref.pkg");
+    let status = Command::new("pkgbuild")
+        .args([
+            "--identifier",
+            "ca.hrndz.embala.hello",
+            "--version",
+            "0.1.0",
+        ])
+        .args(["--install-location", "/usr/local", "--quiet", "--root"])
+        .arg(dir.path().join("root"))
+        .arg("--scripts")
+        .arg(&scripts)
+        .arg(&reference)
+        .status()
+        .expect("pkgbuild on PATH");
+    assert!(status.success());
+    let reference = std::fs::read(reference).unwrap();
+
+    let mut ours = spec(dir.path());
+    ours.scripts = Some(scripts);
+    let out = dir.path().join("ours.pkg");
+    build(&ours, &out).unwrap();
+    let ours = std::fs::read(out).unwrap();
+
+    // pkgbuild writes a bare component; ours nests it in a product archive.
+    let theirs_cpio = gunzip(&component_file(&reference, "Scripts").unwrap());
+    let ours_cpio = gunzip(&component_file(&ours, "hello.pkg/Scripts").unwrap());
+    assert_eq!(
+        cpio_listing(&ours_cpio, true),
+        cpio_listing(&theirs_cpio, false)
+    );
+
+    let theirs_xml = component_file(&reference, "PackageInfo").unwrap();
+    let ours_xml = component_file(&ours, "hello.pkg/PackageInfo").unwrap();
+    for tag in ["scripts", "preinstall", "postinstall"] {
+        assert_eq!(
+            element_attrs(&ours_xml, tag),
+            element_attrs(&theirs_xml, tag),
+            "{tag}"
+        );
+    }
 }

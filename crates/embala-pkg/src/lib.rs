@@ -2,7 +2,8 @@
 //!
 //! [`build`] writes the same shape `productbuild` emits: a xar archive
 //! holding a `Distribution` script plus a `<name>.pkg/` component directory
-//! with `PackageInfo`, `Bom`, and a gzipped odc-cpio `Payload`. Every layer
+//! with `PackageInfo`, `Bom`, a gzipped odc-cpio `Payload`, and (with
+//! [`PkgSpec::scripts`]) a `Scripts` archive in the same format. Every layer
 //! was pinned against Apple tooling on macOS 26.5 (pkgbuild/productbuild
 //! output dissected byte-by-byte; results verified with `pkgutil
 //! --expand-full`, `lsbom`, and `installer`).
@@ -85,6 +86,12 @@ pub enum Error {
 
     #[error("pkg install-location {0:?} must be an absolute path")]
     InvalidInstallLocation(String),
+
+    #[error("pkg scripts {0} must be an existing directory")]
+    ScriptsNotDir(PathBuf),
+
+    #[error("pkg script {0} must be executable (installer cannot run it otherwise)")]
+    ScriptNotExecutable(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -121,6 +128,10 @@ pub struct PkgSpec {
     /// install path).
     pub enable_user_home: bool,
     pub files: Vec<FileSpec>,
+    /// Directory packed as the component's `Scripts` archive, like
+    /// `pkgbuild --scripts`: every file ships (helpers included), and a
+    /// top-level `preinstall`/`postinstall` is referenced from PackageInfo.
+    pub scripts: Option<PathBuf>,
 }
 
 /// One node of the payload tree, keyed by `/`-separated relative path.
@@ -166,45 +177,71 @@ pub fn build(spec: &PkgSpec, out: &Path) -> Result<()> {
     let bom = bom_from_nodes(&nodes, 0, 0)?;
 
     let payload = gzip(&payload_cpio(&nodes))?;
-    let package_info = package_info_xml(spec, number_of_files, install_kbytes)?;
+    let scripts = spec.scripts.as_deref().map(script_nodes).transpose()?;
+    let script_archive = scripts
+        .as_ref()
+        .map(|s| gzip(&payload_cpio(s)))
+        .transpose()?;
+    // pkgbuild references only these two names; other files are helpers.
+    let hooks: Vec<&str> = ["preinstall", "postinstall"]
+        .into_iter()
+        .filter(|name| {
+            scripts
+                .as_ref()
+                .is_some_and(|s| matches!(s.get(*name), Some(Node::File { .. })))
+        })
+        .collect();
+    let package_info = package_info_xml(spec, number_of_files, install_kbytes, &hooks)?;
     let distribution = distribution_xml(spec, install_kbytes)?;
 
     // Product-archive layout, mirroring productbuild: the component
-    // directory first (children in Apple's order: Bom, Payload,
-    // PackageInfo), Distribution last. The Payload is already gzipped, so
-    // it is stored raw (application/octet-stream) exactly as Apple does.
+    // directory first (children in Apple's order: Bom, Payload, Scripts,
+    // PackageInfo), Distribution last. Payload and Scripts are already
+    // gzipped, so they are stored raw (application/octet-stream) exactly as
+    // Apple does.
     let component = format!("{}.pkg", spec.name);
+    let mut children = vec![
+        XarEntry {
+            name: "Bom",
+            kind: XarEntryKind::File {
+                data: &bom,
+                mode: 0o644,
+                store: false,
+            },
+        },
+        XarEntry {
+            name: "Payload",
+            kind: XarEntryKind::File {
+                data: &payload,
+                mode: 0o644,
+                store: true,
+            },
+        },
+    ];
+    if let Some(script_archive) = &script_archive {
+        children.push(XarEntry {
+            name: "Scripts",
+            kind: XarEntryKind::File {
+                data: script_archive,
+                mode: 0o644,
+                store: true,
+            },
+        });
+    }
+    children.push(XarEntry {
+        name: "PackageInfo",
+        kind: XarEntryKind::File {
+            data: &package_info,
+            mode: 0o644,
+            store: false,
+        },
+    });
     let entries = [
         XarEntry {
             name: &component,
             kind: XarEntryKind::Directory {
                 mode: 0o700,
-                children: vec![
-                    XarEntry {
-                        name: "Bom",
-                        kind: XarEntryKind::File {
-                            data: &bom,
-                            mode: 0o644,
-                            store: false,
-                        },
-                    },
-                    XarEntry {
-                        name: "Payload",
-                        kind: XarEntryKind::File {
-                            data: &payload,
-                            mode: 0o644,
-                            store: true,
-                        },
-                    },
-                    XarEntry {
-                        name: "PackageInfo",
-                        kind: XarEntryKind::File {
-                            data: &package_info,
-                            mode: 0o644,
-                            store: false,
-                        },
-                    },
-                ],
+                children,
             },
         },
         XarEntry {
@@ -248,6 +285,49 @@ fn validate(spec: &PkgSpec) -> Result<()> {
     for file in &spec.files {
         if dirs.contains(file.dest.as_str()) {
             return Err(Error::DestConflict(file.dest.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// Load a `--scripts` directory as a cpio tree. Like pkgbuild, every entry
+/// ships (helper files and subdirectories too), keeping its exec bit. Unlike
+/// pkgbuild, which archives a non-executable hook that `installer` then fails
+/// to run, a non-executable `preinstall`/`postinstall` is rejected here.
+fn script_nodes(dir: &Path) -> Result<BTreeMap<String, Node>> {
+    if !dir.is_dir() {
+        return Err(Error::ScriptsNotDir(dir.to_path_buf()));
+    }
+    let mut nodes = BTreeMap::new();
+    collect_nodes(dir, "", &mut nodes)?;
+    for hook in ["preinstall", "postinstall"] {
+        if let Some(Node::File { mode, .. }) = nodes.get(hook) {
+            if mode & 0o111 == 0 {
+                return Err(Error::ScriptNotExecutable(dir.join(hook)));
+            }
+        }
+    }
+    Ok(nodes)
+}
+
+fn collect_nodes(dir: &Path, prefix: &str, nodes: &mut BTreeMap<String, Node>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        // Follows symlinks: a linked script ships as the file it points to.
+        let path = entry.path();
+        if std::fs::metadata(&path)?.is_dir() {
+            nodes.insert(rel.clone(), Node::Dir);
+            collect_nodes(&path, &rel, nodes)?;
+        } else {
+            let mode = if executable(&path)? { 0o755 } else { 0o644 };
+            let bytes = std::fs::read(&path)?;
+            nodes.insert(rel, Node::File { bytes, mode });
         }
     }
     Ok(())
@@ -403,7 +483,12 @@ fn xml_writer() -> std::result::Result<XmlWriter<Cursor<Vec<u8>>>, std::io::Erro
     Ok(writer)
 }
 
-fn package_info_xml(spec: &PkgSpec, number_of_files: u32, install_kbytes: u64) -> XmlResult {
+fn package_info_xml(
+    spec: &PkgSpec,
+    number_of_files: u32,
+    install_kbytes: u64,
+    hooks: &[&str],
+) -> XmlResult {
     let mut writer = xml_writer()?;
     writer
         .create_element("pkg-info")
@@ -429,6 +514,19 @@ fn package_info_xml(spec: &PkgSpec, number_of_files: u32, install_kbytes: u64) -
                 "relocate",
             ] {
                 w.create_element(tag).write_empty()?;
+            }
+            // pkgbuild's shape: `<scripts>` only when a hook exists, each
+            // with its default 600 s timeout.
+            if !hooks.is_empty() {
+                w.create_element("scripts").write_inner_content(|w| {
+                    for hook in hooks {
+                        w.create_element(*hook)
+                            .with_attribute(("file", format!("./{hook}").as_str()))
+                            .with_attribute(("timeout", "600"))
+                            .write_empty()?;
+                    }
+                    Ok::<(), std::io::Error>(())
+                })?;
             }
             Ok::<(), std::io::Error>(())
         })?;
