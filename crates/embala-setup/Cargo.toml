@@ -10,7 +10,7 @@ publish.workspace = true
 
 [dependencies]
 # Shared PE-overlay trailer format (the runtime's counterpart).
-embala-setup-overlay = { version = "0.2.0", path = "../embala-setup-overlay" }
+embala-setup-overlay = { version = "0.2.1", path = "../embala-setup-overlay" }
 # PE resource editor for build-time stub branding (icon, VERSIONINFO, banner).
 # Default features carry `images` (PNG/ICO decode) + `std`.
 editpe = "0.2.3"
