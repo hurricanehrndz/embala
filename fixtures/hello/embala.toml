@@ -23,6 +23,8 @@ arch = "x86_64"
 main-executable = "hello.exe"
 files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
 # Registers hello.exe as a Windows service (ServiceInstall/ServiceControl).
+# `executable = "<dest>"` runs a different payload file as the service than
+# the shortcut targets (an agent beside a UI); it defaults to main-executable.
 # "disabled" because hello.exe is not a real service: an auto/demand service
 # is started on install, which would fail and roll the install back.
 service = { name = "embala-hello", display-name = "Embala Hello", description = "Embala test service", start = "disabled" }

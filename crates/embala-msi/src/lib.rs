@@ -6,7 +6,8 @@
 //!
 //! Scope for v1: install files to Program Files, Start-menu shortcut,
 //! Add/Remove Programs entry, clean uninstall, MajorUpgrade, and optionally
-//! the main executable as a Windows service. Nothing else.
+//! one payload file (by default the main executable) as a Windows service.
+//! Nothing else.
 //
 // Portions ported from deno desktop (cli/tools/desktop.rs),
 // Copyright 2018-2026 the Deno authors, MIT license.
@@ -54,7 +55,8 @@ pub enum ServiceStart {
     Disabled,
 }
 
-/// Installs the main executable as an own-process service via the native
+/// Installs `executable` (by default the main executable) as an own-process
+/// service via the native
 /// ServiceInstall/ServiceControl tables (no custom actions). Mirrors WiX
 /// `<ServiceInstall Type="ownProcess" ErrorControl="normal">` plus
 /// `<ServiceControl Start="install" Stop="both" Remove="uninstall" Wait="yes">`;
@@ -68,6 +70,10 @@ pub struct ServiceSpec {
     pub start: ServiceStart,
     /// Command-line arguments the SCM passes to the executable.
     pub arguments: Option<String>,
+    /// Dest of the payload file the service runs. `None` means
+    /// `MsiSpec::main_executable`, so a UI can own the shortcut while a
+    /// separate agent owns the service.
+    pub executable: Option<String>,
 }
 
 /// A payload file: `src` on disk (already resolved to a real path), `dest`
@@ -100,7 +106,8 @@ pub struct MsiSpec {
     /// Dest of the file the Start-menu shortcut targets.
     pub main_executable: String,
     pub files: Vec<FileSpec>,
-    /// Register `main_executable` as a Windows service.
+    /// Register a payload file (`ServiceSpec::executable`, default
+    /// `main_executable`) as a Windows service.
     pub service: Option<ServiceSpec>,
 }
 
@@ -115,6 +122,8 @@ pub enum Error {
     InvalidDest(String),
     #[error("msi main-executable {0:?} does not match any file dest")]
     MainExecutableNotFound(String),
+    #[error("msi service executable {0:?} does not match any file dest")]
+    ServiceExecutableNotFound(String),
     #[error("msi: two files share the dest {0:?}")]
     DuplicateDest(String),
     #[error(
@@ -221,6 +230,12 @@ fn validate(spec: &MsiSpec) -> Result<()> {
         ] {
             if let Some(value) = value {
                 ensure_ascii(field, value)?;
+            }
+        }
+        if let Some(executable) = &service.executable {
+            ensure_ascii("service executable", executable)?;
+            if !spec.files.iter().any(|f| f.dest == *executable) {
+                return Err(Error::ServiceExecutableNotFound(executable.clone()));
             }
         }
     }

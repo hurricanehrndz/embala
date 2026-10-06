@@ -7,6 +7,7 @@ authors.workspace = true
 repository.workspace = true
 license.workspace = true
 publish.workspace = true
+readme = "README.md"
 
 [dependencies]
 # Shared PE-overlay trailer format (the runtime's counterpart).

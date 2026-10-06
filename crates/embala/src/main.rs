@@ -322,6 +322,7 @@ fn build_msi(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> 
                 config::ServiceStart::Disabled => embala_msi::ServiceStart::Disabled,
             },
             arguments: s.arguments.clone(),
+            executable: s.executable.clone(),
         }),
     };
     let out = out_dir.join(format!(

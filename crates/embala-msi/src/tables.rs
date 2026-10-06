@@ -460,7 +460,11 @@ pub(crate) fn write<F: Read + Write + Seek>(
         })
         .collect();
     if let Some(service) = &spec.service {
-        write_service(package, service, staged)?;
+        let executable = service
+            .executable
+            .as_deref()
+            .unwrap_or(&spec.main_executable);
+        write_service(package, service, executable, staged)?;
         // Standard sequence numbers, with the `VersionNT` condition wixl
         // emits for <ServiceInstall>/<ServiceControl>.
         for (action, seq) in [
@@ -506,19 +510,20 @@ pub(crate) fn write<F: Read + Write + Seek>(
     Ok(())
 }
 
-/// ServiceInstall + ServiceControl rows on the main executable's component,
-/// so the service lives and dies with the file it runs.
+/// ServiceInstall + ServiceControl rows on the component of `executable` (a
+/// payload dest), so the service lives and dies with the file it runs.
 fn write_service<F: Read + Write + Seek>(
     package: &mut msi::Package<F>,
     service: &crate::ServiceSpec,
+    executable: &str,
     staged: &Staged,
 ) -> Result<()> {
     let component = staged
         .files
         .iter()
-        .find(|f| f.key == staged.shortcut_file_key)
+        .find(|f| f.dest == executable)
         .map(|f| f.component.clone())
-        .expect("stage() resolved the main executable");
+        .expect("validate() resolved the service executable");
     const SERVICE_WIN32_OWN_PROCESS: i32 = 0x10;
     const SERVICE_ERROR_NORMAL: i32 = 1;
     let start_type = match service.start {

@@ -64,8 +64,9 @@ pub struct MsiSection {
     pub arch: MsiArch,
     pub files: Vec<FileEntry>,
     pub main_executable: String,
-    /// Installs `main-executable` as a Windows service (ServiceInstall/
-    /// ServiceControl tables; name rules are checked by embala-msi).
+    /// Installs `executable` (default `main-executable`) as a Windows service
+    /// (ServiceInstall/ServiceControl tables; name rules are checked by
+    /// embala-msi).
     pub service: Option<MsiService>,
 }
 
@@ -85,6 +86,8 @@ pub struct MsiService {
     pub description: Option<String>,
     pub start: ServiceStart,
     pub arguments: Option<String>,
+    /// Dest of the file the service runs; defaults to `main-executable`.
+    pub executable: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

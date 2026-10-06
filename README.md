@@ -48,7 +48,7 @@ plus one config file and writes these formats natively.
 
 | Format | Approach |
 |---|---|
-| `.msi` | `embala-msi`: direct Windows Installer database writing (`msi` + `cab` crates); optional `service` via native ServiceInstall/ServiceControl tables |
+| `.msi` | `embala-msi`: direct Windows Installer database writing (`msi` + `cab` crates); optional `service` via native ServiceInstall/ServiceControl tables (on `main-executable` or a separate `executable`) |
 | `.app` | native bundle layout via `apple-bundles`, PNG→icns via `tauri-icns` |
 | `.pkg` | `embala-pkg`: native flat package — `apple-xar` + `apple-bom` + cpio payload; optional `scripts` dir packed like `pkgbuild --scripts` |
 | `.nupkg` (Chocolatey) | `embala-nupkg`: native OPC zip writer (`zip` + `quick-xml`) |

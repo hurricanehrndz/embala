@@ -210,6 +210,7 @@ fn service_spec(start: ServiceStart) -> ServiceSpec {
         description: Some("Foo service".to_string()),
         start,
         arguments: Some("--service".to_string()),
+        executable: None,
     }
 }
 
@@ -310,4 +311,63 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// `ServiceSpec::executable` puts the service on another payload file's
+/// component than the shortcut's, so a UI can own the Start-menu entry while
+/// an agent owns the service.
+#[test]
+fn service_executable_selects_its_own_component() {
+    let payload = tmp("payload-service-exe");
+    let mut spec = test_spec(&payload);
+    fs::write(payload.join("agent.exe"), PAYLOAD_EXE).unwrap();
+    spec.files.push(FileSpec {
+        src: payload.join("agent.exe"),
+        dest: "agent.exe".to_string(),
+    });
+    let mut service = service_spec(ServiceStart::Auto);
+    service.executable = Some("agent.exe".to_string());
+    spec.service = Some(service);
+    let out = tmp("service-exe.msi");
+    build(&spec, &out).unwrap();
+    let mut package = msi::Package::open(fs::File::open(&out).unwrap()).unwrap();
+
+    // File rows: File, Component_, FileName (short|long), ...
+    let component_of = |package: &mut msi::Package<fs::File>, long_name: &str| {
+        rows(package, "File")
+            .into_iter()
+            .map(|r| r.split('\t').map(str::to_string).collect::<Vec<_>>())
+            .find(|cols| cols[2].ends_with(&format!("|{long_name}")))
+            .map(|cols| cols[1].clone())
+            .unwrap_or_else(|| panic!("no File row for {long_name}"))
+    };
+    let agent = component_of(&mut package, "agent.exe");
+    let shortcut_target = component_of(&mut package, "hello.exe");
+    assert_ne!(agent, shortcut_target);
+    let install = rows(&mut package, "ServiceInstall");
+    assert_eq!(install.len(), 1);
+    assert_eq!(install[0].split('\t').nth(11), Some(agent.as_str()));
+    assert_eq!(
+        rows(&mut package, "ServiceControl"),
+        vec![format!("AppServiceControl\tfoo\t163\t\t1\t{agent}")]
+    );
+    // The shortcut still targets the main executable.
+    let shortcut = rows(&mut package, "Shortcut");
+    let hello_key = rows(&mut package, "File")
+        .into_iter()
+        .find(|r| r.contains("|hello.exe"))
+        .map(|r| r.split('\t').next().unwrap().to_string())
+        .unwrap();
+    assert!(
+        shortcut[0].contains(&format!("[#{hello_key}]")),
+        "{shortcut:?}"
+    );
+
+    // An executable that is not a payload file is rejected.
+    spec.service.as_mut().unwrap().executable = Some("missing.exe".to_string());
+    let err = build(&spec, &out).unwrap_err();
+    assert!(
+        matches!(err, embala_msi::Error::ServiceExecutableNotFound(_)),
+        "unexpected error: {err}"
+    );
 }
