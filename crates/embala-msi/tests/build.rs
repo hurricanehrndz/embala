@@ -41,6 +41,7 @@ fn test_spec(payload_dir: &Path) -> MsiSpec {
             },
         ],
         service: None,
+        add_to_path: false,
     }
 }
 
@@ -282,6 +283,37 @@ fn service_tables_match_wixl() {
     let package = msi::Package::open(fs::File::open(&out).unwrap()).unwrap();
     assert!(!package.has_table("ServiceInstall"));
     assert!(!package.has_table("ServiceControl"));
+}
+
+/// CLI payloads are only usable once their directory is on PATH. The row is
+/// wixl's for <Environment Name="PATH" Value="[INSTALLDIR]" Part="last"
+/// Action="set" System="yes" Permanent="no"> on the main executable's
+/// component (c1, as in service_tables_match_wixl), plus the `-` flag wixl
+/// omits: without it msiexec leaves the entry on PATH after uninstall
+/// (verified on Windows 11).
+#[test]
+fn add_to_path_tables() {
+    let mut spec = test_spec(&tmp("payload-path"));
+    spec.add_to_path = true;
+    let out = tmp("path.msi");
+    build(&spec, &out).unwrap();
+    let mut package = msi::Package::open(fs::File::open(&out).unwrap()).unwrap();
+    assert_eq!(
+        rows(&mut package, "Environment"),
+        vec!["PathEnv\t=-*PATH\t[~];[INSTALLDIR]\tc1"]
+    );
+    let seq = rows(&mut package, "InstallExecuteSequence");
+    for expected in [
+        "RemoveEnvironmentStrings\t\t3300",
+        "WriteEnvironmentStrings\t\t5200",
+    ] {
+        assert!(seq.contains(&expected.to_string()), "{expected}: {seq:?}");
+    }
+
+    spec.add_to_path = false;
+    build(&spec, &out).unwrap();
+    let package = msi::Package::open(fs::File::open(&out).unwrap()).unwrap();
+    assert!(!package.has_table("Environment"));
 }
 
 #[test]

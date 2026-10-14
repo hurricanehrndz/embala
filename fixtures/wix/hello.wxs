@@ -36,6 +36,12 @@
                             ErrorControl="normal"/>
             <ServiceControl Id="AppServiceControl" Name="embala-hello"
                             Stop="both" Remove="uninstall" Wait="yes"/>
+            <!-- [msi] add-to-path = true. Expected msi-diff: wixl writes Name
+                 "=*PATH"; embala adds the "-" (remove on uninstall) that
+                 msiexec needs to take the entry back off PATH. -->
+            <Environment Id="PathEnv" Name="PATH" Value="[INSTALLDIR]"
+                         Part="last" Action="set" System="yes"
+                         Permanent="no"/>
           </Component>
         </Directory>
       </Directory>

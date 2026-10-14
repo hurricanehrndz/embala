@@ -324,6 +324,7 @@ fn build_msi(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> 
             arguments: s.arguments.clone(),
             executable: s.executable.clone(),
         }),
+        add_to_path: section.add_to_path,
     };
     let out = out_dir.join(format!(
         "{}-{}-{}.msi",

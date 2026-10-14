@@ -26,6 +26,8 @@ main-executable = "hello.exe"
 files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
 # Optional: register a payload file as a Windows service.
 # service = { name = "hello", start = "auto", arguments = "--service", executable = "agent.exe" }
+# Optional: append the install directory to the system PATH.
+# add-to-path = true
 ```
 
 Prebuilt binaries, the full config reference and signing notes are in the
