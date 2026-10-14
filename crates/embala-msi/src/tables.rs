@@ -182,6 +182,9 @@ pub(crate) fn write<F: Read + Write + Seek>(
     if spec.service.is_some() {
         create_service_schemas(package)?;
     }
+    if spec.add_to_path {
+        create_environment_schema(package)?;
+    }
 
     // --- Directory ----------------------------------------------------------
     let mut directory_rows = vec![
@@ -480,6 +483,35 @@ pub(crate) fn write<F: Read + Write + Seek>(
             ]);
         }
     }
+    if spec.add_to_path {
+        // On the main executable's component, so PATH lives and dies with it.
+        // `=`: set on install; `-`: remove on uninstall; `*`: the system
+        // (machine) environment. `[~];` appends to the existing value, and
+        // uninstall removes only the appended part. wixl omits the `-` for
+        // Permanent="no", and msiexec then leaves the entry behind.
+        let component = staged
+            .files
+            .iter()
+            .find(|f| f.key == staged.shortcut_file_key)
+            .map(|f| f.component.clone())
+            .expect("stage() resolved the main executable");
+        package.insert_rows(Insert::into("Environment").row(vec![
+            Value::Str("PathEnv".to_string()),
+            Value::Str("=-*PATH".to_string()),
+            Value::Str("[~];[INSTALLDIR]".to_string()),
+            Value::Str(component),
+        ]))?;
+        for (action, seq) in [
+            ("RemoveEnvironmentStrings", 3300),
+            ("WriteEnvironmentStrings", 5200),
+        ] {
+            exec_rows.push(vec![
+                Value::Str(action.to_string()),
+                Value::Null,
+                Value::Int(seq),
+            ]);
+        }
+    }
     package.insert_rows(Insert::into("InstallExecuteSequence").rows(exec_rows))?;
     // Minimal UI sequence: cost the install, then hand off to the execute
     // sequence. No Dialog/Control tables — basic-UI msiexec runs use this.
@@ -611,6 +643,23 @@ fn create_service_schemas<F: Read + Write + Seek>(package: &mut msi::Package<F>)
                 .localizable()
                 .formatted_string(255),
             Column::build("Wait").nullable().int16(),
+            Column::build("Component_").id_string(72),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Column types match wixl's (`s72 l64 L255 s72`).
+fn create_environment_schema<F: Read + Write + Seek>(package: &mut msi::Package<F>) -> Result<()> {
+    package.create_table(
+        "Environment",
+        vec![
+            Column::build("Environment").primary_key().id_string(72),
+            Column::build("Name").localizable().text_string(64),
+            Column::build("Value")
+                .nullable()
+                .localizable()
+                .formatted_string(255),
             Column::build("Component_").id_string(72),
         ],
     )?;

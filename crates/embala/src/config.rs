@@ -68,6 +68,9 @@ pub struct MsiSection {
     /// (ServiceInstall/ServiceControl tables; name rules are checked by
     /// embala-msi).
     pub service: Option<MsiService>,
+    /// Append the install directory to the system PATH.
+    #[serde(default)]
+    pub add_to_path: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -522,6 +525,7 @@ mod tests {
         let service = msi.service.unwrap();
         assert_eq!(service.name, "embala-hello");
         assert_eq!(service.start, ServiceStart::Disabled);
+        assert!(msi.add_to_path);
         assert_eq!(
             config.pkg.unwrap().scripts.as_deref(),
             Some(Path::new("scripts"))

@@ -6,8 +6,8 @@
 //!
 //! Scope for v1: install files to Program Files, Start-menu shortcut,
 //! Add/Remove Programs entry, clean uninstall, MajorUpgrade, and optionally
-//! one payload file (by default the main executable) as a Windows service.
-//! Nothing else.
+//! one payload file (by default the main executable) as a Windows service
+//! and the install directory on the system PATH. Nothing else.
 //
 // Portions ported from deno desktop (cli/tools/desktop.rs),
 // Copyright 2018-2026 the Deno authors, MIT license.
@@ -109,6 +109,10 @@ pub struct MsiSpec {
     /// Register a payload file (`ServiceSpec::executable`, default
     /// `main_executable`) as a Windows service.
     pub service: Option<ServiceSpec>,
+    /// Append the install directory to the system PATH (native Environment
+    /// table, WiX `<Environment Name="PATH" Part="last" System="yes">`);
+    /// uninstall removes just that entry.
+    pub add_to_path: bool,
 }
 
 #[derive(Debug, thiserror::Error)]

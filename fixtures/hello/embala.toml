@@ -28,6 +28,8 @@ files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
 # "disabled" because hello.exe is not a real service: an auto/demand service
 # is started on install, which would fail and roll the install back.
 service = { name = "embala-hello", display-name = "Embala Hello", description = "Embala test service", start = "disabled" }
+# Appends the install directory to the system PATH; uninstall removes it.
+add-to-path = true
 
 [app]
 executable = "dist/hello-mac"
