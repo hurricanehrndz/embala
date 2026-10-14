@@ -6,7 +6,9 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license.workspace = true
-publish.workspace = true
+# Only ever consumed as the prebuilt stub embala-setup embeds; its build.rs
+# needs zig, which cargo publish's verify build would not have.
+publish = false
 readme = "README.md"
 
 [[bin]]

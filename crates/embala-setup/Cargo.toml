@@ -8,6 +8,11 @@ repository.workspace = true
 license.workspace = true
 publish.workspace = true
 readme = "README.md"
+# Explicit, because an `include` list is the only way to package gitignored
+# files: the stubs are `just stubs` build products, and without them the
+# published crate fails its build.rs check. Tests are left out; they read
+# fixtures from the repo root.
+include = ["/src/**", "/build.rs", "/README.md", "/stubs/*/setup-stub.exe"]
 
 [dependencies]
 # Shared PE-overlay trailer format (the runtime's counterpart).
