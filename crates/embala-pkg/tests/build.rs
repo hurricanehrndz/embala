@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use apple_bom::ParsedBom;
 use apple_xar::reader::XarReader;
-use embala_pkg::{Error, FileSpec, PkgSpec, build};
+use embala_pkg::{DirSpec, Error, FileSpec, PkgSpec, build};
 
 const HELLO: &[u8] = b"#!/bin/sh\necho hello\n";
 const README: &[u8] = b"read me\n";
@@ -38,12 +38,15 @@ fn spec(src_dir: &Path) -> PkgSpec {
             FileSpec {
                 src: write_src(src_dir, "hello.sh", HELLO, 0o755),
                 dest: "bin/embala-hello".to_string(),
+                mode: None,
             },
             FileSpec {
                 src: write_src(src_dir, "README", README, 0o644),
                 dest: "share/doc/hello/README".to_string(),
+                mode: None,
             },
         ],
+        directories: vec![],
         scripts: None,
     }
 }
@@ -400,6 +403,151 @@ fn rejects_bad_specs() {
     assert!(!out.exists());
 }
 
+const CREDENTIALS: &[u8] = b"secret\n";
+
+/// The osconfig-sync shape on top of the base spec: a root-only file under an
+/// implied 0755 directory, a root-only directory that ships empty, and a
+/// declared mode on a directory that files already imply.
+fn spec_with_modes(src_dir: &Path) -> PkgSpec {
+    let mut spec = spec(src_dir);
+    spec.files.push(FileSpec {
+        // Executable on disk: an explicit mode wins over the exec-bit rule.
+        src: write_src(src_dir, "credentials", CREDENTIALS, 0o755),
+        dest: "etc/credentials".to_string(),
+        mode: Some(0o600),
+    });
+    spec.directories = vec![
+        DirSpec {
+            dest: "var/keys".to_string(),
+            mode: Some(0o700),
+        },
+        DirSpec {
+            dest: "share/doc".to_string(),
+            mode: Some(0o750),
+        },
+    ];
+    spec
+}
+
+/// The `(path, mode)` pairs every listing below is checked against.
+const MODED_TREE: &[(&str, u64)] = &[
+    (".", 0o40755),
+    ("./bin", 0o40755),
+    ("./bin/embala-hello", 0o100755),
+    ("./etc", 0o40755),
+    ("./etc/credentials", 0o100600),
+    ("./share", 0o40755),
+    ("./share/doc", 0o40750),
+    ("./share/doc/hello", 0o40755),
+    ("./share/doc/hello/README", 0o100644),
+    ("./var", 0o40755),
+    ("./var/keys", 0o40700),
+];
+
+fn bom_modes(bom: &[u8]) -> Vec<(String, u64)> {
+    let mut listed: Vec<(String, u64)> = ParsedBom::parse(bom)
+        .unwrap()
+        .paths()
+        .unwrap()
+        .into_iter()
+        .map(|p| (p.path().to_string(), u64::from(p.file_mode())))
+        .collect();
+    listed.sort();
+    listed
+}
+
+#[test]
+fn declared_modes_reach_cpio_bom_and_pkginfo() {
+    // A credentials file or key directory that installs world-readable is a
+    // leak, so the mode must survive into every layer Installer reads.
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("modes.pkg");
+    build(&spec_with_modes(dir.path()), &out).unwrap();
+    let archive = std::fs::read(&out).unwrap();
+    let expected: Vec<(String, u64)> = MODED_TREE
+        .iter()
+        .map(|(n, m)| (n.to_string(), *m))
+        .collect();
+
+    let cpio = gunzip(&component_file(&archive, "hello.pkg/Payload").unwrap());
+    let entries = parse_odc(&cpio);
+    let cpio_modes: Vec<(String, u64)> = entries
+        .iter()
+        .filter(|e| e.name != "TRAILER!!!")
+        .map(|e| (e.name.clone(), e.mode))
+        .collect();
+    assert_eq!(cpio_modes, expected);
+    let keys = entries.iter().find(|e| e.name == "./var/keys").unwrap();
+    assert_eq!(keys.nlink, 2, "empty directory: no children");
+    let creds = entries
+        .iter()
+        .find(|e| e.name == "./etc/credentials")
+        .unwrap();
+    assert_eq!(creds.data, CREDENTIALS);
+
+    let bom = component_file(&archive, "hello.pkg/Bom").unwrap();
+    assert_eq!(bom_modes(&bom), expected);
+
+    // 11 paths; 3 one-block files + 7 directories = 10 blocks = 5 KB.
+    let xml = component_file(&archive, "hello.pkg/PackageInfo").unwrap();
+    let payload = &element_attrs(&xml, "payload")[0];
+    assert_eq!(payload["numberOfFiles"], "11");
+    assert_eq!(payload["installKBytes"], "5");
+
+    let again = dir.path().join("again.pkg");
+    build(&spec_with_modes(dir.path()), &again).unwrap();
+    assert_eq!(archive, std::fs::read(again).unwrap(), "byte-stable");
+}
+
+#[test]
+fn rejects_bad_modes_and_directory_layouts() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.pkg");
+
+    // setuid, setgid and sticky are out of scope; reject them, don't mask.
+    for mode in [0o4755, 0o2755, 0o1777, 0o10000] {
+        let mut file = spec_with_modes(dir.path());
+        file.files[2].mode = Some(mode);
+        assert!(
+            matches!(build(&file, &out), Err(Error::InvalidMode { .. })),
+            "file mode {mode:#o}"
+        );
+        let mut directory = spec_with_modes(dir.path());
+        directory.directories[0].mode = Some(mode);
+        assert!(
+            matches!(build(&directory, &out), Err(Error::InvalidMode { .. })),
+            "directory mode {mode:#o}"
+        );
+    }
+
+    let mut traversal = spec_with_modes(dir.path());
+    traversal.directories[0].dest = "../keys".to_string();
+    assert!(matches!(
+        build(&traversal, &out),
+        Err(Error::InvalidDest(_))
+    ));
+
+    let mut duplicate = spec_with_modes(dir.path());
+    duplicate.directories[1].dest = "var/keys".to_string();
+    assert!(matches!(
+        build(&duplicate, &out),
+        Err(Error::DuplicateDest(_))
+    ));
+
+    let mut same_as_file = spec_with_modes(dir.path());
+    same_as_file.directories[0].dest = "etc/credentials".to_string();
+    assert!(build(&same_as_file, &out).is_err());
+
+    let mut under_file = spec_with_modes(dir.path());
+    under_file.directories[0].dest = "etc/credentials/keys".to_string();
+    assert!(matches!(
+        build(&under_file, &out),
+        Err(Error::DestConflict(_))
+    ));
+
+    assert!(!out.exists());
+}
+
 /// A pkgbuild `--scripts` dir: both hooks, a non-executable helper the hooks
 /// would source, and a nested resource — pkgbuild ships all of it.
 fn scripts_dir(dir: &Path) -> PathBuf {
@@ -585,4 +733,82 @@ fn scripts_match_pkgbuild() {
             "{tag}"
         );
     }
+}
+
+/// Differential oracle for modes: `pkgbuild --root` over a staged tree with
+/// the same 0600 file, empty 0700 directory and 0750 directory must produce
+/// the same `lsbom` listing (minus ownership), the same cpio entries and the
+/// same PackageInfo payload counts.
+#[cfg(target_os = "macos")]
+#[test]
+fn modes_match_pkgbuild() {
+    use std::process::Command;
+
+    let dir = tempfile::tempdir().unwrap();
+    let spec = spec_with_modes(dir.path());
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    for (path, mode) in &MODED_TREE[1..] {
+        let staged = root.join(path);
+        if mode & 0o40000 != 0 {
+            std::fs::create_dir_all(&staged).unwrap();
+        } else {
+            let src = spec.files.iter().find(|f| format!("./{}", f.dest) == *path);
+            std::fs::copy(&src.unwrap().src, &staged).unwrap();
+        }
+    }
+    // Children first, so a 0700 parent never blocks a later chmod.
+    for (path, mode) in MODED_TREE.iter().rev() {
+        let perms = std::fs::Permissions::from_mode(*mode as u32 & 0o7777);
+        std::fs::set_permissions(root.join(path), perms).unwrap();
+    }
+    let reference = dir.path().join("ref.pkg");
+    let status = Command::new("pkgbuild")
+        .args([
+            "--identifier",
+            "ca.hrndz.embala.hello",
+            "--version",
+            "0.1.0",
+        ])
+        .args(["--install-location", "/usr/local", "--quiet", "--root"])
+        .arg(&root)
+        .arg(&reference)
+        .status()
+        .expect("pkgbuild on PATH");
+    assert!(status.success());
+    let reference = std::fs::read(reference).unwrap();
+
+    let out = dir.path().join("ours.pkg");
+    build(&spec, &out).unwrap();
+    let ours = std::fs::read(out).unwrap();
+
+    let lsbom = |bom: Vec<u8>, name: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, bom).unwrap();
+        let output = Command::new("lsbom")
+            .args(["-p", "fmsc"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert_eq!(
+        lsbom(component_file(&ours, "hello.pkg/Bom").unwrap(), "ours.bom"),
+        lsbom(component_file(&reference, "Bom").unwrap(), "ref.bom")
+    );
+
+    let ours_cpio = gunzip(&component_file(&ours, "hello.pkg/Payload").unwrap());
+    let theirs_cpio = gunzip(&component_file(&reference, "Payload").unwrap());
+    assert_eq!(
+        cpio_listing(&ours_cpio, true),
+        cpio_listing(&theirs_cpio, false)
+    );
+
+    let ours_xml = component_file(&ours, "hello.pkg/PackageInfo").unwrap();
+    let theirs_xml = component_file(&reference, "PackageInfo").unwrap();
+    assert_eq!(
+        element_attrs(&ours_xml, "payload"),
+        element_attrs(&theirs_xml, "payload")
+    );
 }

@@ -78,11 +78,14 @@ pub enum Error {
     #[error("pkg dest {0:?} must be a relative /-separated path without empty or '..' segments")]
     InvalidDest(String),
 
-    #[error("pkg: two files share the dest {0:?}")]
+    #[error("pkg: two entries share the dest {0:?}")]
     DuplicateDest(String),
 
-    #[error("pkg dest {0:?} is both a file and a directory of another dest")]
+    #[error("pkg dest {0:?} is both a file and a directory")]
     DestConflict(String),
+
+    #[error("pkg dest {dest:?}: mode {mode:#o} must be permission bits only (0o000-0o777)")]
+    InvalidMode { dest: String, mode: u32 },
 
     #[error("pkg install-location {0:?} must be an absolute path")]
     InvalidInstallLocation(String),
@@ -108,6 +111,18 @@ const SHA1_LEN: u64 = 20;
 pub struct FileSpec {
     pub src: PathBuf,
     pub dest: String,
+    /// Permission bits (`0o000`-`0o777`). `None` installs `0o755` if the
+    /// source is executable, else `0o644`.
+    pub mode: Option<u32>,
+}
+
+/// A payload directory declared explicitly, to give it a mode or to ship it
+/// with nothing under it. Directories only implied by file dests are `0o755`.
+#[derive(Debug, Clone)]
+pub struct DirSpec {
+    pub dest: String,
+    /// Permission bits (`0o000`-`0o777`); `None` means `0o755`.
+    pub mode: Option<u32>,
 }
 
 /// Everything needed to author one product archive. Deliberately independent
@@ -128,6 +143,7 @@ pub struct PkgSpec {
     /// install path).
     pub enable_user_home: bool,
     pub files: Vec<FileSpec>,
+    pub directories: Vec<DirSpec>,
     /// Directory packed as the component's `Scripts` archive, like
     /// `pkgbuild --scripts`: every file ships (helpers included), and a
     /// top-level `preinstall`/`postinstall` is referenced from PackageInfo.
@@ -136,9 +152,12 @@ pub struct PkgSpec {
 
 /// One node of the payload tree, keyed by `/`-separated relative path.
 enum Node {
-    Dir,
+    Dir { mode: u32 },
     File { bytes: Vec<u8>, mode: u32 },
 }
+
+/// pkgbuild's mode for a directory nothing else describes.
+const DIR_MODE: u32 = 0o755;
 
 /// Build the product-archive `.pkg` described by `spec` at `out` (parent
 /// dirs are created). Output is deterministic: fixed timestamps everywhere
@@ -149,13 +168,31 @@ pub fn build(spec: &PkgSpec, out: &Path) -> Result<()> {
     // Payload tree model: relative path -> node, sorted (BTreeMap order
     // matches pkgbuild's cpio/BOM ordering: parents before children).
     let mut nodes: BTreeMap<String, Node> = BTreeMap::new();
+    let implied_dir = || Node::Dir { mode: DIR_MODE };
     for file in &spec.files {
         for ancestor in ancestors(&file.dest) {
-            nodes.insert(ancestor.to_string(), Node::Dir);
+            nodes
+                .entry(ancestor.to_string())
+                .or_insert_with(implied_dir);
         }
         let bytes = std::fs::read(&file.src)?;
-        let mode = if executable(&file.src)? { 0o755 } else { 0o644 };
+        let mode = match file.mode {
+            Some(mode) => mode,
+            None if executable(&file.src)? => 0o755,
+            None => 0o644,
+        };
         nodes.insert(file.dest.clone(), Node::File { bytes, mode });
+    }
+    // Declared directories override the implied mode; validation already
+    // ruled out a declared directory landing on a file.
+    for dir in &spec.directories {
+        for ancestor in ancestors(&dir.dest) {
+            nodes
+                .entry(ancestor.to_string())
+                .or_insert_with(implied_dir);
+        }
+        let mode = dir.mode.unwrap_or(DIR_MODE);
+        nodes.insert(dir.dest.clone(), Node::Dir { mode });
     }
 
     // pkg-info bookkeeping. numberOfFiles counts every BOM path including
@@ -166,7 +203,7 @@ pub fn build(spec: &PkgSpec, out: &Path) -> Result<()> {
     let mut blocks = 0u64;
     for node in nodes.values() {
         blocks += match node {
-            Node::Dir => 1,
+            Node::Dir { .. } => 1,
             Node::File { bytes, .. } => (bytes.len() as u64).div_ceil(512),
         };
     }
@@ -265,23 +302,48 @@ pub fn build(spec: &PkgSpec, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate(spec: &PkgSpec) -> Result<()> {
+/// Check `spec` without touching the filesystem: dests are relative and
+/// unique, no file sits where a directory must be, and modes are permission
+/// bits only. [`build`] runs this first; it is public so callers can reject a
+/// bad layout before building anything.
+pub fn validate(spec: &PkgSpec) -> Result<()> {
     if spec.files.is_empty() {
         return Err(Error::NoFiles);
     }
     if !spec.install_location.starts_with('/') {
         return Err(Error::InvalidInstallLocation(spec.install_location.clone()));
     }
+    let entries = spec
+        .files
+        .iter()
+        .map(|f| (&f.dest, f.mode))
+        .chain(spec.directories.iter().map(|d| (&d.dest, d.mode)));
     let mut seen = BTreeSet::new();
-    for file in &spec.files {
-        if file.dest.split('/').any(|s| s.is_empty() || s == "..") {
-            return Err(Error::InvalidDest(file.dest.clone()));
+    for (dest, mode) in entries {
+        if dest.split('/').any(|s| s.is_empty() || s == "..") {
+            return Err(Error::InvalidDest(dest.clone()));
         }
-        if !seen.insert(file.dest.as_str()) {
-            return Err(Error::DuplicateDest(file.dest.clone()));
+        if !seen.insert(dest.as_str()) {
+            return Err(Error::DuplicateDest(dest.clone()));
+        }
+        // setuid/setgid/sticky are out of scope: a payload that grants
+        // privilege should be a deliberate feature, not a stray digit.
+        if let Some(mode) = mode.filter(|m| *m > 0o777) {
+            return Err(Error::InvalidMode {
+                dest: dest.clone(),
+                mode,
+            });
         }
     }
-    let dirs: BTreeSet<&str> = spec.files.iter().flat_map(|f| ancestors(&f.dest)).collect();
+    // Every path that must be a directory: declared ones and the ancestors
+    // of every dest. A file on any of them is a conflict.
+    let dirs: BTreeSet<&str> = spec
+        .directories
+        .iter()
+        .map(|d| d.dest.as_str())
+        .chain(spec.files.iter().flat_map(|f| ancestors(&f.dest)))
+        .chain(spec.directories.iter().flat_map(|d| ancestors(&d.dest)))
+        .collect();
     for file in &spec.files {
         if dirs.contains(file.dest.as_str()) {
             return Err(Error::DestConflict(file.dest.clone()));
@@ -322,7 +384,7 @@ fn collect_nodes(dir: &Path, prefix: &str, nodes: &mut BTreeMap<String, Node>) -
         // Follows symlinks: a linked script ships as the file it points to.
         let path = entry.path();
         if std::fs::metadata(&path)?.is_dir() {
-            nodes.insert(rel.clone(), Node::Dir);
+            nodes.insert(rel.clone(), Node::Dir { mode: DIR_MODE });
             collect_nodes(&path, &rel, nodes)?;
         } else {
             let mode = if executable(&path)? { 0o755 } else { 0o644 };
@@ -355,10 +417,8 @@ fn executable(path: &Path) -> Result<bool> {
 ///
 /// SHORTCUT: this is a heuristic, and it makes the mode host-dependent — a
 /// non-Mach-O, non-script file that is `chmod +x` on Unix installs as `0o644`
-/// when the same config is built on Windows. The upgrade path is an explicit
-/// per-file `mode` (or `executable`) key in the `[[pkg.files]]` config, which
-/// would make the mode host-independent on every platform and let this
-/// function go away.
+/// when the same config is built on Windows. A payload file with an explicit
+/// [`FileSpec::mode`] skips it; scripts and mode-less files still rely on it.
 #[cfg(windows)]
 fn executable(path: &Path) -> Result<bool> {
     use std::io::Read;
@@ -399,7 +459,7 @@ fn looks_executable(head: &[u8]) -> bool {
 
 /// Serialize the payload tree as odc cpio the way pkgbuild does: entries
 /// `.`/`./path` in sorted order, ownership 0:0, sequential inode numbers,
-/// directory nlink = 2 + direct children, fixed mtime, `TRAILER!!!`
+/// directory nlink = 2 + direct children, root `0o755`, fixed mtime, `TRAILER!!!`
 /// terminator (mtime 0), zero padding to a 512-byte boundary.
 fn payload_cpio(nodes: &BTreeMap<String, Node>) -> Vec<u8> {
     // Direct-child counts drive the directory nlink values ("" = root).
@@ -421,9 +481,9 @@ fn payload_cpio(nodes: &BTreeMap<String, Node>) -> Vec<u8> {
         inode += 1;
         let name = format!("./{path}");
         match node {
-            Node::Dir => {
+            Node::Dir { mode } => {
                 let nlink = 2 + children(path.as_str());
-                odc_record(&mut out, &name, 0o40755, nlink, inode, mtime, &[]);
+                odc_record(&mut out, &name, 0o40000 | mode, nlink, inode, mtime, &[]);
             }
             Node::File { bytes, mode } => {
                 odc_record(&mut out, &name, 0o100000 | mode, 1, inode, mtime, bytes);
@@ -781,15 +841,20 @@ fn bom_from_nodes(nodes: &BTreeMap<String, Node>, uid: u32, gid: u32) -> Result<
     builder.default_group_id(gid);
     builder.default_mtime(mtime);
 
-    // BTreeMap order already matches the BOM's sorted-path convention;
-    // directories are derived from file paths by the builder.
+    // BTreeMap order already matches the BOM's sorted-path convention.
+    // Directories are added explicitly so their modes (and empty declared
+    // directories) match the cpio.
     for (path, node) in nodes {
-        let Node::File { bytes, mode } = node else {
-            continue;
-        };
-        let entry = builder.add_file_from_bytes(path, bytes)?;
-        entry.set_file_mode((0o100000 | (mode & 0o7777)) as u16);
-        entry.set_modified_time(mtime);
+        match node {
+            Node::Dir { mode } => {
+                builder.add_directory(path, (0o40000 | (mode & 0o7777)) as u16)?;
+            }
+            Node::File { bytes, mode } => {
+                let entry = builder.add_file_from_bytes(path, bytes)?;
+                entry.set_file_mode((0o100000 | (mode & 0o7777)) as u16);
+                entry.set_modified_time(mtime);
+            }
+        }
     }
 
     builder.build_bom()

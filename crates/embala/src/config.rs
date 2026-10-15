@@ -48,6 +48,42 @@ pub struct FileEntry {
     pub dest: String,
 }
 
+/// A `[pkg]` payload file: a [`FileEntry`] plus an optional install mode. Its
+/// own type so `mode` fails to parse in formats that cannot honor it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PkgFileEntry {
+    pub src: PathBuf,
+    pub dest: String,
+    /// Permission bits, e.g. `0o600`. Absent: `0o755` if `src` is
+    /// executable, else `0o644`.
+    #[serde(default, deserialize_with = "permission_bits")]
+    pub mode: Option<u32>,
+}
+
+/// A `[pkg]` directory declared to set its mode or to ship it empty.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PkgDirEntry {
+    pub dest: String,
+    /// Permission bits, e.g. `0o700`. Absent: `0o755`.
+    #[serde(default, deserialize_with = "permission_bits")]
+    pub mode: Option<u32>,
+}
+
+/// Accept only `0o000`-`0o777`: setuid, setgid and sticky are not supported.
+fn permission_bits<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error> {
+    let mode = u32::deserialize(deserializer)?;
+    if mode > 0o777 {
+        return Err(serde::de::Error::custom(format!(
+            "mode {mode:#o} must be permission bits only (0o000-0o777)"
+        )));
+    }
+    Ok(Some(mode))
+}
+
 /// Windows Installer only supports 64-bit targets in embala; 32-bit configs
 /// are rejected at parse time (unknown variant).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -104,7 +140,10 @@ pub struct AppSection {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct PkgSection {
-    pub files: Vec<FileEntry>,
+    pub files: Vec<PkgFileEntry>,
+    /// Directories to create with an explicit mode, even if empty.
+    #[serde(default)]
+    pub directories: Vec<PkgDirEntry>,
     pub install_location: String,
     /// Marks the package installable into the user's home directory
     /// (`installer -target CurrentUserHomeDirectory`) — the sudo-free test hook.
@@ -113,6 +152,39 @@ pub struct PkgSection {
     /// `pkgbuild --scripts` directory (relative to the config dir): packed
     /// whole; top-level `preinstall`/`postinstall` run as install hooks.
     pub scripts: Option<PathBuf>,
+}
+
+impl PkgSection {
+    /// The `embala-pkg` spec for this section, with `src` and `scripts`
+    /// resolved against `base` (the config file's directory).
+    pub fn spec(&self, package: &Package, base: &Path) -> embala_pkg::PkgSpec {
+        embala_pkg::PkgSpec {
+            name: package.name.clone(),
+            display_name: package.display_name.clone(),
+            identifier: package.identifier.clone(),
+            version: package.version.clone(),
+            install_location: self.install_location.clone(),
+            enable_user_home: self.enable_user_home,
+            files: self
+                .files
+                .iter()
+                .map(|f| embala_pkg::FileSpec {
+                    src: base.join(&f.src),
+                    dest: f.dest.clone(),
+                    mode: f.mode,
+                })
+                .collect(),
+            directories: self
+                .directories
+                .iter()
+                .map(|d| embala_pkg::DirSpec {
+                    dest: d.dest.clone(),
+                    mode: d.mode,
+                })
+                .collect(),
+            scripts: self.scripts.as_ref().map(|s| base.join(s)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -339,6 +411,12 @@ impl Config {
         }
         if let Some(setup) = &self.setup {
             validate_setup(setup)?;
+        }
+        if let Some(pkg) = &self.pkg {
+            // Layout rules (dest shape, duplicates, file/directory
+            // conflicts) belong to embala-pkg; run them now so a bad [pkg]
+            // fails before any format builds. No filesystem access.
+            embala_pkg::validate(&pkg.spec(p, Path::new("")))?;
         }
         if let Some(sign) = &self.sign {
             // signed-stub existence is a build-time check (needs the config dir);
@@ -843,6 +921,85 @@ shortcuts = [{ name = "Hello", target = "hello.exe" }]
 "#;
         let err = parse(&with_setup(block)).unwrap_err().to_string();
         assert!(err.contains("cannot be combined with"), "{err}");
+    }
+
+    /// The fixture with its `[pkg]` files line swapped for `files`, plus
+    /// any extra `[pkg]` keys.
+    fn with_pkg(files: &str, extra: &str) -> String {
+        fixture_toml().replace(
+            "files = [{ src = \"hello.sh\", dest = \"bin/embala-hello\" }]",
+            &format!("files = {files}\n{extra}"),
+        )
+    }
+
+    #[test]
+    fn pkg_modes_and_directories_parse() {
+        let text = with_pkg(
+            r#"[{ src = "hello.sh", dest = "etc/credentials", mode = 0o600 }, { src = "hello.sh", dest = "bin/embala-hello" }]"#,
+            r#"directories = [{ dest = "keys", mode = 0o700 }, { dest = "empty" }]"#,
+        );
+        let pkg = parse(&text).expect("pkg modes must parse").pkg.unwrap();
+        assert_eq!(pkg.files[0].mode, Some(0o600));
+        assert_eq!(
+            pkg.files[1].mode, None,
+            "absent mode keeps the exec-bit rule"
+        );
+        assert_eq!(pkg.directories[0].dest, "keys");
+        assert_eq!(pkg.directories[0].mode, Some(0o700));
+        assert_eq!(pkg.directories[1].mode, None);
+    }
+
+    #[test]
+    fn pkg_mode_beyond_permission_bits_is_rejected() {
+        // Why: setuid/setgid/sticky would grant privilege on install; they are
+        // not supported, so they must fail loudly rather than be masked.
+        for mode in ["0o4755", "0o2755", "0o1777"] {
+            let file = with_pkg(
+                &format!(r#"[{{ src = "hello.sh", dest = "bin/embala-hello", mode = {mode} }}]"#),
+                "",
+            );
+            let err = format!("{:#}", parse(&file).unwrap_err());
+            assert!(err.contains("permission bits only"), "{mode}: {err}");
+            let dir = with_pkg(
+                r#"[{ src = "hello.sh", dest = "bin/embala-hello" }]"#,
+                &format!(r#"directories = [{{ dest = "keys", mode = {mode} }}]"#),
+            );
+            assert!(parse(&dir).is_err(), "directory {mode}");
+        }
+    }
+
+    #[test]
+    fn mode_outside_pkg_fails_to_parse() {
+        // Why: only .pkg can honor a mode; elsewhere it must not be silently
+        // dropped.
+        let msi = fixture_toml().replace(
+            "files = [{ src = \"dist/hello.exe\", dest = \"hello.exe\" }]\n# Registers",
+            "files = [{ src = \"dist/hello.exe\", dest = \"hello.exe\", mode = 0o600 }]\n# Registers",
+        );
+        assert_ne!(msi, fixture_toml(), "replacement must hit [msi] files");
+        let err = format!("{:#}", parse(&msi).unwrap_err());
+        assert!(err.contains("unknown field `mode`"), "{err}");
+    }
+
+    #[test]
+    fn pkg_directory_conflicts_are_rejected() {
+        let files = r#"[{ src = "hello.sh", dest = "bin/embala-hello" }]"#;
+        for (directories, needle) in [
+            (
+                r#"[{ dest = "keys" }, { dest = "keys" }]"#,
+                "share the dest",
+            ),
+            (r#"[{ dest = "bin/embala-hello" }]"#, "share the dest"),
+            (
+                r#"[{ dest = "bin/embala-hello/keys" }]"#,
+                "both a file and a directory",
+            ),
+            (r#"[{ dest = "../keys" }]"#, "relative"),
+        ] {
+            let text = with_pkg(files, &format!("directories = {directories}"));
+            let err = format!("{:#}", parse(&text).unwrap_err());
+            assert!(err.contains(needle), "{directories}: {err}");
+        }
     }
 
     #[test]

@@ -172,8 +172,9 @@ fn validate_bom_path(s: &str) -> Result<()> {
 pub struct BomBuilder {
     /// Paths to materialize.
     ///
-    /// Directories are not tracked explicitly. Rather they are derived
-    /// at BOM generation time.
+    /// Directories added with [`BomBuilder::add_directory`] are tracked
+    /// explicitly; the rest are derived from file paths at BOM generation
+    /// time.
     paths: BTreeMap<String, BomPath>,
 
     default_mtime: DateTime<Utc>,
@@ -282,6 +283,20 @@ impl BomBuilder {
         self.paths.insert(bom_path.clone(), path);
 
         Ok(self.paths.get_mut(&bom_path).unwrap())
+    }
+
+    /// Add a directory with an explicit `mode` (file-type bits included,
+    /// e.g. `0o40700`). It is recorded even when no file lives under it;
+    /// directories that are only implied by file paths keep the default
+    /// mode.
+    pub fn add_directory(&mut self, bom_path: impl ToString, mode: u16) -> Result<()> {
+        let bom_path = bom_path.to_string();
+        validate_bom_path(&bom_path)?;
+        let mut record = self.directory_record();
+        record.mode = mode;
+        let path = BomPath::from_record(String::new(), &record)?;
+        self.paths.insert(bom_path, path);
+        Ok(())
     }
 
     fn directory_record(&self) -> BomBlockPathRecord<'static> {

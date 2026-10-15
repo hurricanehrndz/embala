@@ -190,26 +190,10 @@ fn build_app(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> 
 
 fn build_pkg(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> {
     let section = config.pkg.as_ref().expect("caller checked [pkg] presence");
-    // FileEntry.src is relative to the config file's directory.
+    // Section paths are relative to the config file's directory.
     let base = config_path.parent().unwrap_or(Path::new("."));
     let package = &config.package;
-    let spec = embala_pkg::PkgSpec {
-        name: package.name.clone(),
-        display_name: package.display_name.clone(),
-        identifier: package.identifier.clone(),
-        version: package.version.clone(),
-        install_location: section.install_location.clone(),
-        enable_user_home: section.enable_user_home,
-        files: section
-            .files
-            .iter()
-            .map(|f| embala_pkg::FileSpec {
-                src: base.join(&f.src),
-                dest: f.dest.clone(),
-            })
-            .collect(),
-        scripts: section.scripts.as_ref().map(|s| base.join(s)),
-    };
+    let spec = section.spec(package, base);
     let out = out_dir.join(format!("{}-{}.pkg", package.name, package.version));
     std::fs::create_dir_all(out_dir)?;
     embala_pkg::build(&spec, &out)?;
