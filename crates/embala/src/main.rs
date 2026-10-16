@@ -35,6 +35,9 @@ enum Command {
         /// Package version, overriding `[package].version` (numeric x.y.z)
         #[arg(long)]
         version: Option<String>,
+        /// Skip every `[sign]` command, building as if the section were absent
+        #[arg(long)]
+        no_sign: bool,
     },
     /// Write the setup stub (for external signing flows). Bare by default; with
     /// `--config` the stub is branded exactly as `build` would patch it.
@@ -83,7 +86,8 @@ fn main() -> Result<()> {
             formats,
             out_dir,
             version,
-        } => build(&config, &formats, &out_dir, version.as_deref()),
+            no_sign,
+        } => build(&config, &formats, &out_dir, version.as_deref(), no_sign),
         Command::DumpStub {
             arch,
             config,
@@ -137,8 +141,13 @@ fn build(
     formats: &[Format],
     out_dir: &Path,
     version: Option<&str>,
+    no_sign: bool,
 ) -> Result<()> {
-    let config = Config::load(config_path, version)?;
+    let mut config = Config::load(config_path, version)?;
+    if no_sign {
+        // The same code path as a config without [sign].
+        config.sign = None;
+    }
 
     let formats: Vec<Format> = if formats.is_empty() {
         let configured = [
