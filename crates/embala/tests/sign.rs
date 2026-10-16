@@ -63,11 +63,21 @@ fn write_sign_script(dir: &Path, log: &Path) -> PathBuf {
 }
 
 fn build(config: &Path, out_dir: &Path, formats: &str) -> std::process::Output {
+    build_with(config, out_dir, formats, &[])
+}
+
+fn build_with(
+    config: &Path,
+    out_dir: &Path,
+    formats: &str,
+    extra: &[&str],
+) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_embala"))
         .args(["build", "--config"])
         .arg(config)
         .args(["--formats", formats, "--out-dir"])
         .arg(out_dir)
+        .args(extra)
         .output()
         .expect("run embala")
 }
@@ -167,6 +177,34 @@ fn no_sign_section_is_byte_reproducible() {
             fs::read(out1.join(name)).unwrap(),
             fs::read(out2.join(name)).unwrap(),
             "{name} must be byte-identical without [sign]"
+        );
+    }
+}
+
+#[test]
+fn no_sign_flag_builds_as_if_sign_were_absent() {
+    // Why: unsigned builds (no certificate on the host) must not need a
+    // rewritten config, and must match a config that never had [sign].
+    let signed_dir = tmp("no-sign-flag");
+    let signed = write_fixture(&signed_dir, "[sign.windows]\ncommand = \"false $f\"\n");
+    let flagged = signed_dir.join("dist");
+    let result = build_with(&signed, &flagged, "msi,setup", &["--no-sign"]);
+    assert!(
+        result.status.success(),
+        "--no-sign must skip the failing sign command: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let plain_dir = tmp("no-sign-plain");
+    let plain = write_fixture(&plain_dir, "");
+    let unsigned = plain_dir.join("dist");
+    assert!(build(&plain, &unsigned, "msi,setup").status.success());
+
+    for name in ["hello-0.1.0-x86_64-setup.exe", "hello-0.1.0-x86_64.msi"] {
+        assert_eq!(
+            fs::read(flagged.join(name)).unwrap(),
+            fs::read(unsigned.join(name)).unwrap(),
+            "{name} with --no-sign must match a build without [sign]"
         );
     }
 }
