@@ -32,6 +32,9 @@ enum Command {
         /// Directory the artifacts are written into
         #[arg(long, default_value = "dist")]
         out_dir: PathBuf,
+        /// Package version, overriding `[package].version` (numeric x.y.z)
+        #[arg(long)]
+        version: Option<String>,
     },
     /// Write the setup stub (for external signing flows). Bare by default; with
     /// `--config` the stub is branded exactly as `build` would patch it.
@@ -43,6 +46,9 @@ enum Command {
         /// Config to brand the stub from (icon, banner, VERSIONINFO).
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Package version for VERSIONINFO, overriding `[package].version`
+        #[arg(long, requires = "config")]
+        version: Option<String>,
         #[arg(long)]
         out: PathBuf,
     },
@@ -76,8 +82,14 @@ fn main() -> Result<()> {
             config,
             formats,
             out_dir,
-        } => build(&config, &formats, &out_dir),
-        Command::DumpStub { arch, config, out } => dump_stub(arch, config.as_deref(), &out),
+            version,
+        } => build(&config, &formats, &out_dir, version.as_deref()),
+        Command::DumpStub {
+            arch,
+            config,
+            version,
+            out,
+        } => dump_stub(arch, config.as_deref(), version.as_deref(), &out),
     }
 }
 
@@ -91,13 +103,14 @@ fn setup_arch(arch: config::SetupArch) -> embala_setup::SetupArch {
 fn dump_stub(
     arch: Option<config::SetupArch>,
     config_path: Option<&Path>,
+    version: Option<&str>,
     out: &Path,
 ) -> Result<()> {
     let bytes = match config_path {
         // With `--config`: brand the stub exactly as `build` would (spec R9),
         // arch from `[setup].arch` unless `--arch` overrides it.
         Some(path) => {
-            let config = Config::load(path)?;
+            let config = Config::load(path, version)?;
             let section = config
                 .setup
                 .as_ref()
@@ -119,8 +132,13 @@ fn dump_stub(
     Ok(())
 }
 
-fn build(config_path: &Path, formats: &[Format], out_dir: &Path) -> Result<()> {
-    let config = Config::load(config_path)?;
+fn build(
+    config_path: &Path,
+    formats: &[Format],
+    out_dir: &Path,
+    version: Option<&str>,
+) -> Result<()> {
+    let config = Config::load(config_path, version)?;
 
     let formats: Vec<Format> = if formats.is_empty() {
         let configured = [

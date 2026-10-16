@@ -341,11 +341,16 @@ pub struct MacosSign {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Self> {
+    /// `version` (the CLI's `--version`) replaces `[package].version` before
+    /// validation, so an override gets the same x.y.z check as the file.
+    pub fn load(path: &Path, version: Option<&str>) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        let config: Config =
+        let mut config: Config =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        if let Some(version) = version {
+            config.package.version = version.to_string();
+        }
         config.validate()?;
         Ok(config)
     }
