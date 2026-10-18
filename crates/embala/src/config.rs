@@ -562,7 +562,7 @@ pub struct MacosSign {
 
 impl Config {
     /// `version` (the CLI's `--version`) replaces `[package].version` before
-    /// validation, so an override gets the same x.y.z check as the file.
+    /// validation, so an override gets the same version check as the file.
     pub fn load(path: &Path, version: Option<&str>) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
@@ -585,14 +585,20 @@ impl Config {
         {
             bail!("package.name must match [a-z0-9-]+ (got {:?})", p.name);
         }
+        // An optional fourth component is a build number. MSI and VERSIONINFO
+        // store it as a 16-bit field, so it is capped at 65535.
         let version_parts: Vec<&str> = p.version.split('.').collect();
-        if version_parts.len() != 3
+        if !(3..=4).contains(&version_parts.len())
             || version_parts
                 .iter()
                 .any(|s| s.is_empty() || !s.chars().all(|c| c.is_ascii_digit()))
+            || version_parts
+                .get(3)
+                .is_some_and(|build| build.parse::<u16>().is_err())
         {
             bail!(
-                "package.version must be numeric x.y.z — MSI requires it (got {:?})",
+                "package.version must be numeric x.y.z or x.y.z.build (build <= 65535) — \
+                 MSI requires it (got {:?})",
                 p.version
             );
         }
@@ -954,6 +960,22 @@ mod tests {
         let text = fixture_toml().replace("version = \"0.1.0\"", "version = \"0.1.0-beta\"");
         let err = parse(&text).unwrap_err().to_string();
         assert!(err.contains("numeric x.y.z"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn build_number_is_accepted_up_to_sixteen_bits() {
+        // Why: CI stamps a build number as the fourth component; MSI and
+        // VERSIONINFO hold it in 16 bits, so anything larger would be truncated.
+        let with =
+            |v: &str| fixture_toml().replace("version = \"0.1.0\"", &format!("version = \"{v}\""));
+        assert_eq!(
+            parse(&with("0.1.0.65535")).unwrap().package.version,
+            "0.1.0.65535"
+        );
+        for bad in ["0.1.0.65536", "0.1.0.", "0.1.0.1.2"] {
+            let err = parse(&with(bad)).unwrap_err().to_string();
+            assert!(err.contains("x.y.z.build"), "{bad}: {err}");
+        }
     }
 
     #[test]

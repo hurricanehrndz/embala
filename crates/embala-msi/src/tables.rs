@@ -393,16 +393,24 @@ pub(crate) fn write<F: Read + Write + Seek>(
     // emits for <MajorUpgrade/>) ----------------------------------------------
     const UPGRADE_MIGRATE_FEATURES: i32 = 1; // msidbUpgradeAttributesMigrateFeatures
     const UPGRADE_ONLY_DETECT: i32 = 2; // msidbUpgradeAttributesOnlyDetect
+    const UPGRADE_VERSION_MAX_INCLUSIVE: i32 = 0x200; // msidbUpgradeAttributesVersionMaxInclusive
     let upgrade_code = guids::upgrade_code(&spec.identifier);
     package.insert_rows(Insert::into("Upgrade").rows(vec![
-        // Any older version (VersionMax is exclusive, so not this one):
-        // RemoveExistingProducts uninstalls it, migrating feature states.
+        // Any older or same-x.y.z version: RemoveExistingProducts uninstalls
+        // it, migrating feature states. VersionMax is inclusive (WiX's
+        // AllowSameVersionUpgrades) because Windows Installer ignores the
+        // fourth (build) field: with an exclusive max, 1.2.3.4 would not count
+        // as older than 1.2.3.5, and with distinct ProductCodes both would end
+        // up installed side by side. The accepted cost: a build-only
+        // downgrade (1.2.3.5 -> 1.2.3.4) replaces rather than being blocked.
+        // An identical version has the same ProductCode, which
+        // FindRelatedProducts skips, so plain rebuilds are unaffected.
         vec![
             Value::Str(upgrade_code.clone()),
             Value::Null, // VersionMin: no lower bound
             Value::Str(spec.version.clone()),
             Value::Null, // Language: any
-            Value::Int(UPGRADE_MIGRATE_FEATURES),
+            Value::Int(UPGRADE_MIGRATE_FEATURES | UPGRADE_VERSION_MAX_INCLUSIVE),
             Value::Null, // Remove: all features
             Value::Str("OLDPRODUCTFOUND".to_string()),
         ],

@@ -176,7 +176,7 @@ fn concat_children(nodes: &[Vec<u8>]) -> Vec<u8> {
 }
 
 /// Numeric `a.b.c.d` VERSIONINFO tuple from a version string: the leading
-/// `major[.minor[.patch]]` components, the fourth always zero, and any
+/// `major[.minor[.patch[.build]]]` components, with any missing or
 /// unparseable component (or the whole string) collapsing to zero (spec R7).
 fn numeric_version(version: &str) -> (u16, u16, u16, u16) {
     let mut parts = version.split('.');
@@ -186,7 +186,7 @@ fn numeric_version(version: &str) -> (u16, u16, u16, u16) {
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(0)
     };
-    (next(), next(), next(), 0)
+    (next(), next(), next(), next())
 }
 
 /// Set `blob` as the raw `RT_VERSION` resource id 1 under en-US, replacing any
@@ -370,6 +370,7 @@ mod tests {
     #[test]
     fn numeric_version_cases() {
         assert_eq!(numeric_version("1.2.3"), (1, 2, 3, 0));
+        assert_eq!(numeric_version("1.2.3.42"), (1, 2, 3, 42));
         assert_eq!(numeric_version("0.1.0-rc1"), (0, 1, 0, 0));
         assert_eq!(numeric_version("garbage"), (0, 0, 0, 0));
     }

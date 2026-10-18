@@ -51,7 +51,13 @@ pub fn build(
         "????", // unregistered creator code — the modern convention
         &package.name,
     )?;
-    builder.set_info_plist_key("CFBundleShortVersionString", package.version.as_str())?;
+    // Apple specifies three integers for the marketing version; a build number
+    // (x.y.z.build) only goes in CFBundleVersion, set above.
+    let short_version = match package.version.match_indices('.').nth(2) {
+        Some((i, _)) => &package.version[..i],
+        None => package.version.as_str(),
+    };
+    builder.set_info_plist_key("CFBundleShortVersionString", short_version)?;
     if let Some(min) = &section.minimum_system_version {
         builder.set_info_plist_key("LSMinimumSystemVersion", min.as_str())?;
     }
@@ -189,6 +195,20 @@ mod tests {
         }
         // The fixture doesn't configure a minimum system version.
         assert!(!dict.contains_key("LSMinimumSystemVersion"));
+    }
+
+    #[test]
+    fn build_number_goes_only_in_the_bundle_version() {
+        let out = tmp("build-number");
+        let package = Package {
+            version: "0.1.0.42".to_string(),
+            ..package()
+        };
+        let bundle = build(&package, &section(), &fixture_dir(), &out).unwrap();
+        let dict = plist_dict(&bundle);
+        let get = |key: &str| dict.get(key).and_then(|v| v.as_string());
+        assert_eq!(get("CFBundleVersion"), Some("0.1.0.42"));
+        assert_eq!(get("CFBundleShortVersionString"), Some("0.1.0"));
     }
 
     #[test]
