@@ -13,10 +13,10 @@ readme = "README.md"
 anyhow = "1.0.103"
 apple-bundles = "0.21"
 clap = { version = "4.6.1", features = ["derive"] }
-embala-msi = { version = "0.6.0", path = "../embala-msi" }
-embala-nupkg = { version = "0.6.0", path = "../embala-nupkg" }
-embala-pkg = { version = "0.6.0", path = "../embala-pkg" }
-embala-setup = { version = "0.6.0", path = "../embala-setup" }
+embala-msi = { version = "0.7.0", path = "../embala-msi" }
+embala-nupkg = { version = "0.7.0", path = "../embala-nupkg" }
+embala-pkg = { version = "0.7.0", path = "../embala-pkg" }
+embala-setup = { version = "0.7.0", path = "../embala-setup" }
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 plist = "1"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -27,7 +27,7 @@ toml = "1.1.2"
 [dev-dependencies]
 # The sign integration test parses the produced setup.exe's overlay trailer to
 # assert the signed uninstall stub was actually embedded.
-embala-setup-overlay = { version = "0.6.0", path = "../embala-setup-overlay" }
+embala-setup-overlay = { version = "0.7.0", path = "../embala-setup-overlay" }
 # The optional-files test reads the built .pkg payload (xar -> gzip -> cpio)
 # and the setup.exe payload zip; the same crates the writers use.
 apple-xar = { version = "0.20", default-features = false }
