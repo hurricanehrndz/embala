@@ -555,18 +555,21 @@ version = "0.6.0"
 dependencies = [
  "anyhow",
  "apple-bundles",
+ "apple-xar",
  "clap",
  "embala-msi",
  "embala-nupkg",
  "embala-pkg",
  "embala-setup",
  "embala-setup-overlay",
+ "flate2",
  "image",
  "plist",
  "serde",
  "simple-file-manifest",
  "tauri-icns",
  "toml",
+ "zip",
 ]
 
 [[package]]

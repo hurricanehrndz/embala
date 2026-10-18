@@ -114,12 +114,14 @@ fn dump_stub(
         // With `--config`: brand the stub exactly as `build` would (spec R9),
         // arch from `[setup].arch` unless `--arch` overrides it.
         Some(path) => {
-            let config = Config::load(path, version)?;
+            let mut config = Config::load(path, version)?;
+            let base = path.parent().unwrap_or(Path::new("."));
             let section = config
                 .setup
-                .as_ref()
+                .as_mut()
                 .with_context(|| format!("{} has no [setup] section", path.display()))?;
-            let base = path.parent().unwrap_or(Path::new("."));
+            section.drop_absent_optional(base)?;
+            let section = &*section;
             config::validate_setup_paths(section, base)?;
             let arch = setup_arch(arch.unwrap_or(section.arch));
             let branding = assemble_branding(&config.package, section, base)?;
@@ -173,6 +175,13 @@ fn build(
         formats.to_vec()
     };
 
+    // Every builder (and the setup lowering) sees the file lists with absent
+    // optional entries already gone, as if the config never listed them.
+    let base = config_path.parent().unwrap_or(Path::new("."));
+    for format in &formats {
+        drop_absent_optional(&mut config, *format, base)?;
+    }
+
     for format in formats {
         let section_present = match format {
             Format::Msi => config.msi.is_some(),
@@ -190,6 +199,21 @@ fn build(
         build_format(format, &config, config_path, out_dir)?;
     }
     Ok(())
+}
+
+/// Drop absent `optional` payload files from `format`'s section, if present.
+/// Only requested formats are touched, so an unbuilt section neither prints
+/// skip notes nor fails on its references.
+fn drop_absent_optional(config: &mut Config, format: Format, base: &Path) -> Result<()> {
+    match format {
+        Format::Msi => config.msi.as_mut().map(|s| s.drop_absent_optional(base)),
+        Format::Pkg => config.pkg.as_mut().map(|s| s.drop_absent_optional(base)),
+        Format::Nupkg => config.nupkg.as_mut().map(|s| s.drop_absent_optional(base)),
+        Format::Setup => config.setup.as_mut().map(|s| s.drop_absent_optional(base)),
+        // [app] has no file list: `executable` is a required path.
+        Format::App => None,
+    }
+    .unwrap_or(Ok(()))
 }
 
 fn build_format(format: Format, config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> {

@@ -23,7 +23,13 @@ description = "Example app"
 [msi]
 arch = "x86_64"
 main-executable = "hello.exe"
-files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
+files = [
+  { src = "dist/hello.exe", dest = "hello.exe" },
+  # Optional: `optional = true` (any format's files) drops the entry, with a
+  # note, when src is not found. A dangling symlink or non-file src still
+  # fails, as does main-executable or a shortcut naming the dropped dest.
+  # { src = "build/secrets/token", dest = "token", optional = true },
+]
 # Optional: register a payload file as a Windows service.
 # service = { name = "hello", start = "auto", arguments = "--service", executable = "agent.exe" }
 # Optional: append the install directory to the system PATH.

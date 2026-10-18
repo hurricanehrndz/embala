@@ -46,6 +46,9 @@ pub struct Package {
 pub struct FileEntry {
     pub src: PathBuf,
     pub dest: String,
+    /// Drop the entry from the build when `src` is not found.
+    #[serde(default)]
+    pub optional: bool,
 }
 
 /// A `[pkg]` payload file: a [`FileEntry`] plus an optional install mode. Its
@@ -59,6 +62,133 @@ pub struct PkgFileEntry {
     /// executable, else `0o644`.
     #[serde(default, deserialize_with = "permission_bits")]
     pub mode: Option<u32>,
+    /// Drop the entry from the build when `src` is not found.
+    #[serde(default)]
+    pub optional: bool,
+}
+
+/// What [`drop_absent`] needs from either payload entry type.
+trait Payload {
+    fn src(&self) -> &Path;
+    fn dest(&self) -> &str;
+    fn optional(&self) -> bool;
+}
+
+impl Payload for FileEntry {
+    fn src(&self) -> &Path {
+        &self.src
+    }
+    fn dest(&self) -> &str {
+        &self.dest
+    }
+    fn optional(&self) -> bool {
+        self.optional
+    }
+}
+
+impl Payload for PkgFileEntry {
+    fn src(&self) -> &Path {
+        &self.src
+    }
+    fn dest(&self) -> &str {
+        &self.dest
+    }
+    fn optional(&self) -> bool {
+        self.optional
+    }
+}
+
+/// An `optional` entry [`drop_absent`] removed: its dest and resolved src.
+struct Dropped {
+    dest: String,
+    src: PathBuf,
+}
+
+/// Remove every `optional` entry whose `src` (resolved against `base`) is not
+/// found, printing one note per skip to stderr. Returns what was removed.
+fn drop_absent<T: Payload>(section: &str, files: &mut Vec<T>, base: &Path) -> Result<Vec<Dropped>> {
+    let mut dropped = Vec::new();
+    let mut kept = Vec::with_capacity(files.len());
+    for file in files.drain(..) {
+        let src = base.join(file.src());
+        if file.optional() && optional_src_absent(&src)? {
+            eprintln!("{section}: skipped optional {} (not found)", src.display());
+            dropped.push(Dropped {
+                dest: file.dest().to_string(),
+                src,
+            });
+        } else {
+            kept.push(file);
+        }
+    }
+    *files = kept;
+    Ok(dropped)
+}
+
+/// Whether an optional `src` is absent. Only "not found" counts as absent:
+/// the probe is `symlink_metadata`, not `exists`/`try_exists`, because those
+/// follow symlinks and report a dangling one as absent. A dangling symlink,
+/// at `src` or at its nearest existing ancestor, is a broken build input, so
+/// it is an error, as is a present `src` that is not a regular file or any
+/// other I/O error (e.g. permission denied).
+fn optional_src_absent(src: &Path) -> Result<bool> {
+    use std::io::ErrorKind::NotFound;
+    match std::fs::symlink_metadata(src) {
+        Ok(_) => {
+            let meta = std::fs::metadata(src).map_err(|e| match e.kind() {
+                NotFound => anyhow::anyhow!("optional src {} is a dangling symlink", src.display()),
+                _ => {
+                    anyhow::Error::new(e).context(format!("reading optional src {}", src.display()))
+                }
+            })?;
+            if !meta.is_file() {
+                bail!("optional src {} is not a regular file", src.display());
+            }
+            Ok(false)
+        }
+        Err(e) if e.kind() == NotFound => {
+            // A dangling symlinked parent directory also surfaces as
+            // NotFound for `src`; catch it at the nearest existing ancestor.
+            let nearest = src
+                .ancestors()
+                .skip(1)
+                .find(|a| std::fs::symlink_metadata(a).is_ok());
+            if let Some(link) = nearest {
+                if link.is_symlink() && std::fs::metadata(link).is_err() {
+                    bail!(
+                        "optional src {}: ancestor {} is a dangling symlink",
+                        src.display(),
+                        link.display()
+                    );
+                }
+            }
+            Ok(true)
+        }
+        Err(e) => Err(e).with_context(|| format!("reading optional src {}", src.display())),
+    }
+}
+
+/// Fail when a config field names a dest only a skipped optional entry
+/// provided, instead of building a package that points at nothing. `kept` is
+/// every dest still in the build (another entry may provide the same dest).
+fn ensure_not_dropped<'a>(
+    section: &str,
+    dropped: &[Dropped],
+    kept: &[&str],
+    refs: impl IntoIterator<Item = (String, &'a str)>,
+) -> Result<()> {
+    for (field, dest) in refs {
+        if kept.contains(&dest) {
+            continue;
+        }
+        if let Some(d) = dropped.iter().find(|d| d.dest == dest) {
+            bail!(
+                "{section}: {field} {dest:?} is an optional file that was absent ({} not found)",
+                d.src.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// A `[pkg]` directory declared to set its mode or to ship it empty.
@@ -109,6 +239,24 @@ pub struct MsiSection {
     pub add_to_path: bool,
 }
 
+impl MsiSection {
+    /// Drop absent optional files; `main-executable` and the service
+    /// executable must not name one.
+    pub fn drop_absent_optional(&mut self, base: &Path) -> Result<()> {
+        let dropped = drop_absent("msi", &mut self.files, base)?;
+        let kept: Vec<&str> = self.files.iter().map(|f| f.dest.as_str()).collect();
+        let service = self.service.as_ref().and_then(|s| s.executable.as_deref());
+        ensure_not_dropped(
+            "msi",
+            &dropped,
+            &kept,
+            [("main-executable".to_string(), self.main_executable.as_str())]
+                .into_iter()
+                .chain(service.map(|e| ("service executable".to_string(), e))),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ServiceStart {
@@ -155,6 +303,11 @@ pub struct PkgSection {
 }
 
 impl PkgSection {
+    /// Drop absent optional files. Nothing else in `[pkg]` names a file dest.
+    pub fn drop_absent_optional(&mut self, base: &Path) -> Result<()> {
+        drop_absent("pkg", &mut self.files, base).map(drop)
+    }
+
     /// The `embala-pkg` spec for this section, with `src` and `scripts`
     /// resolved against `base` (the config file's directory).
     pub fn spec(&self, package: &Package, base: &Path) -> embala_pkg::PkgSpec {
@@ -207,6 +360,14 @@ pub struct NupkgSection {
     pub release_notes: Option<String>,
     pub icon_url: Option<String>,
     pub license_url: Option<String>,
+}
+
+impl NupkgSection {
+    /// Drop absent optional files. Download style never reads `src`, and
+    /// validation rejects `optional` there, so it has nothing to drop.
+    pub fn drop_absent_optional(&mut self, base: &Path) -> Result<()> {
+        drop_absent("nupkg", &mut self.files, base).map(drop)
+    }
 }
 
 /// Windows setup.exe selects the embedded stub by arch; only 64-bit targets
@@ -313,6 +474,30 @@ impl SetupSection {
             .map(|f| f.dest.as_str())
             .collect()
     }
+
+    /// Drop absent optional files, top-level and per component, before
+    /// lowering sees them; `main-executable` (shortcut, ARP DisplayIcon,
+    /// finish-page run) and shortcut targets must not name one.
+    pub fn drop_absent_optional(&mut self, base: &Path) -> Result<()> {
+        let mut dropped = drop_absent("setup", &mut self.files, base)?;
+        for component in &mut self.components {
+            dropped.extend(drop_absent("setup", &mut component.files, base)?);
+        }
+        let main = self
+            .main_executable
+            .as_deref()
+            .map(|m| ("main-executable".to_string(), m));
+        let targets = self
+            .shortcuts
+            .iter()
+            .map(|s| (format!("shortcut {:?} target", s.name), s.target.as_str()));
+        ensure_not_dropped(
+            "setup",
+            &dropped,
+            &self.installed_dests(),
+            main.into_iter().chain(targets),
+        )
+    }
 }
 
 /// User-supplied signing commands (spec R5/R6). embala never implements a
@@ -406,6 +591,9 @@ impl Config {
                     bail!("nupkg: url/checksum are only valid with style \"download\"");
                 }
                 _ => {}
+            }
+            if nupkg.style == NupkgStyle::Download && nupkg.files.iter().any(|f| f.optional) {
+                bail!("nupkg: optional has no effect with style \"download\" (src is never read)");
             }
             if p.require_license_acceptance && nupkg.license_url.is_none() {
                 bail!(
@@ -1005,6 +1193,162 @@ shortcuts = [{ name = "Hello", target = "hello.exe" }]
             let err = format!("{:#}", parse(&text).unwrap_err());
             assert!(err.contains(needle), "{directories}: {err}");
         }
+    }
+
+    /// Fresh per-test dir holding `dist/hello.exe`, the only payload present.
+    fn optional_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("embala-optional-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dist")).unwrap();
+        std::fs::write(dir.join("dist/hello.exe"), b"MZ").unwrap();
+        dir
+    }
+
+    const ABSENT: &str = r#"{ src = "absent.exe", dest = "agent.exe", optional = true }"#;
+
+    #[test]
+    fn optional_parses_on_every_file_entry_and_defaults_off() {
+        let text = fixture_toml()
+            .replace(
+                r#"files = [{ src = "hello.sh", dest = "bin/embala-hello" }]"#,
+                r#"files = [{ src = "hello.sh", dest = "bin/embala-hello", mode = 0o600, optional = true }]"#,
+            )
+            .replace(
+                r#"{ src = "readme.txt", dest = "readme.txt" }"#,
+                r#"{ src = "readme.txt", dest = "readme.txt", optional = true }"#,
+            );
+        let config = parse(&text).expect("optional must parse");
+        let pkg = &config.pkg.as_ref().unwrap().files[0];
+        assert!(pkg.optional);
+        assert_eq!(pkg.mode, Some(0o600));
+        let setup = config.setup.as_ref().unwrap();
+        assert!(setup.components[0].files[0].optional);
+        assert!(!setup.files[0].optional, "optional defaults to false");
+    }
+
+    #[test]
+    fn optional_with_download_style_is_rejected() {
+        // Why: download style never reads src, so optional could only ever
+        // change the build by removing the one entry the URL needs.
+        let text = fixture_toml()
+            .replace(
+                "style = \"embedded\"",
+                "style = \"download\"\nurl = \"https://e.x/a.exe\"\nchecksum = \"00\"",
+            )
+            .replace(
+                r#"files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
+
+[setup]"#,
+                r#"files = [{ src = "dist/hello.exe", dest = "hello.exe", optional = true }]
+
+[setup]"#,
+            );
+        let err = parse(&text).unwrap_err().to_string();
+        assert!(err.contains("no effect with style \"download\""), "{err}");
+    }
+
+    #[test]
+    fn absent_optional_files_are_dropped_and_others_kept() {
+        let dir = optional_dir("drop");
+        let mut setup: SetupSection = toml::from_str(&format!(
+            r#"arch = "x86_64"
+main-executable = "hello.exe"
+files = [{{ src = "dist/hello.exe", dest = "hello.exe", optional = true }}, {ABSENT}]
+components = [{{ id = "extra", label = "Extra", files = [{ABSENT}] }}]"#
+        ))
+        .unwrap();
+        setup.drop_absent_optional(&dir).unwrap();
+        assert_eq!(setup.installed_dests(), ["hello.exe"]);
+        assert!(setup.components[0].files.is_empty());
+    }
+
+    #[test]
+    fn references_to_a_dropped_optional_file_are_rejected() {
+        // Why: a shortcut, ARP icon, MSI entry point or service pointing at a
+        // file the package does not ship is a broken install, not a skip.
+        let dir = optional_dir("refs");
+        let hello = r#"{ src = "dist/hello.exe", dest = "hello.exe" }"#;
+        for (field, setup) in [
+            (
+                "main-executable",
+                format!(
+                    "arch = \"x86_64\"\nmain-executable = \"agent.exe\"\nfiles = [{hello}, {ABSENT}]"
+                ),
+            ),
+            (
+                "shortcut \"Agent\" target",
+                format!(
+                    "arch = \"x86_64\"\nfiles = [{hello}]\n\
+                     components = [{{ id = \"a\", label = \"A\", files = [{ABSENT}] }}]\n\
+                     shortcuts = [{{ name = \"Agent\", target = \"agent.exe\" }}]"
+                ),
+            ),
+        ] {
+            let mut setup: SetupSection = toml::from_str(&setup).unwrap();
+            let err = setup.drop_absent_optional(&dir).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("setup: {field} \"agent.exe\"")),
+                "{err}"
+            );
+            assert!(err.contains("optional file that was absent"), "{err}");
+        }
+        for (field, msi) in [
+            ("main-executable", "main-executable = \"agent.exe\""),
+            (
+                "service executable",
+                "main-executable = \"hello.exe\"\n\
+                 service = { name = \"a\", start = \"auto\", executable = \"agent.exe\" }",
+            ),
+        ] {
+            let mut msi: MsiSection = toml::from_str(&format!(
+                "arch = \"x86_64\"\n{msi}\nfiles = [{hello}, {ABSENT}]"
+            ))
+            .unwrap();
+            let err = msi.drop_absent_optional(&dir).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("msi: {field} \"agent.exe\"")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reference_another_entry_still_provides_is_kept() {
+        let dir = optional_dir("shared-dest");
+        let mut msi: MsiSection = toml::from_str(
+            r#"arch = "x86_64"
+main-executable = "hello.exe"
+files = [{ src = "absent.exe", dest = "hello.exe", optional = true }, { src = "dist/hello.exe", dest = "hello.exe" }]"#,
+        )
+        .unwrap();
+        msi.drop_absent_optional(&dir).unwrap();
+        assert_eq!(msi.files.len(), 1);
+    }
+
+    #[test]
+    fn only_not_found_counts_as_absent() {
+        let dir = optional_dir("probe");
+        assert!(optional_src_absent(&dir.join("missing")).unwrap());
+        assert!(optional_src_absent(&dir.join("no/such/dir/file")).unwrap());
+        assert!(!optional_src_absent(&dir.join("dist/hello.exe")).unwrap());
+        let err = optional_src_absent(&dir.join("dist")).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_is_an_error_not_a_skip() {
+        // Why: exists()/try_exists() report a dangling link as absent; a
+        // broken staging step must fail the build, not quietly drop a file.
+        let dir = optional_dir("dangling");
+        std::os::unix::fs::symlink(dir.join("gone"), dir.join("link")).unwrap();
+        let err = optional_src_absent(&dir.join("link")).unwrap_err();
+        assert!(err.to_string().contains("dangling symlink"), "{err}");
+        let err = optional_src_absent(&dir.join("link/credentials")).unwrap_err();
+        assert!(err.to_string().contains("dangling symlink"), "{err}");
+        std::os::unix::fs::symlink(dir.join("dist/hello.exe"), dir.join("good")).unwrap();
+        assert!(!optional_src_absent(&dir.join("good")).unwrap());
     }
 
     #[test]
