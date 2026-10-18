@@ -63,6 +63,15 @@ Windows 11, the `.app` launches via `open` and the `.pkg` installs via
 differential-tested against Apple's `pkgbuild`/`productbuild`/`mkbom` and
 against msitools respectively.
 
+## Versions
+
+`[package].version` (or `--version`) is numeric `x.y.z`, optionally followed by
+a build number: `x.y.z.build`, with the build no higher than 65535. Every format
+carries the full string, except that `.app` puts only `x.y.z` in
+`CFBundleShortVersionString`. Windows Installer ignores the build field when it
+compares versions, so the `.msi` replaces any install with the same `x.y.z`.
+That means a build-only bump upgrades, but a build-only downgrade isn't blocked.
+
 ## Signing — SmartScreen & Gatekeeper
 
 embala artifacts are **signable**: an optional `[sign]` section in `embala.toml`

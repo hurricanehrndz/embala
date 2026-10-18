@@ -32,7 +32,7 @@ enum Command {
         /// Directory the artifacts are written into
         #[arg(long, default_value = "dist")]
         out_dir: PathBuf,
-        /// Package version, overriding `[package].version` (numeric x.y.z)
+        /// Package version, overriding `[package].version` (numeric x.y.z or x.y.z.build)
         #[arg(long)]
         version: Option<String>,
         /// Skip every `[sign]` command, building as if the section were absent

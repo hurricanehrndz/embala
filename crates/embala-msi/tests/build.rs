@@ -101,9 +101,13 @@ fn major_upgrade_tables_are_authored() {
         .collect();
     let upgrade_code = "{AEEE1525-B29B-5F4D-AA97-3E85DD62F6D2}";
     // Attributes: 1 = msidbUpgradeAttributesMigrateFeatures,
-    //             2 = msidbUpgradeAttributesOnlyDetect.
+    //             2 = msidbUpgradeAttributesOnlyDetect,
+    //             0x200 = msidbUpgradeAttributesVersionMaxInclusive (513 = 1 | 0x200).
+    // The inclusive max is what lets a build-number bump (1.2.3.4 -> 1.2.3.5)
+    // replace the old install: Windows Installer ignores the fourth field, so
+    // an exclusive max would leave both installed side by side.
     assert!(
-        rows.contains(&format!("{upgrade_code} ..0.1.0 1 -> OLDPRODUCTFOUND")),
+        rows.contains(&format!("{upgrade_code} ..0.1.0 513 -> OLDPRODUCTFOUND")),
         "missing remove-older Upgrade row: {rows:?}"
     );
     assert!(
