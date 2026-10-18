@@ -133,10 +133,9 @@ fn drop_absent<T: Payload>(section: &str, files: &mut Vec<T>, base: &Path) -> Re
 /// other I/O error (e.g. permission denied).
 fn optional_src_absent(src: &Path) -> Result<bool> {
     use std::io::ErrorKind::NotFound;
-    // Rebuilding from components drops a trailing separator or `.`; with one,
-    // lstat follows a final symlink and a dangling one reads as NotFound.
-    let src: PathBuf = src.components().collect();
-    let src = src.as_path();
+    // With a trailing separator or `.`, lstat follows a final symlink and a
+    // dangling one reads as NotFound.
+    let src = trim_trailing(src);
     match std::fs::symlink_metadata(src) {
         Ok(_) => {
             let meta = std::fs::metadata(src).map_err(|e| match e.kind() {
@@ -170,6 +169,38 @@ fn optional_src_absent(src: &Path) -> Result<bool> {
         }
         Err(e) => Err(e).with_context(|| format!("reading optional src {}", src.display())),
     }
+}
+
+/// `path` without trailing separators or `.` components, never trimming into
+/// its prefix or root (`/`, `C:\`, `\\server\share\`, `\\?\C:\`). This strips
+/// text rather than rebuilding from `components()`: `PathBuf::push` re-parses
+/// each component, so on Windows `C:\stage\c:credentials` would collapse to the
+/// drive-relative `c:credentials`. Separators are `/` on Unix and `/` or `\`
+/// on Windows, except that verbatim (`\\?\`) paths use only `\` and keep `.`
+/// literally, as `components()` treats them.
+fn trim_trailing(path: &Path) -> &Path {
+    use std::path::Component;
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let (mut floor, verbatim) = match path.components().next() {
+        Some(Component::Prefix(p)) => (p.as_os_str().len(), p.kind().is_verbatim()),
+        _ => (0, false),
+    };
+    let is_sep = |b: u8| (b == b'\\' && cfg!(windows)) || (b == b'/' && !verbatim);
+    if bytes.get(floor).is_some_and(|&b| is_sep(b)) {
+        floor += 1;
+    }
+    let mut end = bytes.len();
+    while end > floor {
+        let last = bytes[end - 1];
+        let dot_component = last == b'.' && !verbatim && end >= 2 && is_sep(bytes[end - 2]);
+        if !is_sep(last) && !dot_component {
+            break;
+        }
+        end -= 1;
+    }
+    // SAFETY: the bytes come from `as_encoded_bytes` and are cut immediately
+    // before an ASCII `/`, `\` or `.`, a boundary the encoding allows.
+    Path::new(unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&bytes[..end]) })
 }
 
 /// Fail when a config field names a dest only a skipped optional entry
@@ -1385,5 +1416,78 @@ files = [{ src = "absent.exe", dest = "hello.exe", optional = true }, { src = "d
         );
         let err = parse(&text).unwrap_err().to_string();
         assert!(err.contains("must be non-empty and contain $f"), "{err}");
+    }
+
+    /// `trim_trailing` as a string, compared exactly: `Path`'s `==` ignores
+    /// trailing separators, which is what these tests check.
+    fn trimmed(path: &str) -> &str {
+        trim_trailing(Path::new(path)).to_str().unwrap()
+    }
+
+    #[test]
+    fn trim_trailing_strips_only_trailing_separators_and_dots() {
+        assert_eq!(trimmed("dir/link/"), "dir/link");
+        assert_eq!(trimmed("dir/link/."), "dir/link");
+        assert_eq!(trimmed("dir/link//././/"), "dir/link");
+        assert_eq!(trimmed("dir/./link"), "dir/./link");
+        assert_eq!(trimmed("dir/link"), "dir/link");
+        // A `:` mid-path is kept, not re-parsed as a drive.
+        assert_eq!(trimmed("stage/c:credentials/."), "stage/c:credentials");
+        assert_eq!(trimmed("dir/.."), "dir/..");
+        assert_eq!(trimmed("dir/link."), "dir/link.");
+        assert_eq!(trimmed("/"), "/");
+        assert_eq!(trimmed("/."), "/");
+        assert_eq!(trimmed("."), ".");
+        assert_eq!(trimmed("./"), ".");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn trim_trailing_keeps_backslash_on_unix() {
+        assert_eq!(trimmed("dir/link\\"), "dir/link\\");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn trim_trailing_windows_paths() {
+        // Backslash, alone or mixed with `/`.
+        assert_eq!(trimmed(r"stage\link\"), r"stage\link");
+        assert_eq!(trimmed(r"stage\link\."), r"stage\link");
+        assert_eq!(trimmed(r"stage\link/.\"), r"stage\link");
+        // Drive-absolute: the root stays, a `:` component is kept.
+        assert_eq!(
+            trimmed(r"C:\stage\c:credentials\"),
+            r"C:\stage\c:credentials"
+        );
+        assert_eq!(
+            trimmed(r"C:\stage\c:credentials\."),
+            r"C:\stage\c:credentials"
+        );
+        assert_eq!(trimmed(r"C:\"), r"C:\");
+        assert_eq!(trimmed(r"C:\."), r"C:\");
+        assert_eq!(trimmed("C:/"), "C:/");
+        // Drive-relative: never trimmed into the prefix.
+        assert_eq!(trimmed(r"C:link\"), r"C:link");
+        assert_eq!(trimmed(r"C:link\."), r"C:link");
+        assert_eq!(trimmed("C:"), "C:");
+        assert_eq!(trimmed("C:."), "C:.");
+        // UNC: the share root stays.
+        assert_eq!(
+            trimmed(r"\\server\share\dir\link\."),
+            r"\\server\share\dir\link"
+        );
+        assert_eq!(trimmed(r"\\server\share\"), r"\\server\share\");
+        // Verbatim: only `\` separates and `.` is literal.
+        assert_eq!(
+            trimmed(r"\\?\C:\stage\c:credentials\"),
+            r"\\?\C:\stage\c:credentials"
+        );
+        assert_eq!(trimmed(r"\\?\C:\"), r"\\?\C:\");
+        assert_eq!(trimmed(r"\\?\C:\dir\link/"), r"\\?\C:\dir\link/");
+        assert_eq!(trimmed(r"\\?\C:\dir\."), r"\\?\C:\dir\.");
+        assert_eq!(
+            trimmed(r"\\?\UNC\server\share\link\"),
+            r"\\?\UNC\server\share\link"
+        );
     }
 }
