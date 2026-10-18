@@ -73,8 +73,8 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// `(name, mode)` of every entry in the built .pkg's cpio payload.
-fn pkg_payload(dir: &Path) -> Vec<(String, u64)> {
+/// `name -> (mode, contents)` of every entry in the built .pkg's cpio payload.
+fn pkg_payload(dir: &Path) -> BTreeMap<String, (u64, Vec<u8>)> {
     let archive = fs::read(dir.join("dist/hello-0.1.0.pkg")).unwrap();
     let gz = apple_xar::reader::XarReader::new(Cursor::new(archive))
         .unwrap()
@@ -86,7 +86,7 @@ fn pkg_payload(dir: &Path) -> Vec<(String, u64)> {
         .read_to_end(&mut cpio)
         .unwrap();
     // odc headers: 76 ASCII-octal bytes, then the NUL-terminated name and data.
-    let mut entries = Vec::new();
+    let mut entries = BTreeMap::new();
     let mut rest = &cpio[..];
     loop {
         let field = |lo: usize, hi: usize| {
@@ -98,7 +98,8 @@ fn pkg_payload(dir: &Path) -> Vec<(String, u64)> {
         if name == "TRAILER!!!" {
             return entries;
         }
-        entries.push((name, mode));
+        let data = rest[76 + name_size..76 + name_size + file_size].to_vec();
+        entries.insert(name, (mode, data));
         rest = &rest[76 + name_size + file_size..];
     }
 }
@@ -141,14 +142,12 @@ fn absent_optional_files_are_left_out_of_every_payload() {
     }
 
     let pkg = pkg_payload(&dir);
-    assert!(
-        pkg.contains(&("./bin/hello".to_string(), 0o100644)),
+    assert_eq!(
+        pkg.get("./bin/hello").map(|e| e.0),
+        Some(0o100644),
         "{pkg:?}"
     );
-    assert!(
-        !pkg.iter().any(|(n, _)| n.contains("credentials")),
-        "{pkg:?}"
-    );
+    assert!(!pkg.keys().any(|n| n.contains("credentials")), "{pkg:?}");
 
     let (files, install_lua) = setup_payload(&dir);
     assert_eq!(files.keys().collect::<Vec<_>>(), ["hello.exe"]);
@@ -166,9 +165,10 @@ fn present_optional_files_ship_like_required_ones() {
     assert!(!stderr(&result).contains("skipped"), "{}", stderr(&result));
 
     let pkg = pkg_payload(&dir);
-    assert!(
-        pkg.contains(&("./credentials".to_string(), 0o100600)),
-        "credentials must keep its 0o600 mode: {pkg:?}"
+    assert_eq!(
+        pkg.get("./credentials"),
+        Some(&(0o100600, CREDENTIALS.to_vec())),
+        "credentials must ship unchanged with its 0o600 mode: {pkg:?}"
     );
     let (files, install_lua) = setup_payload(&dir);
     assert_eq!(
@@ -182,17 +182,18 @@ fn present_optional_files_ship_like_required_ones() {
 fn missing_required_files_still_fail() {
     let dir = tmp("optional-required");
     let config = write_fixture(&dir, "");
-    // The errors are each writer's own, unchanged; embala-pkg's does not
-    // name the path, so only setup's message is pinned.
-    for (format, needle) in [
-        ("pkg", "No such file"),
-        ("setup", "credentials does not exist"),
-    ] {
+    // The errors are each writer's own, unchanged. embala-pkg's is only the
+    // OS error text, which differs per platform, so it is not pinned.
+    for (format, needle) in [("pkg", None), ("setup", Some("credentials does not exist"))] {
         let result = build(&config, format);
+        let err = stderr(&result);
         assert!(!result.status.success(), "{format} must fail");
-        assert!(stderr(&result).contains(needle), "{}", stderr(&result));
-        assert!(!stderr(&result).contains("skipped"), "{}", stderr(&result));
+        if let Some(needle) = needle {
+            assert!(err.contains(needle), "{err}");
+        }
+        assert!(!err.contains("skipped"), "{err}");
     }
+    assert!(!dir.join("dist/hello-0.1.0.pkg").exists());
 }
 
 #[cfg(unix)]

@@ -133,6 +133,10 @@ fn drop_absent<T: Payload>(section: &str, files: &mut Vec<T>, base: &Path) -> Re
 /// other I/O error (e.g. permission denied).
 fn optional_src_absent(src: &Path) -> Result<bool> {
     use std::io::ErrorKind::NotFound;
+    // Rebuilding from components drops a trailing separator or `.`; with one,
+    // lstat follows a final symlink and a dangling one reads as NotFound.
+    let src: PathBuf = src.components().collect();
+    let src = src.as_path();
     match std::fs::symlink_metadata(src) {
         Ok(_) => {
             let meta = std::fs::metadata(src).map_err(|e| match e.kind() {
@@ -1347,6 +1351,12 @@ files = [{ src = "absent.exe", dest = "hello.exe", optional = true }, { src = "d
         assert!(err.to_string().contains("dangling symlink"), "{err}");
         let err = optional_src_absent(&dir.join("link/credentials")).unwrap_err();
         assert!(err.to_string().contains("dangling symlink"), "{err}");
+        // A trailing separator makes lstat follow the link and report
+        // NotFound, which must not read as an absent file.
+        for spelling in ["link/", "link/."] {
+            let err = optional_src_absent(&dir.join(spelling)).unwrap_err();
+            assert!(err.to_string().contains("dangling symlink"), "{err}");
+        }
         std::os::unix::fs::symlink(dir.join("dist/hello.exe"), dir.join("good")).unwrap();
         assert!(!optional_src_absent(&dir.join("good")).unwrap());
     }
