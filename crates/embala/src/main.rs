@@ -360,6 +360,21 @@ fn build_msi(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()> 
             executable: s.executable.clone(),
         }),
         add_to_path: section.add_to_path,
+        registry: section
+            .registry
+            .iter()
+            .map(|r| embala_msi::RegistryValue {
+                root: match r.root {
+                    config::RegistryRoot::Hklm => embala_msi::RegistryRoot::Hklm,
+                },
+                key: r.key.clone(),
+                name: r.name.clone(),
+                value: match &r.value {
+                    config::RegistryData::String(s) => embala_msi::RegistryData::String(s.clone()),
+                    config::RegistryData::Integer(n) => embala_msi::RegistryData::Integer(*n),
+                },
+            })
+            .collect(),
     };
     let out = out_dir.join(format!(
         "{}-{}-{}.msi",

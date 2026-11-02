@@ -6,8 +6,9 @@
 //!
 //! Scope for v1: install files to Program Files, Start-menu shortcut,
 //! Add/Remove Programs entry, clean uninstall, MajorUpgrade, and optionally
-//! one payload file (by default the main executable) as a Windows service
-//! and the install directory on the system PATH. Nothing else.
+//! one payload file (by default the main executable) as a Windows service,
+//! the install directory on the system PATH, and HKLM registry values.
+//! Nothing else.
 //
 // Portions ported from deno desktop (cli/tools/desktop.rs),
 // Copyright 2018-2026 the Deno authors, MIT license.
@@ -17,6 +18,7 @@ mod guids;
 mod resort;
 mod summary;
 mod tables;
+mod version;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -76,6 +78,35 @@ pub struct ServiceSpec {
     pub executable: Option<String>,
 }
 
+/// Registry hive of a [`RegistryValue`]. Only HKLM: the package is
+/// per-machine and often installed as SYSTEM (Intune, SCCM), where HKCU is
+/// SYSTEM's own hive rather than any user's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryRoot {
+    Hklm,
+}
+
+/// Registry data. `String` is an MSI Formatted string (`[INSTALLDIR]`,
+/// `[#filekey]`, `[\[]` for a literal `[`), written as REG_SZ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistryData {
+    String(String),
+    /// REG_DWORD (MSI's `#` prefix).
+    Integer(i32),
+}
+
+/// A registry value written on install and removed on uninstall, in the
+/// 64-bit view. All values share one dedicated component.
+#[derive(Debug, Clone)]
+pub struct RegistryValue {
+    pub root: RegistryRoot,
+    /// Key path below the root, `\`-separated.
+    pub key: String,
+    /// Value name; `None` is the key's default value.
+    pub name: Option<String>,
+    pub value: RegistryData,
+}
+
 /// A payload file: `src` on disk (already resolved to a real path), `dest`
 /// the `/`-separated install path relative to the install directory.
 #[derive(Debug, Clone)]
@@ -114,6 +145,8 @@ pub struct MsiSpec {
     /// table, WiX `<Environment Name="PATH" Part="last" System="yes">`);
     /// uninstall removes just that entry.
     pub add_to_path: bool,
+    /// Registry values owned by the product.
+    pub registry: Vec<RegistryValue>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -136,6 +169,12 @@ pub enum Error {
          (Windows SCM rules)"
     )]
     InvalidServiceName(String),
+    #[error("msi registry value {key:?} {name:?}: {reason}")]
+    InvalidRegistry {
+        key: String,
+        name: Option<String>,
+        reason: &'static str,
+    },
     #[error("msi payload too large (File.FileSize is a 32-bit int): {0}")]
     FileTooLarge(PathBuf),
     #[error(transparent)]
@@ -242,6 +281,53 @@ fn validate(spec: &MsiSpec) -> Result<()> {
             if !spec.files.iter().any(|f| f.dest == *executable) {
                 return Err(Error::ServiceExecutableNotFound(executable.clone()));
             }
+        }
+    }
+    validate_registry(&spec.registry)
+}
+
+/// Key, Name and Value are all formatted by msiexec, so `[...]` and `{...}`
+/// are allowed on purpose; only what would silently change the meaning of a
+/// row is rejected.
+fn validate_registry(values: &[RegistryValue]) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for v in values {
+        let err = |reason| Error::InvalidRegistry {
+            key: v.key.clone(),
+            name: v.name.clone(),
+            reason,
+        };
+        ensure_ascii("registry key", &v.key)?;
+        if v.key.split('\\').any(str::is_empty) {
+            return Err(err(
+                "key must be non-empty, without leading, trailing or doubled '\\'",
+            ));
+        }
+        if let Some(name) = &v.name {
+            ensure_ascii("registry name", name)?;
+            // An empty Name is NULL (the default value).
+            if name.is_empty() {
+                return Err(err(
+                    "name must be non-empty (omit it for the default value)",
+                ));
+            }
+        }
+        if let RegistryData::String(s) = &v.value {
+            ensure_ascii("registry value", s)?;
+            // Empty is stored as NULL, which the Registry table does not
+            // read as an empty REG_SZ; `[~]` turns the value into
+            // REG_MULTI_SZ.
+            if s.is_empty() || s.contains("[~]") {
+                return Err(err("string value must be non-empty and not contain [~]"));
+            }
+        }
+        // Registry paths are case-insensitive.
+        let id = (
+            v.key.to_ascii_lowercase(),
+            v.name.as_ref().map(|n| n.to_ascii_lowercase()),
+        );
+        if !seen.insert(id) {
+            return Err(err("duplicate registry value"));
         }
     }
     Ok(())

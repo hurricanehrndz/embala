@@ -30,6 +30,12 @@ files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
 service = { name = "embala-hello", display-name = "Embala Hello", description = "Embala test service", start = "disabled" }
 # Appends the install directory to the system PATH; uninstall removes it.
 add-to-path = true
+# HKLM values written on install and removed on uninstall. A string is an MSI
+# formatted string (REG_SZ), an integer a REG_DWORD.
+registry = [
+  { root = "HKLM", key = 'Software\Carlos Hernandez\Embala Hello', name = "InstallDir", value = "[INSTALLDIR]" },
+  { root = "HKLM", key = 'Software\Carlos Hernandez\Embala Hello', name = "Installed", value = 1 },
+]
 
 [app]
 executable = "dist/hello-mac"

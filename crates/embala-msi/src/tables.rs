@@ -10,7 +10,8 @@ use std::path::PathBuf;
 
 use msi::{Category, Column, Insert, Value};
 
-use crate::{Error, MsiSpec, Result, ServiceStart, guids};
+use crate::version::FileVersion;
+use crate::{Error, MsiSpec, RegistryData, RegistryRoot, Result, ServiceStart, guids, version};
 
 /// Name of the CFB stream holding the embedded cabinet. The Media table
 /// references it as `#embala.cab` (the `#` marks an internal stream).
@@ -28,6 +29,8 @@ pub(crate) struct StagedFile {
     pub src: PathBuf,
     pub dir_id: String,
     pub dest: String,
+    /// `File.Version`/`Language` when `src` is a PE with a version resource.
+    pub version: Option<FileVersion>,
 }
 
 pub(crate) struct Staged {
@@ -140,6 +143,7 @@ pub(crate) fn stage(spec: &MsiSpec) -> Result<Staged> {
         };
         let size = std::fs::metadata(src)?.len();
         let size = i32::try_from(size).map_err(|_| Error::FileTooLarge((*src).clone()))?;
+        let bytes = std::fs::read(src)?;
         short_counter += 1;
         files.push(StagedFile {
             key: format!("f{i}"),
@@ -149,6 +153,7 @@ pub(crate) fn stage(spec: &MsiSpec) -> Result<Staged> {
             src: (*src).clone(),
             dir_id: dir_ids[dir].clone(),
             dest: (*dest).to_string(),
+            version: version::read(&bytes),
         });
     }
 
@@ -251,6 +256,21 @@ pub(crate) fn write<F: Read + Write + Seek>(
         Value::Null,
         Value::Str("ShortcutRegistry".to_string()),
     ]);
+    // Dedicated component for the configured registry values, KeyPath = the
+    // first one. Its GUID is stable across versions like the file
+    // components; the set of values may still change between versions
+    // because RemoveExistingProducts runs first and removes the old product
+    // entirely.
+    if !spec.registry.is_empty() {
+        component_rows.push(vec![
+            Value::Str("RegistryComponent".to_string()),
+            Value::Str(guids::registry_component_guid(&spec.identifier)),
+            Value::Str("INSTALLDIR".to_string()),
+            Value::Int(ATTR_64BIT | ATTR_REGISTRY_KEYPATH),
+            Value::Null,
+            Value::Str("reg0".to_string()),
+        ]);
+    }
     package.insert_rows(Insert::into("Component").rows(component_rows))?;
 
     // --- File (sequence numbers match cabinet order, 1-based) ---------------
@@ -265,8 +285,15 @@ pub(crate) fn write<F: Read + Write + Seek>(
                 Value::Str(f.component.clone()),
                 Value::Str(f.file_name.clone()),
                 Value::Int(f.size),
-                Value::Null, // Version (not a tracked-version file)
-                Value::Null, // Language
+                // NULL = unversioned: compared by hash/date, and always
+                // older than an installed versioned file.
+                f.version
+                    .as_ref()
+                    .map_or(Value::Null, |v| Value::Str(v.version.clone())),
+                f.version
+                    .as_ref()
+                    .and_then(|v| v.language.clone())
+                    .map_or(Value::Null, Value::Str),
                 Value::Int(FILE_VITAL),
                 Value::Int(1 + i as i32),
             ]
@@ -299,6 +326,12 @@ pub(crate) fn write<F: Read + Write + Seek>(
         Value::Str("MainFeature".to_string()),
         Value::Str("ShortcutComponent".to_string()),
     ]);
+    if !spec.registry.is_empty() {
+        feature_component_rows.push(vec![
+            Value::Str("MainFeature".to_string()),
+            Value::Str("RegistryComponent".to_string()),
+        ]);
+    }
     package.insert_rows(Insert::into("FeatureComponents").rows(feature_component_rows))?;
 
     // --- Media: one disk, everything in the embedded cabinet ----------------
@@ -328,15 +361,37 @@ pub(crate) fn write<F: Read + Write + Seek>(
     ]))?;
 
     // --- Registry: the shortcut component's KeyPath -------------------------
+    // (plus the configured values, on RegistryComponent).
     const HKCU: i32 = 1;
-    package.insert_rows(Insert::into("Registry").row(vec![
+    const HKLM: i32 = 2;
+    let mut registry_rows = vec![vec![
         Value::Str("ShortcutRegistry".to_string()),
         Value::Int(HKCU),
         Value::Str(format!("Software\\{}\\{}", spec.publisher, spec.name)),
         Value::Str("installed".to_string()),
         Value::Str("#1".to_string()), // DWORD 1
         Value::Str("ShortcutComponent".to_string()),
-    ]))?;
+    ]];
+    for (i, v) in spec.registry.iter().enumerate() {
+        let root = match v.root {
+            RegistryRoot::Hklm => HKLM,
+        };
+        let value = match &v.value {
+            // A leading `#` marks a typed value; `##` escapes it to REG_SZ.
+            RegistryData::String(s) if s.starts_with('#') => format!("#{s}"),
+            RegistryData::String(s) => s.clone(),
+            RegistryData::Integer(n) => format!("#{n}"),
+        };
+        registry_rows.push(vec![
+            Value::Str(format!("reg{i}")),
+            Value::Int(root),
+            Value::Str(v.key.clone()),
+            v.name.clone().map_or(Value::Null, Value::Str),
+            Value::Str(value),
+            Value::Str("RegistryComponent".to_string()),
+        ]);
+    }
+    package.insert_rows(Insert::into("Registry").rows(registry_rows))?;
 
     // --- Property ------------------------------------------------------------
     let mut property_rows = vec![

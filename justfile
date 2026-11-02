@@ -18,10 +18,19 @@ lint:
 
 # Cross-compile the fixture test exes: Windows via mingw (0.2.0 feeds the
 # upgrade test), macOS via zig (rcodesign needs a real Mach-O in the .app).
+# The Windows exes carry a VERSIONINFO (hello.rc), so the MSI upgrade test
+# compares versioned files, as real payloads do.
 fixtures:
+    #!/usr/bin/env bash
+    set -euo pipefail
     mkdir -p fixtures/hello/dist
-    x86_64-w64-mingw32-cc -DVERSION='"0.1.0"' -o fixtures/hello/dist/hello.exe fixtures/hello/hello.c
-    x86_64-w64-mingw32-cc -DVERSION='"0.2.0"' -o fixtures/hello/dist/hello-0.2.0.exe fixtures/hello/hello.c
+    for v in 0.1.0 0.2.0; do
+        out=fixtures/hello/dist/hello-$v.exe
+        [ "$v" = 0.1.0 ] && out=fixtures/hello/dist/hello.exe
+        x86_64-w64-mingw32-windres -DVERSION_NUM="${v//./,},0" -DVERSION="\\\"$v\\\"" \
+            -O coff -o fixtures/hello/dist/hello-$v.res fixtures/hello/hello.rc
+        x86_64-w64-mingw32-cc -DVERSION="\"$v\"" -o "$out" fixtures/hello/hello.c fixtures/hello/dist/hello-$v.res
+    done
     zig cc -target aarch64-macos -DVERSION='"0.1.0"' -o fixtures/hello/dist/hello-mac fixtures/hello/hello.c
 
 # Cross-compile the setup.exe runtime stub for both Windows arches via zig and

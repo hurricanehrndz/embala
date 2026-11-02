@@ -272,6 +272,36 @@ pub struct MsiSection {
     /// Append the install directory to the system PATH.
     #[serde(default)]
     pub add_to_path: bool,
+    /// Registry values written on install and removed on uninstall (key and
+    /// value rules are checked by embala-msi).
+    #[serde(default)]
+    pub registry: Vec<MsiRegistryValue>,
+}
+
+/// Only HKLM: the MSI is per-machine, and when it is installed as SYSTEM
+/// HKCU is SYSTEM's own hive, not the user's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum RegistryRoot {
+    #[serde(rename = "HKLM")]
+    Hklm,
+}
+
+/// A TOML string is a REG_SZ (MSI formatted string), an integer a REG_DWORD.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum RegistryData {
+    String(String),
+    Integer(i32),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct MsiRegistryValue {
+    pub root: RegistryRoot,
+    pub key: String,
+    /// Absent: the key's default value.
+    pub name: Option<String>,
+    pub value: RegistryData,
 }
 
 impl MsiSection {
@@ -838,6 +868,14 @@ mod tests {
         assert_eq!(service.name, "embala-hello");
         assert_eq!(service.start, ServiceStart::Disabled);
         assert!(msi.add_to_path);
+        assert_eq!(msi.registry.len(), 2);
+        assert_eq!(msi.registry[0].root, RegistryRoot::Hklm);
+        assert_eq!(msi.registry[0].name.as_deref(), Some("InstallDir"));
+        assert_eq!(
+            msi.registry[0].value,
+            RegistryData::String("[INSTALLDIR]".to_string())
+        );
+        assert_eq!(msi.registry[1].value, RegistryData::Integer(1));
         assert_eq!(
             config.pkg.unwrap().scripts.as_deref(),
             Some(Path::new("scripts"))
@@ -855,6 +893,21 @@ mod tests {
         assert_eq!(setup.components[0].id, "docs");
         assert!(setup.components[0].default);
         assert_eq!(setup.components[0].files[0].dest, "readme.txt");
+    }
+
+    #[test]
+    fn msi_registry_accepts_only_hklm() {
+        // Why: the MSI is per-machine and often installed as SYSTEM, where
+        // HKCU is SYSTEM's hive, so a user-hive value would land nowhere
+        // useful. Anything but HKLM must fail at parse time, naming HKLM.
+        for root in ["HKCU", "HKCR", "hklm"] {
+            let text = fixture_toml().replace("root = \"HKLM\"", &format!("root = \"{root}\""));
+            let err = format!("{:#}", parse(&text).unwrap_err());
+            assert!(err.contains("expected `HKLM`"), "{root}: {err}");
+        }
+        // REG_DWORD is a 32-bit signed MSI integer.
+        let text = fixture_toml().replace("value = 1 }", "value = 4294967296 }");
+        assert!(parse(&text).is_err());
     }
 
     /// The fixture with its Phase-4 metadata keys stripped, so the mutation
