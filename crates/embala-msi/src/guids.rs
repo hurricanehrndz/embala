@@ -50,6 +50,12 @@ pub(crate) fn shortcut_component_guid(identifier: &str) -> String {
     braced(v5(format!("{identifier}\0shortcut")))
 }
 
+/// The component holding every `MsiSpec::registry` value, in the same
+/// NUL-separated namespace as the shortcut component.
+pub(crate) fn registry_component_guid(identifier: &str) -> String {
+    braced(v5(format!("{identifier}\0registry")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +102,14 @@ mod tests {
         assert_eq!(
             shortcut_component_guid(IDENT),
             "{DD0EC1DA-82DF-50D1-BDEC-1F8547ADE512}"
+        );
+    }
+
+    #[test]
+    fn registry_component_guid_is_locked() {
+        assert_eq!(
+            registry_component_guid(IDENT),
+            "{AFBA0C22-3E60-5CB7-9481-41A8F7DC221C}"
         );
     }
 }

@@ -48,7 +48,7 @@ plus one config file and writes these formats natively.
 
 | Format | Approach |
 |---|---|
-| `.msi` | `embala-msi`: direct Windows Installer database writing (`msi` + `cab` crates); optional `service` via native ServiceInstall/ServiceControl tables (on `main-executable` or a separate `executable`); optional `add-to-path` via the native Environment table |
+| `.msi` | `embala-msi`: direct Windows Installer database writing (`msi` + `cab` crates); optional `service` via native ServiceInstall/ServiceControl tables (on `main-executable` or a separate `executable`); optional `add-to-path` via the native Environment table; optional HKLM `registry` values via the native Registry table |
 | `.app` | native bundle layout via `apple-bundles`, PNG→icns via `tauri-icns` |
 | `.pkg` | `embala-pkg`: native flat package — `apple-xar` + `apple-bom` + cpio payload; optional `scripts` dir packed like `pkgbuild --scripts` |
 | `.nupkg` (Chocolatey) | `embala-nupkg`: native OPC zip writer (`zip` + `quick-xml`) |
@@ -71,6 +71,42 @@ carries the full string, except that `.app` puts only `x.y.z` in
 `CFBundleShortVersionString`. Windows Installer ignores the build field when it
 compares versions, so the `.msi` replaces any install with the same `x.y.z`.
 That means a build-only bump upgrades, but a build-only downgrade isn't blocked.
+
+Inside the `.msi`, each payload file that is a PE with a version resource
+gets that file version in `File.Version`, as WiX does. On an upgrade, a
+component whose installed file version is higher than the incoming one is
+skipped by costing and then removed with the old product, so a file's version
+must never go down between releases, and a binary must not lose its version
+resource. Files that never had a version resource are unversioned and always
+replaced on a major upgrade.
+
+## MSI registry values
+
+`[msi].registry` writes registry values on install and removes them on
+uninstall:
+
+```toml
+[msi]
+registry = [
+  { root = "HKLM", key = 'Software\Microsoft\Windows\CurrentVersion\Run', name = "AI Usage Monitor", value = '"[INSTALLDIR]AI Usage Monitor.exe"' },
+  { root = "HKLM", key = 'Software\Example\App', name = "Level", value = 1 },
+]
+```
+
+- `root`: only `"HKLM"`. The MSI is per-machine and is often installed as
+  SYSTEM (Intune, SCCM), where HKCU is SYSTEM's own hive, not the user's.
+  Values go to the 64-bit view (not `WOW6432Node`).
+- `key`: the path below the root, `\`-separated, with no leading, trailing,
+  or doubled `\`. TOML literal strings (`'...'`) avoid escaping backslashes.
+- `name`: the value name. Leave it out to set the key's default value.
+- `value`: a string is written as REG_SZ, an integer as REG_DWORD (32-bit
+  signed). Strings are MSI
+  [formatted strings](https://learn.microsoft.com/en-us/windows/win32/msi/formatted)
+  (`[INSTALLDIR]` expands; a literal `[` is `[\[]`). `[~]` (REG_MULTI_SZ)
+  and empty strings are rejected.
+
+All values share one component with a GUID derived from the identifier, so
+they live and die with the product: uninstall removes each value.
 
 ## Signing — SmartScreen & Gatekeeper
 

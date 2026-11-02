@@ -6,7 +6,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use embala_msi::{FileSpec, MsiArch, MsiSpec, ServiceSpec, ServiceStart, build};
+use embala_msi::{
+    FileSpec, MsiArch, MsiSpec, RegistryData, RegistryRoot, RegistryValue, ServiceSpec,
+    ServiceStart, build,
+};
+
+mod support;
+use support::pe::versioned_pe;
 
 const PAYLOAD_EXE: &[u8] = b"MZ fake windows executable payload";
 const PAYLOAD_TXT: &[u8] = b"readme contents\n";
@@ -42,6 +48,7 @@ fn test_spec(payload_dir: &Path) -> MsiSpec {
         ],
         service: None,
         add_to_path: false,
+        registry: vec![],
     }
 }
 
@@ -405,5 +412,172 @@ fn service_executable_selects_its_own_component() {
     assert!(
         matches!(err, embala_msi::Error::ServiceExecutableNotFound(_)),
         "unexpected error: {err}"
+    );
+}
+
+/// The 0.8.0 bug: File.Version was always NULL, so on a MajorUpgrade msiexec
+/// saw every installed versioned file as newer than the incoming
+/// "unversioned" one, skipped its component ("higher versioned keyfile
+/// exists"), and the early RemoveExistingProducts then deleted it. A PE with
+/// a version resource must carry its file version; anything else stays NULL.
+#[test]
+fn versioned_pe_files_carry_file_version() {
+    let payload = tmp("payload-version");
+    let mut spec = test_spec(&payload);
+    fs::write(payload.join("app.exe"), versioned_pe([1, 2, 3, 4], &[1033])).unwrap();
+    spec.files.push(FileSpec {
+        src: payload.join("app.exe"),
+        dest: "app.exe".to_string(),
+    });
+    let out = tmp("version.msi");
+    build(&spec, &out).unwrap();
+    let mut package = msi::Package::open(fs::File::open(&out).unwrap()).unwrap();
+    // File, Component_, FileName, FileSize, Version, Language, ...: sorted by
+    // dest, so app.exe, data/readme.txt, hello.exe (a fake "MZ" PE).
+    let files: Vec<Vec<String>> = rows(&mut package, "File")
+        .into_iter()
+        .map(|r| r.split('\t').map(str::to_string).collect())
+        .collect();
+    let version_of = |name: &str| {
+        let row = files
+            .iter()
+            .find(|cols| cols[2].ends_with(&format!("|{name}")))
+            .unwrap();
+        (row[4].clone(), row[5].clone())
+    };
+    assert_eq!(version_of("app.exe"), ("1.2.3.4".into(), "1033".into()));
+    assert_eq!(version_of("readme.txt"), (String::new(), String::new()));
+    assert_eq!(version_of("hello.exe"), (String::new(), String::new()));
+}
+
+/// `File.Language` holds 20 characters; five language ids would fail the
+/// whole build, so Language is NULL and the version is kept.
+#[test]
+fn many_languages_keep_the_version() {
+    let payload = tmp("payload-languages");
+    let mut spec = test_spec(&payload);
+    let pe = versioned_pe([1, 2, 3, 4], &[1033, 1031, 1036, 1040, 3082]);
+    fs::write(payload.join("app.exe"), pe).unwrap();
+    spec.files.push(FileSpec {
+        src: payload.join("app.exe"),
+        dest: "app.exe".to_string(),
+    });
+    let out = tmp("languages.msi");
+    build(&spec, &out).unwrap();
+    let mut package = msi::Package::open(fs::File::open(&out).unwrap()).unwrap();
+    let row = rows(&mut package, "File")
+        .into_iter()
+        .find(|r| r.contains("|app.exe"))
+        .unwrap();
+    let cols: Vec<&str> = row.split('\t').collect();
+    assert_eq!((cols[4], cols[5]), ("1.2.3.4", ""));
+}
+
+fn run_value(value: RegistryData) -> RegistryValue {
+    RegistryValue {
+        root: RegistryRoot::Hklm,
+        key: r"Software\Microsoft\Windows\CurrentVersion\Run".to_string(),
+        name: Some("Embala Hello".to_string()),
+        value,
+    }
+}
+
+/// Registry values live on their own component (stable GUID, registry
+/// KeyPath, in the main feature), so msiexec writes them on install and
+/// removes them with the product.
+#[test]
+fn registry_values_get_their_own_component() {
+    let mut spec = test_spec(&tmp("payload-registry"));
+    spec.registry = vec![
+        run_value(RegistryData::String(
+            r#""[INSTALLDIR]hello.exe""#.to_string(),
+        )),
+        RegistryValue {
+            key: r"Software\Carlos Hernandez\hello".to_string(),
+            name: Some("Level".to_string()),
+            ..run_value(RegistryData::Integer(7))
+        },
+        RegistryValue {
+            key: r"Software\Carlos Hernandez\hello".to_string(),
+            name: None,
+            ..run_value(RegistryData::String("#not a number".to_string()))
+        },
+    ];
+    let out = tmp("registry.msi");
+    build(&spec, &out).unwrap();
+    let mut package = msi::Package::open(fs::File::open(&out).unwrap()).unwrap();
+    let registry = rows(&mut package, "Registry");
+    for expected in [
+        "reg0\t2\tSoftware\\Microsoft\\Windows\\CurrentVersion\\Run\tEmbala Hello\t\"[INSTALLDIR]hello.exe\"\tRegistryComponent",
+        "reg1\t2\tSoftware\\Carlos Hernandez\\hello\tLevel\t#7\tRegistryComponent",
+        // `##` keeps a leading `#` a literal REG_SZ.
+        "reg2\t2\tSoftware\\Carlos Hernandez\\hello\t\t##not a number\tRegistryComponent",
+    ] {
+        assert!(
+            registry.contains(&expected.to_string()),
+            "{expected}: {registry:?}"
+        );
+    }
+    assert!(
+        rows(&mut package, "Component").contains(
+            &"RegistryComponent\t{AFBA0C22-3E60-5CB7-9481-41A8F7DC221C}\tINSTALLDIR\t260\t\treg0"
+                .to_string()
+        )
+    );
+    assert!(
+        rows(&mut package, "FeatureComponents")
+            .contains(&"MainFeature\tRegistryComponent".to_string())
+    );
+
+    spec.registry.clear();
+    build(&spec, &out).unwrap();
+    let mut package = msi::Package::open(fs::File::open(&out).unwrap()).unwrap();
+    assert!(
+        !rows(&mut package, "Component")
+            .iter()
+            .any(|r| r.starts_with("RegistryComponent"))
+    );
+}
+
+#[test]
+fn invalid_registry_values_are_rejected() {
+    let mut spec = test_spec(&tmp("payload-registry-bad"));
+    let ok = || run_value(RegistryData::String("x".to_string()));
+    let cases = [
+        RegistryValue {
+            key: String::new(),
+            ..ok()
+        },
+        RegistryValue {
+            key: r"\Software\x".to_string(),
+            ..ok()
+        },
+        RegistryValue {
+            key: r"Software\\x".to_string(),
+            ..ok()
+        },
+        RegistryValue {
+            name: Some(String::new()),
+            ..ok()
+        },
+        run_value(RegistryData::String(String::new())),
+        run_value(RegistryData::String("a[~]b".to_string())),
+    ];
+    for bad in cases {
+        spec.registry = vec![bad.clone()];
+        let err = build(&spec, &tmp("registry-bad.msi")).unwrap_err();
+        assert!(
+            matches!(err, embala_msi::Error::InvalidRegistry { .. }),
+            "{bad:?}: {err}"
+        );
+    }
+    // Registry paths are case-insensitive, so this is a duplicate.
+    let mut upper = ok();
+    upper.key = upper.key.to_uppercase();
+    spec.registry = vec![ok(), upper];
+    let err = build(&spec, &tmp("registry-bad.msi")).unwrap_err();
+    assert!(
+        matches!(err, embala_msi::Error::InvalidRegistry { .. }),
+        "{err}"
     );
 }

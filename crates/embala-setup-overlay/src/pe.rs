@@ -14,6 +14,8 @@
 //! invalidating the signature). Any malformed / truncated / non-PE input degrades
 //! silently to the stream length — exactly the pre-signing behavior — and never
 //! errors on structure; only a genuine reader I/O error propagates.
+//!
+//! `embala-msi/src/version.rs` walks the same headers (to the resource table).
 
 use std::io::{self, Read, Seek, SeekFrom};
 
