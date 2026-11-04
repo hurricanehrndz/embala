@@ -87,6 +87,10 @@ fn do_install(
     attached: bool,
 ) -> Result<(String, bool), String> {
     let install_dir = resolve_install_dir(args, resolved, &manifest.package.name)?;
+    // The script's directory page may re-point the install elsewhere, which
+    // would leave this default directory behind, so remember whether this run
+    // created it and remove it again (empty) once the final directory is known.
+    let created_default_dir = !install_dir.exists();
     std::fs::create_dir_all(&install_dir).map_err(|e| e.to_string())?;
 
     // Fresh staging dir for the read-only payload (spec R11 `payload_dir`).
@@ -126,6 +130,9 @@ fn do_install(
             let final_dir = engine.borrow().install_dir().to_path_buf();
             write_uninstaller(exe, trailer, &final_dir, manifest, &engine.borrow())?;
             let _ = std::fs::remove_dir_all(&payload_dir);
+            if created_default_dir && final_dir != install_dir {
+                let _ = std::fs::remove_dir(&install_dir);
+            }
             let ui_handled = engine.borrow_mut().finish_ui();
             Ok((
                 format!(
@@ -143,9 +150,17 @@ fn do_install(
             let records = engine.borrow().records().to_vec();
             api::reverse_all(&records);
             let final_dir = engine.borrow().install_dir().to_path_buf();
-            let _ = std::fs::remove_file(final_dir.join("install.log"));
+            // `install.log` is flushed with the first record, so with no records
+            // this run wrote none, and the file there belongs to an existing
+            // install the script refused to replace: its uninstaller needs it.
+            if !records.is_empty() {
+                let _ = std::fs::remove_file(final_dir.join("install.log"));
+            }
             let _ = std::fs::remove_dir_all(&payload_dir);
             let _ = std::fs::remove_dir(&final_dir);
+            if created_default_dir && final_dir != install_dir {
+                let _ = std::fs::remove_dir(&install_dir);
+            }
             Err(e)
         }
     }
