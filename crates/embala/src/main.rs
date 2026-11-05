@@ -260,60 +260,13 @@ fn build_nupkg(config: &Config, config_path: &Path, out_dir: &Path) -> Result<()
         .nupkg
         .as_ref()
         .expect("caller checked [nupkg] presence");
-    // FileEntry.src is relative to the config file's directory.
+    // Section paths are relative to the config file's directory.
     let base = config_path.parent().unwrap_or(Path::new("."));
     let package = &config.package;
-    let style = match section.style {
-        config::NupkgStyle::Embedded => embala_nupkg::Style::Embedded {
-            files: section
-                .files
-                .iter()
-                .map(|f| embala_nupkg::FileSpec {
-                    src: base.join(&f.src),
-                    dest: f.dest.clone(),
-                })
-                .collect(),
-        },
-        config::NupkgStyle::Download => {
-            // For download style the files list names the downloaded
-            // payload's dest; one URL downloads one file.
-            let [file] = section.files.as_slice() else {
-                bail!(
-                    "nupkg: style \"download\" needs exactly one files entry (its dest \
-                     names the downloaded payload), got {}",
-                    section.files.len()
-                );
-            };
-            embala_nupkg::Style::Download {
-                url: section.url.clone().expect("config validation requires url"),
-                checksum: section
-                    .checksum
-                    .clone()
-                    .expect("config validation requires checksum"),
-                dest: file.dest.clone(),
-            }
-        }
-    };
-    let spec = embala_nupkg::NupkgSpec {
-        name: package.name.clone(),
-        display_name: package.display_name.clone(),
-        version: package.version.clone(),
-        identifier: package.identifier.clone(),
-        publisher: package.publisher.clone(),
-        description: package.description.clone(),
-        homepage: package.homepage.clone(),
-        license: package.license.clone(),
-        copyright: package.copyright.clone(),
-        tags: package.tags.clone().unwrap_or_default(),
-        release_notes: section.release_notes.clone(),
-        require_license_acceptance: package.require_license_acceptance,
-        project_source_url: section.project_source_url.clone(),
-        package_source_url: section.package_source_url.clone(),
-        license_url: section.license_url.clone(),
-        icon: package.icon.as_ref().map(|p| base.join(p)),
-        icon_url: section.icon_url.clone(),
-        style,
-    };
+    if let Some(warning) = section.warning() {
+        eprintln!("{warning}");
+    }
+    let spec = section.spec(package, base)?;
     let out = out_dir.join(format!("{}-{}.nupkg", package.name, package.version));
     std::fs::create_dir_all(out_dir)?;
     embala_nupkg::build(&spec, &out)?;

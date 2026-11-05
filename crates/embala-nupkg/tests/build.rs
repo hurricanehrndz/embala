@@ -7,7 +7,7 @@ use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use embala_nupkg::{FileSpec, NupkgSpec, Style, build};
+use embala_nupkg::{FileSpec, NupkgSpec, Scripts, Style, build, validate};
 use sha2::{Digest as _, Sha256};
 
 const PAYLOAD_EXE: &[u8] = b"MZ fake windows executable payload";
@@ -50,7 +50,9 @@ fn embedded_spec(payload_dir: &Path) -> NupkgSpec {
         files: vec![FileSpec {
             src: payload_dir.join("hello.exe"),
             dest: "hello.exe".to_string(),
+            shim: true,
         }],
+        scripts: None,
     })
 }
 
@@ -529,20 +531,26 @@ fn invalid_specs_are_rejected() {
     let file = |dest: &str| FileSpec {
         src: payload.join("hello.exe"),
         dest: dest.to_string(),
+        shim: true,
     };
 
     let fail = |style: Style| build(&base_spec(style), &tmp("invalid.nupkg")).unwrap_err();
 
-    let err = fail(Style::Embedded { files: vec![] });
+    let err = fail(Style::Embedded {
+        files: vec![],
+        scripts: None,
+    });
     assert!(matches!(err, embala_nupkg::Error::NoFiles), "{err}");
 
     let err = fail(Style::Embedded {
         files: vec![file("../evil.exe")],
+        scripts: None,
     });
     assert!(matches!(err, embala_nupkg::Error::InvalidDest(_)), "{err}");
 
     let err = fail(Style::Embedded {
         files: vec![file("hello.exe"), file("hello.exe")],
+        scripts: None,
     });
     assert!(
         matches!(err, embala_nupkg::Error::DuplicateDest(_)),
@@ -552,6 +560,7 @@ fn invalid_specs_are_rejected() {
     // Would silently clobber the generated file on a case-insensitive extract.
     let err = fail(Style::Embedded {
         files: vec![file("verification.txt")],
+        scripts: None,
     });
     assert!(matches!(err, embala_nupkg::Error::ReservedDest(_)), "{err}");
 
@@ -562,6 +571,274 @@ fn invalid_specs_are_rejected() {
     });
     assert!(
         matches!(err, embala_nupkg::Error::InvalidChecksum(_)),
+        "{err}"
+    );
+}
+
+#[test]
+fn packages_without_new_keys_keep_their_bytes() {
+    // Pinned at 496883a, before nupkg scripts and shim control existed.
+    // Deployed machines call embedded exes through Chocolatey's shims in
+    // C:\ProgramData\chocolatey\bin; a package built from an unchanged
+    // config must stay byte-identical so upgrading embala never changes
+    // what those machines get. Update the hashes only for a deliberate
+    // format change.
+    let (embedded, _) =
+        embedded_spec_with_icon(&tmp("payload-pin"), "icon.png", PNG_MAGIC, b"pinned pixels");
+    for (label, spec, expected) in [
+        (
+            "embedded",
+            embedded,
+            "b089ff74aa6b549eee5c22094420daa901677ec97a6c16b6c7e54e28e59b2631",
+        ),
+        (
+            "download",
+            download_spec(),
+            "44b7fe3a6f60734ea77edc132d309dc53cf3a3fa08a9eabc016f602c8eb6bbd3",
+        ),
+    ] {
+        let out = tmp(&format!("pin-{label}.nupkg"));
+        build(&spec, &out).unwrap();
+        let actual = format!("{:x}", Sha256::digest(fs::read(&out).unwrap()));
+        assert_eq!(actual, expected, "{label} nupkg bytes changed");
+    }
+}
+
+/// The payload exe written into `dir`, packed at `dest`.
+fn payload_file(dir: &Path, dest: &str, shim: bool) -> FileSpec {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join("hello.exe"), PAYLOAD_EXE).unwrap();
+    FileSpec {
+        src: dir.join("hello.exe"),
+        dest: dest.to_string(),
+        shim,
+    }
+}
+
+/// All three supplied scripts, written into `dir` under names unlike any
+/// in-package name, each with its own content.
+fn supplied_scripts(dir: &Path) -> Scripts {
+    fs::create_dir_all(dir).unwrap();
+    for name in ["setup.ps1", "remove.ps1", "pre.ps1"] {
+        fs::write(dir.join(name), format!("# {name}\n")).unwrap();
+    }
+    Scripts::Supplied {
+        install: dir.join("setup.ps1"),
+        uninstall: Some(dir.join("remove.ps1")),
+        before_modify: Some(dir.join("pre.ps1")),
+    }
+}
+
+fn entry_names(entries: &BTreeMap<String, Vec<u8>>) -> Vec<&str> {
+    entries.keys().map(String::as_str).collect()
+}
+
+#[test]
+fn embedded_supplied_scripts_pack_under_chocolatey_names() {
+    let dir = tmp("payload-embedded-scripts");
+    let spec = base_spec(Style::Embedded {
+        files: vec![payload_file(&dir, "hello.exe", true)],
+        scripts: Some(supplied_scripts(&dir)),
+    });
+    let out = tmp("embedded-scripts.nupkg");
+    build(&spec, &out).unwrap();
+
+    let entries = read_entries(&out);
+    assert_eq!(
+        entry_names(&entries),
+        vec![
+            "[Content_Types].xml",
+            "_rels/.rels",
+            "hello.nuspec",
+            PSMDCP,
+            "tools/LICENSE.txt",
+            "tools/VERIFICATION.txt",
+            "tools/chocolateyBeforeModify.ps1",
+            "tools/chocolateyInstall.ps1",
+            "tools/chocolateyUninstall.ps1",
+            "tools/hello.exe",
+        ]
+    );
+    // Byte-for-byte, whatever the source file was called.
+    assert_eq!(entries["tools/chocolateyInstall.ps1"], b"# setup.ps1\n");
+    assert_eq!(entries["tools/chocolateyUninstall.ps1"], b"# remove.ps1\n");
+    assert_eq!(entries["tools/chocolateyBeforeModify.ps1"], b"# pre.ps1\n");
+    // VERIFICATION.txt vouches for the payload, not the scripts.
+    let verification = String::from_utf8(entries["tools/VERIFICATION.txt"].clone()).unwrap();
+    assert!(!verification.contains(".ps1"), "{verification}");
+}
+
+#[test]
+fn shim_false_adds_an_ignore_in_the_configured_case() {
+    // Why: Chocolatey skips shimming an exe only when <exe>.ignore sits next
+    // to it, so the name must match the dest exactly.
+    let dir = tmp("payload-shim");
+    let spec = base_spec(Style::Embedded {
+        files: vec![
+            payload_file(&dir, "hello.exe", true),
+            payload_file(&dir, "bin/Helper.exe", false),
+        ],
+        scripts: None,
+    });
+    let out = tmp("shim.nupkg");
+    build(&spec, &out).unwrap();
+
+    let entries = read_entries(&out);
+    assert_eq!(
+        entry_names(&entries),
+        vec![
+            "[Content_Types].xml",
+            "_rels/.rels",
+            "hello.nuspec",
+            PSMDCP,
+            "tools/LICENSE.txt",
+            "tools/VERIFICATION.txt",
+            "tools/bin/Helper.exe",
+            "tools/bin/Helper.exe.ignore",
+            "tools/hello.exe",
+        ]
+    );
+    assert!(entries["tools/bin/Helper.exe.ignore"].is_empty());
+}
+
+#[test]
+fn plain_package_has_plain_scripts_and_a_guard() {
+    let dir = tmp("payload-plain");
+    let mut spec = base_spec(Style::Plain {
+        // shim = false is rejected by config validation for plain; here it
+        // proves a plain package never emits .ignore.
+        files: vec![payload_file(&dir, "hello.exe", false)],
+        scripts: supplied_scripts(&dir),
+    });
+    spec.display_name = "O'Hello Ünï".to_string();
+    let out = tmp("plain.nupkg");
+    build(&spec, &out).unwrap();
+
+    let entries = read_entries(&out);
+    assert_eq!(
+        entry_names(&entries),
+        vec![
+            "[Content_Types].xml",
+            "_rels/.rels",
+            "hello.nuspec",
+            PSMDCP,
+            "tools/LICENSE.txt",
+            "tools/VERIFICATION.txt",
+            "tools/before-modify.ps1",
+            "tools/chocolateyInstall.ps1",
+            "tools/hello.exe",
+            "tools/install.ps1",
+            "tools/uninstall.ps1",
+        ]
+    );
+    assert_eq!(entries["tools/install.ps1"], b"# setup.ps1\n");
+    assert_eq!(entries["tools/uninstall.ps1"], b"# remove.ps1\n");
+    assert_eq!(entries["tools/before-modify.ps1"], b"# pre.ps1\n");
+    // The guard only throws, with the display name as a quoted literal. The
+    // BOM keeps a non-ASCII name intact under Windows PowerShell 5.1.
+    assert_eq!(
+        String::from_utf8(entries["tools/chocolateyInstall.ps1"].clone()).unwrap(),
+        "\u{feff}throw 'O''Hello Ünï is not a Chocolatey package'\n"
+    );
+}
+
+#[test]
+fn choco_script_dest_without_scripts_is_a_plain_payload_file() {
+    // R7: configs that predate `scripts` may already ship this dest.
+    let dir = tmp("payload-legacy-script");
+    let spec = base_spec(Style::Embedded {
+        files: vec![
+            payload_file(&dir, "hello.exe", true),
+            payload_file(&dir, "chocolateyInstall.ps1", true),
+        ],
+        scripts: None,
+    });
+    let out = tmp("legacy-script.nupkg");
+    build(&spec, &out).unwrap();
+    assert_eq!(
+        read_entries(&out)["tools/chocolateyInstall.ps1"],
+        PAYLOAD_EXE
+    );
+}
+
+#[test]
+fn script_and_ignore_collisions_are_rejected() {
+    let dir = tmp("payload-collide");
+    let scripts = supplied_scripts(&dir);
+    let check = |style: Style| validate(&base_spec(style)).unwrap_err();
+
+    // Either set, any case, once scripts are present or the style is plain.
+    for dest in ["CHOCOLATEYINSTALL.PS1", "before-modify.ps1"] {
+        let err = check(Style::Embedded {
+            files: vec![payload_file(&dir, dest, true)],
+            scripts: Some(scripts.clone()),
+        });
+        assert!(
+            matches!(err, embala_nupkg::Error::ScriptDest(_)),
+            "{dest}: {err}"
+        );
+        let err = check(Style::Plain {
+            files: vec![payload_file(&dir, dest, true)],
+            scripts: scripts.clone(),
+        });
+        assert!(
+            matches!(err, embala_nupkg::Error::ScriptDest(_)),
+            "{dest}: {err}"
+        );
+    }
+
+    let err = check(Style::Embedded {
+        files: vec![
+            payload_file(&dir, "Hello.exe", false),
+            payload_file(&dir, "HELLO.EXE.ignore", true),
+        ],
+        scripts: None,
+    });
+    assert!(
+        matches!(err, embala_nupkg::Error::IgnoreDest(ref d, ref f)
+            if d == "HELLO.EXE.ignore" && f == "Hello.exe"),
+        "{err}"
+    );
+    // With generated scripts every .exe gets an .ignore, shim key or not.
+    let err = check(Style::Embedded {
+        files: vec![
+            payload_file(&dir, "hello.exe", true),
+            payload_file(&dir, "hello.exe.ignore", true),
+        ],
+        scripts: Some(Scripts::Generate),
+    });
+    assert!(matches!(err, embala_nupkg::Error::IgnoreDest(..)), "{err}");
+}
+
+#[test]
+fn generated_scripts_need_a_valid_directory_display_name() {
+    // Why: the generated install creates "<display-name> (nupkg)" under
+    // Program Files, so the name must be a legal Windows directory name.
+    let dir = tmp("payload-display-name");
+    let generate = || Style::Embedded {
+        files: vec![payload_file(&dir, "hello.exe", true)],
+        scripts: Some(Scripts::Generate),
+    };
+    for bad in ["", "Hello: World", "a/b", "tab\there", "Hello.", "Hello "] {
+        let mut spec = base_spec(generate());
+        spec.display_name = bad.to_string();
+        let err = validate(&spec).unwrap_err();
+        assert!(
+            matches!(err, embala_nupkg::Error::InvalidDisplayName(_)),
+            "{bad:?}: {err}"
+        );
+        // Supplied scripts never use the name as a directory.
+        spec.style = Style::Embedded {
+            files: vec![payload_file(&dir, "hello.exe", true)],
+            scripts: Some(supplied_scripts(&dir)),
+        };
+        validate(&spec).unwrap_or_else(|e| panic!("{bad:?}: {e}"));
+    }
+    validate(&base_spec(generate())).expect("a normal display name passes");
+    // Generation itself lands in a later phase.
+    let err = build(&base_spec(generate()), &tmp("generate.nupkg")).unwrap_err();
+    assert!(
+        matches!(err, embala_nupkg::Error::GenerateUnsupported),
         "{err}"
     );
 }

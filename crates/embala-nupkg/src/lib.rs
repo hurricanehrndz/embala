@@ -5,9 +5,10 @@
 //! choco, NuGet, or .NET. Builds are byte-stable: fixed entry order, pinned
 //! zip timestamps, and deterministic part names.
 //!
-//! Scope for v1: plain executables put on PATH via Chocolatey's automatic
-//! `tools/*.exe` shimming — either embedded in the package or downloaded at
-//! install time. Nothing else.
+//! Payloads are plain executables, either embedded in the package or
+//! downloaded at install time. By default Chocolatey's automatic `tools/*.exe`
+//! shimming puts them on PATH; an embedded or plain package can instead carry
+//! its own install scripts.
 
 use std::collections::BTreeSet;
 use std::io::{Cursor, Write as _};
@@ -41,14 +42,52 @@ const DC_XMLNS: &str = "http://purl.org/dc/elements/1.1/";
 pub struct FileSpec {
     pub src: PathBuf,
     pub dest: String,
+    /// false: an embedded package adds an empty `tools/<dest>.ignore`, which
+    /// stops Chocolatey from shimming the file. Plain packages ignore it.
+    pub shim: bool,
 }
+
+/// The install scripts an embedded or plain package carries.
+#[derive(Debug, Clone)]
+pub enum Scripts {
+    /// embala writes the install and uninstall scripts. Not built yet:
+    /// [`build`] returns [`Error::GenerateUnsupported`].
+    Generate,
+    /// The user's own scripts (paths already resolved by the caller), packed
+    /// byte-for-byte under the style's script names.
+    Supplied {
+        install: PathBuf,
+        uninstall: Option<PathBuf>,
+        before_modify: Option<PathBuf>,
+    },
+}
+
+/// In-package names for install, uninstall and before-modify: Chocolatey's
+/// for embedded packages, the plain set for plain ones.
+const CHOCO_SCRIPTS: [&str; 3] = [
+    "chocolateyInstall.ps1",
+    "chocolateyUninstall.ps1",
+    "chocolateyBeforeModify.ps1",
+];
+const PLAIN_SCRIPTS: [&str; 3] = ["install.ps1", "uninstall.ps1", "before-modify.ps1"];
 
 /// How the payload reaches the machine.
 #[derive(Debug, Clone)]
 pub enum Style {
-    /// Payload files ship inside the package under `tools/`; Chocolatey
-    /// shims every `tools/*.exe` onto PATH with no install script.
-    Embedded { files: Vec<FileSpec> },
+    /// Payload files ship inside the package under `tools/`. Chocolatey runs
+    /// the scripts, if any, then shims every `tools/*.exe` that has no
+    /// `.ignore` onto PATH.
+    Embedded {
+        files: Vec<FileSpec>,
+        scripts: Option<Scripts>,
+    },
+    /// Not a Chocolatey package: the embedded payload, scripts under the
+    /// plain names, and a guard `chocolateyInstall.ps1` that only throws, so
+    /// `choco install` fails instead of half-installing.
+    Plain {
+        files: Vec<FileSpec>,
+        scripts: Scripts,
+    },
     /// The package carries only a `chocolateyinstall.ps1` that downloads the
     /// payload into `tools/` (checksum-verified) at install time.
     Download {
@@ -112,6 +151,21 @@ pub enum Error {
     DuplicateDest(String),
     #[error("nupkg dest {0:?} collides with a generated tools/ file")]
     ReservedDest(String),
+    #[error(
+        "nupkg: dest {0:?} collides with an install script name (with scripts set or style \
+         \"plain\", no dest may be a Chocolatey or plain script name)"
+    )]
+    ScriptDest(String),
+    #[error("nupkg: dest {0:?} collides with the .ignore file generated for {1:?}")]
+    IgnoreDest(String, String),
+    #[error(
+        "nupkg: scripts = \"generate\" installs to \"<display-name> (nupkg)\", so \
+         package.display-name must be a valid Windows directory name: non-empty, no \
+         <>:\"/\\|?* or control characters, not ending in a space or dot (got {0:?})"
+    )]
+    InvalidDisplayName(String),
+    #[error("nupkg: scripts = \"generate\" is not supported yet")]
+    GenerateUnsupported,
     #[error("nupkg checksum must be 64 hex chars (sha256), got {0:?}")]
     InvalidChecksum(String),
     #[error("nupkg icon {0:?} must be a PNG or JPEG (magic-byte check)")]
@@ -132,34 +186,18 @@ pub fn build(spec: &NupkgSpec, out: &Path) -> Result<()> {
 
     // `tools/`-relative name -> content, assembled per style then sorted so
     // the zip entry order is deterministic.
-    let mut tools: Vec<(String, Vec<u8>)> = Vec::new();
-    match &spec.style {
-        Style::Embedded { files } => {
-            let mut listed = Vec::new();
-            for file in files {
-                let bytes = std::fs::read(&file.src)?;
-                listed.push((file.dest.clone(), sha256_hex(&bytes)));
-                tools.push((file.dest.clone(), bytes));
-            }
-            if let Some(license) = license_txt(spec) {
-                tools.push(("LICENSE.txt".to_string(), license));
-            }
-            tools.push((
-                "VERIFICATION.txt".to_string(),
-                verification_txt(spec, &listed),
-            ));
-        }
+    let mut tools: Vec<(String, Vec<u8>)> = match &spec.style {
+        Style::Embedded { files, scripts } => payload_tools(spec, files, scripts.as_ref(), false)?,
+        Style::Plain { files, scripts } => payload_tools(spec, files, Some(scripts), true)?,
         Style::Download {
             url,
             checksum,
             dest,
-        } => {
-            tools.push((
-                "chocolateyinstall.ps1".to_string(),
-                install_ps1(&spec.name, url, checksum, dest),
-            ));
-        }
-    }
+        } => vec![(
+            "chocolateyinstall.ps1".to_string(),
+            install_ps1(&spec.name, url, checksum, dest),
+        )],
+    };
     tools.sort_by(|a, b| a.0.cmp(&b.0));
 
     // Icon: read bytes, sniff PNG/JPEG magic for the in-zip entry name, and
@@ -251,26 +289,86 @@ pub fn build(spec: &NupkgSpec, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate(spec: &NupkgSpec) -> Result<()> {
-    match &spec.style {
-        Style::Embedded { files } => {
-            if files.is_empty() {
-                return Err(Error::NoFiles);
-            }
-            let mut seen = BTreeSet::new();
-            for file in files {
-                validate_dest(&file.dest)?;
-                // Windows extraction is case-insensitive; block collisions
-                // with the files we generate alongside the payload.
-                let lowered = file.dest.to_ascii_lowercase();
-                if lowered == "license.txt" || lowered == "verification.txt" {
-                    return Err(Error::ReservedDest(file.dest.clone()));
-                }
-                if !seen.insert(lowered) {
-                    return Err(Error::DuplicateDest(file.dest.clone()));
+/// The `tools/` entries of an embedded or plain package: the payload, the
+/// scripts under the style's names, a plain package's guard, the `.ignore`
+/// files, and the generated `LICENSE.txt` and `VERIFICATION.txt`.
+fn payload_tools(
+    spec: &NupkgSpec,
+    files: &[FileSpec],
+    scripts: Option<&Scripts>,
+    plain: bool,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut tools = Vec::new();
+    let mut listed = Vec::new();
+    for file in files {
+        let bytes = std::fs::read(&file.src)?;
+        listed.push((file.dest.clone(), sha256_hex(&bytes)));
+        tools.push((file.dest.clone(), bytes));
+    }
+    match scripts {
+        None => {}
+        Some(Scripts::Generate) => return Err(Error::GenerateUnsupported),
+        Some(Scripts::Supplied {
+            install,
+            uninstall,
+            before_modify,
+        }) => {
+            let names = if plain { PLAIN_SCRIPTS } else { CHOCO_SCRIPTS };
+            for (name, src) in
+                names
+                    .into_iter()
+                    .zip([Some(install), uninstall.as_ref(), before_modify.as_ref()])
+            {
+                if let Some(src) = src {
+                    tools.push((name.to_string(), std::fs::read(src)?));
                 }
             }
         }
+    }
+    if plain {
+        tools.push((CHOCO_SCRIPTS[0].to_string(), guard_ps1(&spec.display_name)));
+    }
+    for dest in ignored(&spec.style) {
+        tools.push((format!("{dest}.ignore"), Vec::new()));
+    }
+    if let Some(license) = license_txt(spec) {
+        tools.push(("LICENSE.txt".to_string(), license));
+    }
+    tools.push((
+        "VERIFICATION.txt".to_string(),
+        verification_txt(spec, &listed),
+    ));
+    Ok(tools)
+}
+
+/// Payload dests that get an empty `tools/<dest>.ignore`, the only way to
+/// stop Chocolatey's shim. In an embedded package: every `shim = false` file,
+/// plus every `.exe` when the scripts are generated (they put the install
+/// directory on PATH themselves). One entry per file, so each `.ignore` is
+/// emitted once. None in a plain package: its guard fails a choco install
+/// before shimming.
+fn ignored(style: &Style) -> Vec<&str> {
+    let Style::Embedded { files, scripts } = style else {
+        return Vec::new();
+    };
+    let generate = matches!(scripts, Some(Scripts::Generate));
+    files
+        .iter()
+        .filter(|f| !f.shim || (generate && f.dest.to_ascii_lowercase().ends_with(".exe")))
+        .map(|f| f.dest.as_str())
+        .collect()
+}
+
+/// Layout rules, no filesystem access: dest shape, duplicates, collisions
+/// with generated `tools/` files, and the display name generated scripts
+/// install under. [`build`] runs it first; callers can run it early to fail
+/// before building anything.
+pub fn validate(spec: &NupkgSpec) -> Result<()> {
+    match &spec.style {
+        Style::Embedded { files, scripts } => {
+            validate_payload(spec, files, scripts.as_ref())?;
+        }
+        Style::Plain { files, scripts } => validate_payload(spec, files, Some(scripts))?,
         Style::Download { checksum, dest, .. } => {
             validate_dest(dest)?;
             if checksum.len() != 64 || !checksum.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -279,6 +377,55 @@ fn validate(spec: &NupkgSpec) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `scripts` is always set for a plain package.
+fn validate_payload(spec: &NupkgSpec, files: &[FileSpec], scripts: Option<&Scripts>) -> Result<()> {
+    if files.is_empty() {
+        return Err(Error::NoFiles);
+    }
+    let mut seen = BTreeSet::new();
+    for file in files {
+        validate_dest(&file.dest)?;
+        // Windows extraction is case-insensitive; block collisions
+        // with the files we generate alongside the payload.
+        let lowered = file.dest.to_ascii_lowercase();
+        if lowered == "license.txt" || lowered == "verification.txt" {
+            return Err(Error::ReservedDest(file.dest.clone()));
+        }
+        // One source per script: with scripts (or a plain guard) in the
+        // package, no dest may take a script name of either set.
+        if scripts.is_some()
+            && CHOCO_SCRIPTS
+                .iter()
+                .chain(&PLAIN_SCRIPTS)
+                .any(|name| name.eq_ignore_ascii_case(&file.dest))
+        {
+            return Err(Error::ScriptDest(file.dest.clone()));
+        }
+        if !seen.insert(lowered) {
+            return Err(Error::DuplicateDest(file.dest.clone()));
+        }
+    }
+    for shimless in ignored(&spec.style) {
+        let ignore = format!("{shimless}.ignore");
+        if let Some(file) = files.iter().find(|f| f.dest.eq_ignore_ascii_case(&ignore)) {
+            return Err(Error::IgnoreDest(file.dest.clone(), shimless.to_string()));
+        }
+    }
+    if matches!(scripts, Some(Scripts::Generate)) && !is_dir_name(&spec.display_name) {
+        return Err(Error::InvalidDisplayName(spec.display_name.clone()));
+    }
+    Ok(())
+}
+
+/// Whether `name` is a valid Windows directory name.
+fn is_dir_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name
+            .chars()
+            .any(|c| c.is_control() || "<>:\"/\\|?*".contains(c))
+        && !name.ends_with([' ', '.'])
 }
 
 fn validate_dest(dest: &str) -> Result<()> {
@@ -345,6 +492,17 @@ fn verification_txt(spec: &NupkgSpec, files: &[(String, String)]) -> Vec<u8> {
 fn ps_quote(value: &str) -> String {
     // PowerShell single-quoted literal: only ' needs escaping (doubled).
     format!("'{}'", value.replace('\'', "''"))
+}
+
+/// A plain package's `chocolateyInstall.ps1`: fails `choco install` before
+/// Chocolatey shims anything. UTF-8 with a byte-order mark, so Windows
+/// PowerShell 5.1 decodes a non-ASCII display name.
+fn guard_ps1(display_name: &str) -> Vec<u8> {
+    format!(
+        "\u{feff}throw {}\n",
+        ps_quote(&format!("{display_name} is not a Chocolatey package"))
+    )
+    .into_bytes()
 }
 
 fn install_ps1(name: &str, url: &str, checksum: &str, dest: &str) -> Vec<u8> {
@@ -518,4 +676,33 @@ fn psmdcp_xml(spec: &NupkgSpec) -> XmlResult {
             Ok::<(), std::io::Error>(())
         })?;
     Ok(finish(writer))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_ignore_is_emitted_once() {
+        // A shim = false exe with generated scripts matches both .ignore
+        // rules, but a zip cannot hold the same entry twice.
+        let file = |dest: &str, shim| FileSpec {
+            src: PathBuf::new(),
+            dest: dest.to_string(),
+            shim,
+        };
+        let style = Style::Embedded {
+            files: vec![
+                file("hello.exe", false),
+                file("bin/Tool.EXE", true),
+                file("readme.txt", true),
+                file("notes.txt", false),
+            ],
+            scripts: Some(Scripts::Generate),
+        };
+        assert_eq!(
+            ignored(&style),
+            vec!["hello.exe", "bin/Tool.EXE", "notes.txt"]
+        );
+    }
 }

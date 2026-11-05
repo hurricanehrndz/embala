@@ -410,6 +410,96 @@ impl PkgSection {
 pub enum NupkgStyle {
     Embedded,
     Download,
+    /// Not a Chocolatey package: scripts under plain names and a guard that
+    /// fails `choco install`.
+    Plain,
+}
+
+/// A `[nupkg]` payload file: a [`FileEntry`] plus Chocolatey's shim switch.
+/// Its own type so `shim` fails to parse in `[msi]` and `[setup]`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NupkgFileEntry {
+    pub src: PathBuf,
+    pub dest: String,
+    /// `false` packs an empty `<dest>.ignore` so Chocolatey does not shim the
+    /// file. Absent means `true`; kept an `Option` so validation can reject
+    /// any `shim` key with style "download".
+    pub shim: Option<bool>,
+    /// Drop the entry from the build when `src` is not found.
+    #[serde(default)]
+    pub optional: bool,
+}
+
+impl Payload for NupkgFileEntry {
+    fn src(&self) -> &Path {
+        &self.src
+    }
+    fn dest(&self) -> &str {
+        &self.dest
+    }
+    fn optional(&self) -> bool {
+        self.optional
+    }
+}
+
+/// `[nupkg].scripts`: the string `"generate"` or a table of the user's own
+/// scripts.
+#[derive(Debug)]
+pub enum NupkgScripts {
+    Generate,
+    Supplied(NupkgScriptsTable),
+}
+
+/// Script paths, relative to the config file's directory.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct NupkgScriptsTable {
+    /// Required. An `Option` so a missing `install` is a `nupkg:` validation
+    /// error rather than a bare parse error.
+    pub install: Option<PathBuf>,
+    pub uninstall: Option<PathBuf>,
+    pub before_modify: Option<PathBuf>,
+}
+
+/// By hand rather than `#[serde(untagged)]`, so a wrong value's error names
+/// both accepted forms.
+impl<'de> Deserialize<'de> for NupkgScripts {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = NupkgScripts;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "\"generate\" or a table { install = \"<path>\", uninstall = \"<path>\", \
+                     before-modify = \"<path>\" }",
+                )
+            }
+
+            fn visit_str<E: serde::de::Error>(
+                self,
+                v: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                if v == "generate" {
+                    Ok(NupkgScripts::Generate)
+                } else {
+                    Err(E::invalid_value(serde::de::Unexpected::Str(v), &self))
+                }
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                NupkgScriptsTable::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(NupkgScripts::Supplied)
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -417,7 +507,8 @@ pub enum NupkgStyle {
 pub struct NupkgSection {
     pub style: NupkgStyle,
     #[serde(default)]
-    pub files: Vec<FileEntry>,
+    pub files: Vec<NupkgFileEntry>,
+    pub scripts: Option<NupkgScripts>,
     pub url: Option<String>,
     pub checksum: Option<String>,
     pub project_source_url: Option<String>,
@@ -432,6 +523,97 @@ impl NupkgSection {
     /// validation rejects `optional` there, so it has nothing to drop.
     pub fn drop_absent_optional(&mut self, base: &Path) -> Result<()> {
         drop_absent("nupkg", &mut self.files, base).map(drop)
+    }
+
+    /// The warning `embala build` prints before building this section, if
+    /// any. A supplied install without an uninstall is allowed, but nothing
+    /// generates the missing uninstall: embala cannot know what the install
+    /// did.
+    pub fn warning(&self) -> Option<&'static str> {
+        match &self.scripts {
+            Some(NupkgScripts::Supplied(table)) if table.uninstall.is_none() => Some(
+                "nupkg: warning: scripts has no uninstall, so the package has no uninstall script",
+            ),
+            _ => None,
+        }
+    }
+
+    /// The `embala-nupkg` spec for this section, with `src` and script paths
+    /// resolved against `base` (the config file's directory). Expects a
+    /// validated config.
+    pub fn spec(&self, package: &Package, base: &Path) -> Result<embala_nupkg::NupkgSpec> {
+        let files = || {
+            self.files
+                .iter()
+                .map(|f| embala_nupkg::FileSpec {
+                    src: base.join(&f.src),
+                    dest: f.dest.clone(),
+                    shim: f.shim.unwrap_or(true),
+                })
+                .collect()
+        };
+        let scripts = self.scripts.as_ref().map(|scripts| match scripts {
+            NupkgScripts::Generate => embala_nupkg::Scripts::Generate,
+            NupkgScripts::Supplied(table) => embala_nupkg::Scripts::Supplied {
+                install: base.join(
+                    table
+                        .install
+                        .as_ref()
+                        .expect("config validation requires install"),
+                ),
+                uninstall: table.uninstall.as_ref().map(|p| base.join(p)),
+                before_modify: table.before_modify.as_ref().map(|p| base.join(p)),
+            },
+        });
+        let style = match self.style {
+            NupkgStyle::Embedded => embala_nupkg::Style::Embedded {
+                files: files(),
+                scripts,
+            },
+            NupkgStyle::Plain => embala_nupkg::Style::Plain {
+                files: files(),
+                scripts: scripts.expect("config validation requires scripts with style plain"),
+            },
+            NupkgStyle::Download => {
+                // For download style the files list names the downloaded
+                // payload's dest; one URL downloads one file.
+                let [file] = self.files.as_slice() else {
+                    bail!(
+                        "nupkg: style \"download\" needs exactly one files entry (its dest \
+                         names the downloaded payload), got {}",
+                        self.files.len()
+                    );
+                };
+                embala_nupkg::Style::Download {
+                    url: self.url.clone().expect("config validation requires url"),
+                    checksum: self
+                        .checksum
+                        .clone()
+                        .expect("config validation requires checksum"),
+                    dest: file.dest.clone(),
+                }
+            }
+        };
+        Ok(embala_nupkg::NupkgSpec {
+            name: package.name.clone(),
+            display_name: package.display_name.clone(),
+            version: package.version.clone(),
+            identifier: package.identifier.clone(),
+            publisher: package.publisher.clone(),
+            description: package.description.clone(),
+            homepage: package.homepage.clone(),
+            license: package.license.clone(),
+            copyright: package.copyright.clone(),
+            tags: package.tags.clone().unwrap_or_default(),
+            release_notes: self.release_notes.clone(),
+            require_license_acceptance: package.require_license_acceptance,
+            project_source_url: self.project_source_url.clone(),
+            package_source_url: self.package_source_url.clone(),
+            license_url: self.license_url.clone(),
+            icon: package.icon.as_ref().map(|p| base.join(p)),
+            icon_url: self.icon_url.clone(),
+            style,
+        })
     }
 }
 
@@ -658,10 +840,40 @@ impl Config {
                 NupkgStyle::Download if nupkg.url.is_none() || nupkg.checksum.is_none() => {
                     bail!("nupkg: style \"download\" requires both url and checksum");
                 }
-                NupkgStyle::Embedded if nupkg.url.is_some() || nupkg.checksum.is_some() => {
+                NupkgStyle::Embedded | NupkgStyle::Plain
+                    if nupkg.url.is_some() || nupkg.checksum.is_some() =>
+                {
                     bail!("nupkg: url/checksum are only valid with style \"download\"");
                 }
+                NupkgStyle::Download
+                    if nupkg.scripts.is_some() || nupkg.files.iter().any(|f| f.shim.is_some()) =>
+                {
+                    bail!(
+                        "nupkg: scripts and shim are not valid with style \"download\" \
+                         (it writes its own install script)"
+                    );
+                }
+                NupkgStyle::Plain if nupkg.scripts.is_none() => {
+                    bail!(
+                        "nupkg: style \"plain\" requires scripts (\"generate\" or a table with \
+                         install): without them the package installs nothing"
+                    );
+                }
+                NupkgStyle::Plain if nupkg.files.iter().any(|f| f.shim == Some(false)) => {
+                    bail!(
+                        "nupkg: shim = false has no effect with style \"plain\" (its guard \
+                         fails a Chocolatey install before anything is shimmed)"
+                    );
+                }
                 _ => {}
+            }
+            if let Some(NupkgScripts::Supplied(table)) = &nupkg.scripts {
+                if table.install.is_none() {
+                    bail!(
+                        "nupkg: a scripts table requires install (uninstall and \
+                         before-modify alone would never run at install)"
+                    );
+                }
             }
             if nupkg.style == NupkgStyle::Download && nupkg.files.iter().any(|f| f.optional) {
                 bail!("nupkg: optional has no effect with style \"download\" (src is never read)");
@@ -671,6 +883,15 @@ impl Config {
                     "package.require-license-acceptance = true requires nupkg.license-url \
                      (Chocolatey rejects the package otherwise)"
                 );
+            }
+            // Layout rules (dests, script-name and .ignore collisions, the
+            // display name generated scripts install under) belong to
+            // embala-nupkg; run them now so a bad [nupkg] fails before any
+            // format builds. No filesystem access.
+            embala_nupkg::validate(&nupkg.spec(p, Path::new(""))?)?;
+            // Last, so the layout rules above already apply to it.
+            if matches!(nupkg.scripts, Some(NupkgScripts::Generate)) {
+                bail!("nupkg: scripts = \"generate\" is not supported yet");
             }
         }
         if let Some(setup) = &self.setup {
@@ -1564,5 +1785,185 @@ files = [{ src = "absent.exe", dest = "hello.exe", optional = true }, { src = "d
             trimmed(r"\\?\UNC\server\share\link\"),
             r"\\?\UNC\server\share\link"
         );
+    }
+
+    /// The fixture with its `[nupkg]` section replaced by `block`.
+    fn with_nupkg(block: &str) -> String {
+        let base = fixture_toml();
+        let start = base.find("\n[nupkg]").unwrap();
+        let end = base.find("\n[setup]").unwrap();
+        format!("{}\n{block}\n{}", &base[..start], &base[end..])
+    }
+
+    fn nupkg_err(block: &str) -> String {
+        format!("{:#}", parse(&with_nupkg(block)).unwrap_err())
+    }
+
+    const HELLO: &str = r#"{ src = "dist/hello.exe", dest = "hello.exe" }"#;
+
+    #[test]
+    fn nupkg_scripts_and_shim_parse_and_resolve() {
+        let config = parse(&with_nupkg(
+            r#"[nupkg]
+style = "embedded"
+scripts = { install = "scripts/setup.ps1", uninstall = "scripts/remove.ps1", before-modify = "scripts/pre.ps1" }
+files = [{ src = "dist/hello.exe", dest = "hello.exe", shim = false }]"#,
+        ))
+        .unwrap();
+        let nupkg = config.nupkg.as_ref().unwrap();
+        assert!(nupkg.warning().is_none());
+        let spec = nupkg.spec(&config.package, Path::new("cfg")).unwrap();
+        let embala_nupkg::Style::Embedded { files, scripts } = spec.style else {
+            panic!("embedded style expected");
+        };
+        assert!(!files[0].shim);
+        let Some(embala_nupkg::Scripts::Supplied {
+            install,
+            uninstall,
+            before_modify,
+        }) = scripts
+        else {
+            panic!("supplied scripts expected");
+        };
+        // Relative to the config directory, like files[].src.
+        assert_eq!(install, Path::new("cfg/scripts/setup.ps1"));
+        assert_eq!(
+            uninstall.as_deref(),
+            Some(Path::new("cfg/scripts/remove.ps1"))
+        );
+        assert_eq!(
+            before_modify.as_deref(),
+            Some(Path::new("cfg/scripts/pre.ps1"))
+        );
+    }
+
+    #[test]
+    fn nupkg_scripts_value_error_names_both_forms() {
+        for value in [r#""gen""#, "true"] {
+            let err = nupkg_err(&format!(
+                "[nupkg]\nstyle = \"embedded\"\nscripts = {value}\nfiles = [{HELLO}]"
+            ));
+            assert!(
+                err.contains(r#""generate" or a table { install = "#),
+                "{value}: {err}"
+            );
+        }
+        let err = nupkg_err(&format!(
+            "[nupkg]\nstyle = \"embedded\"\nscripts = {{ install = \"a.ps1\", postinstall = \"b.ps1\" }}\nfiles = [{HELLO}]"
+        ));
+        assert!(err.contains("unknown field `postinstall`"), "{err}");
+    }
+
+    #[test]
+    fn nupkg_rejects_new_keys_where_they_cannot_work() {
+        let download = "style = \"download\"\nurl = \"http://example.com/hello.exe\"\n\
+                        checksum = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"";
+        let cases = [
+            // Download writes its own install script.
+            (
+                format!("{download}\nscripts = {{ install = \"a.ps1\" }}\nfiles = [{HELLO}]"),
+                "nupkg: scripts and shim are not valid with style \"download\"",
+            ),
+            (
+                format!(
+                    "{download}\nfiles = [{{ src = \"dist/hello.exe\", dest = \"hello.exe\", shim = true }}]"
+                ),
+                "nupkg: scripts and shim are not valid with style \"download\"",
+            ),
+            (
+                format!("style = \"plain\"\nfiles = [{HELLO}]"),
+                "nupkg: style \"plain\" requires scripts",
+            ),
+            (
+                "style = \"plain\"\nscripts = { install = \"a.ps1\" }\n\
+                 files = [{ src = \"dist/hello.exe\", dest = \"hello.exe\", shim = false }]"
+                    .to_string(),
+                "nupkg: shim = false has no effect with style \"plain\"",
+            ),
+            (
+                format!(
+                    "style = \"plain\"\nscripts = {{ install = \"a.ps1\" }}\nurl = \"http://x\"\nfiles = [{HELLO}]"
+                ),
+                "nupkg: url/checksum are only valid with style \"download\"",
+            ),
+            (
+                format!(
+                    "style = \"embedded\"\nscripts = {{ uninstall = \"a.ps1\" }}\nfiles = [{HELLO}]"
+                ),
+                "nupkg: a scripts table requires install",
+            ),
+            // One source per script, either name set, any case.
+            (
+                "style = \"embedded\"\nscripts = { install = \"a.ps1\" }\n\
+                 files = [{ src = \"dist/hello.exe\", dest = \"Install.ps1\" }]"
+                    .to_string(),
+                "nupkg: dest \"Install.ps1\" collides with an install script name",
+            ),
+            (
+                "style = \"plain\"\nscripts = { install = \"a.ps1\" }\n\
+                 files = [{ src = \"dist/hello.exe\", dest = \"chocolateyinstall.ps1\" }]"
+                    .to_string(),
+                "nupkg: dest \"chocolateyinstall.ps1\" collides with an install script name",
+            ),
+            (
+                "style = \"embedded\"\nfiles = [\n\
+                 { src = \"dist/hello.exe\", dest = \"hello.exe\", shim = false },\n\
+                 { src = \"dist/hello.exe\", dest = \"Hello.exe.ignore\" },\n]"
+                    .to_string(),
+                "nupkg: dest \"Hello.exe.ignore\" collides with the .ignore file generated for \"hello.exe\"",
+            ),
+        ];
+        for (keys, expected) in cases {
+            let err = nupkg_err(&format!("[nupkg]\n{keys}"));
+            assert!(err.contains(expected), "{keys}\n=> {err}");
+        }
+    }
+
+    #[test]
+    fn nupkg_generate_checks_the_display_name_then_is_rejected() {
+        // Generation lands in a later phase; its layout rules already apply.
+        let generate =
+            format!("[nupkg]\nstyle = \"embedded\"\nscripts = \"generate\"\nfiles = [{HELLO}]");
+        let text = with_nupkg(&generate).replace(
+            "display-name = \"Embala Hello\"",
+            "display-name = \"Hello: World\"",
+        );
+        let err = format!("{:#}", parse(&text).unwrap_err());
+        assert!(
+            err.contains("package.display-name must be a valid Windows directory name"),
+            "{err}"
+        );
+        let err = nupkg_err(&generate);
+        assert!(
+            err.contains("nupkg: scripts = \"generate\" is not supported yet"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn nupkg_install_without_uninstall_warns() {
+        // Decision: embala cannot generate an uninstall for a script it did
+        // not write, so it builds and says so.
+        let config = parse(&with_nupkg(&format!(
+            "[nupkg]\nstyle = \"plain\"\nscripts = {{ install = \"a.ps1\" }}\nfiles = [{HELLO}]"
+        )))
+        .unwrap();
+        let warning = config.nupkg.unwrap().warning().expect("a warning");
+        assert!(warning.starts_with("nupkg: warning:"), "{warning}");
+        assert!(warning.contains("no uninstall script"), "{warning}");
+    }
+
+    #[test]
+    fn shim_is_a_nupkg_only_key() {
+        let shimmed = r#"{ src = "dist/hello.exe", dest = "hello.exe", shim = false }"#;
+        let msi = fixture_toml().replacen(HELLO, shimmed, 1);
+        assert!(msi.contains("[msi]") && msi.find(shimmed) < msi.find("[app]"));
+        let err = format!("{:#}", parse(&msi).unwrap_err());
+        assert!(err.contains("unknown field `shim`"), "{err}");
+        let setup = with_setup(&format!(
+            "\n[setup]\narch = \"x86_64\"\nfiles = [{shimmed}]\n"
+        ));
+        let err = format!("{:#}", parse(&setup).unwrap_err());
+        assert!(err.contains("unknown field `shim`"), "{err}");
     }
 }
