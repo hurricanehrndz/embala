@@ -33,6 +33,13 @@ fixtures:
     done
     zig cc -target aarch64-macos -DVERSION='"0.1.0"' -o fixtures/hello/dist/hello-mac fixtures/hello/hello.c
 
+# Windows end-to-end run of the nupkg writer's scripts on a windows-test-rig
+# VM (default win11-test; RIG and RIG_E2E_VM override): real Chocolatey plus a
+# script-only run as SYSTEM. Resets the VM, installs Chocolatey from
+# community.chocolatey.org, and resets and shuts the VM down afterwards.
+nupkg-e2e:
+    fixtures/nupkg-e2e/run.sh
+
 # Cross-compile the setup.exe runtime stub for both Windows arches via zig and
 # stage the committed artifacts embala-setup include_bytes!-embeds. Dev-shell
 # only (needs zig + cargo-zigbuild) — `embala build` never compiles.

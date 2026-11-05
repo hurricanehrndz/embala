@@ -57,8 +57,12 @@ The core knows nothing about any build system: input is files + metadata, never 
 compilation step.
 
 Every format is verified against its real target, not just unit-tested:
-the `.msi` installs via `msiexec` and the `.nupkg` via `choco install` on
-Windows 11, the `.app` launches via `open` and the `.pkg` installs via
+the `.msi` installs via `msiexec` on Windows 11, and `just nupkg-e2e` runs
+the `.nupkg` on Windows 11: `choco install`, upgrade, a locked upgrade and
+uninstall, a `display-name` rename and uninstall of a `scripts = "generate"`
+package, the same scripts run as SYSTEM without Chocolatey, an embedded
+package still shimmed, and a plain package refused by its guard. The `.app`
+launches via `open` and the `.pkg` installs via
 `installer` on macOS 26. The pkg/BOM/cpio and MSI writers are additionally
 differential-tested against Apple's `pkgbuild`/`productbuild`/`mkbom` and
 against msitools respectively.
@@ -107,6 +111,88 @@ registry = [
 
 All values share one component with a GUID derived from the identifier, so
 they live and die with the product: uninstall removes each value.
+
+## nupkg install scripts and shims
+
+By default an embedded `.nupkg` ships its files under `tools/` with no install
+script, and Chocolatey shims each exe into `C:\ProgramData\chocolatey\bin`.
+Three opt-in keys change that. A config that uses none of them builds the same
+bytes as before they existed.
+
+```toml
+# Generated scripts: work under choco and under a script-only installer.
+[nupkg]
+style = "embedded"
+scripts = "generate"
+files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
+```
+
+- `scripts = "generate"` packs a generated install and uninstall script
+  (Windows PowerShell 5.1, no Chocolatey cmdlets). The install copies the
+  payload to `<ProgramFiles>\<display-name> (nupkg)`, for example
+  `C:\Program Files\Embala Hello (nupkg)`, and appends that directory to the
+  machine PATH. It records the directory under
+  `HKLM\SOFTWARE\embala\nupkg\<identifier>`, so a later version with a
+  different `display-name` removes the old directory. An upgrade replaces the
+  directory as a whole. If a file in it is in use, install and uninstall fail
+  with `<display-name> is in use; close it and retry` and change nothing. In
+  an embedded package every `.exe` also gets an `.ignore` file, so Chocolatey
+  does not shim on top of the PATH entry. `package.display-name` must be a
+  valid Windows directory name.
+- `scripts = { install = "...", uninstall = "...", before-modify = "..." }`
+  packs your own scripts, from any path relative to the config, under
+  `chocolateyInstall.ps1`, `chocolateyUninstall.ps1` and
+  `chocolateyBeforeModify.ps1`. `install` is required. Without `uninstall`
+  the build prints `nupkg: warning: scripts has no uninstall, ...`.
+- `shim = false` on a file adds `tools/<dest>.ignore`, so Chocolatey does not
+  shim that exe.
+- `style = "plain"` builds a package that is not a Chocolatey package: the
+  scripts are packed as `tools/install.ps1`, `uninstall.ps1` and
+  `before-modify.ps1`, and a guard `chocolateyInstall.ps1` makes
+  `choco install` fail with `<display-name> is not a Chocolatey package`.
+
+```toml
+# Own scripts, packed under Chocolatey's names. shim = false because the
+# script puts hello.exe on PATH itself.
+[nupkg]
+style = "embedded"
+scripts = { install = "scripts/install.ps1", uninstall = "scripts/uninstall.ps1" }
+files = [{ src = "dist/hello.exe", dest = "hello.exe", shim = false }]
+
+# Keep choco's shim for hello.exe, hide a helper exe (choco only).
+[nupkg]
+style = "embedded"
+files = [
+  { src = "dist/hello.exe",  dest = "hello.exe" },
+  { src = "dist/helper.exe", dest = "helper.exe", shim = false },
+]
+
+# Not a Chocolatey package. scripts is required; "generate" or a table.
+[nupkg]
+style = "plain"
+scripts = "generate"
+files = [{ src = "dist/hello.exe", dest = "hello.exe" }]
+```
+
+`embala build` rejects these configs before writing anything:
+
+| Config | Error starts with |
+|---|---|
+| `scripts` or `shim` with `style = "download"` | `nupkg: scripts and shim are not valid with style "download"` |
+| `style = "plain"` without `scripts` | `nupkg: style "plain" requires scripts` |
+| `shim = false` with `style = "plain"` | `nupkg: shim = false has no effect with style "plain"` |
+| a `scripts` table without `install` | `nupkg: a scripts table requires install` |
+| with `scripts` or `style = "plain"`, a dest named like any script of either set (case-insensitive) | `nupkg: dest "..." collides with an install script name` |
+| a dest equal to an `.ignore` file embala emits | `nupkg: dest "..." collides with the .ignore file generated for "..."` |
+| `shim` on a `[msi]` or `[setup]` file | a parse error: `` unknown field `shim`  `` |
+| `scripts = "generate"` with a `display-name` that is not a valid directory name | `nupkg: scripts = "generate" installs to "<display-name> (nupkg)"` |
+| `scripts = "generate"` with a dest containing `\` or `:` | `nupkg: scripts = "generate" copies dest "..." into the install directory` |
+
+Install either the `.msi` or the generated-script `.nupkg` on a machine, not
+both. They use different directories (`<display-name>` and
+`<display-name> (nupkg)`) and each removes only its own PATH entry, but with
+the MSI's `add-to-path` both directories end up on PATH and the first one
+wins, so uninstalling it silently hands the command to the other copy.
 
 ## Signing — SmartScreen & Gatekeeper
 
@@ -172,6 +258,15 @@ clone must run `just stubs` (dev shell) once before `cargo build` / `just test`.
 
 `msitools` (wixl, msiinfo) is included in the dev shell as the differential-testing
 oracle for MSI table output.
+
+`just nupkg-e2e` (dev shell) builds test nupkgs and checks them on a Windows 11
+VM driven by the windows-test-rig `rig` script, printing a `PASS` or `FAIL` line
+per check. It needs `rig` at `RIG` (default
+`~/.claude/skills/windows-test-rig/scripts/rig`), a VM config named by
+`RIG_E2E_VM` (default `win11-test`) whose `clean` snapshot has no Chocolatey,
+and guest internet: the run installs Chocolatey from community.chocolatey.org.
+It resets the VM first and resets and shuts it down at the end, and takes a
+few minutes.
 
 ## Attribution
 
