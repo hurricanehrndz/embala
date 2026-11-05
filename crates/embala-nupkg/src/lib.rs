@@ -616,8 +616,21 @@ function Test-Dir([string]$path) {
     [System.IO.Directory]::Exists($path)
 }
 
-# Renaming a directory is the lock probe: Windows refuses it while any file
-# inside is open, a running exe included.
+# The lock probe: throws if any file under the directory is open elsewhere.
+# Each file is opened exclusively and closed at once; a running exe fails
+# this even though renaming its directory would succeed. A read-only file
+# counts as in use: a read-only open cannot detect a running exe, so the probe
+# fails safe. The install clears ReadOnly on what it copies, so only a file
+# marked read-only by hand trips it.
+function Assert-DirNotInUse([string]$path) {
+    foreach ($file in [System.IO.Directory]::GetFiles($path, '*', [System.IO.SearchOption]::AllDirectories)) {
+        [System.IO.File]::Open($file, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None).Close()
+    }
+}
+
+# Every probing rename follows Assert-DirNotInUse. The rename is the atomic
+# swap and a second probe: it fails while a process's working directory is
+# inside.
 function Move-Dir([string]$from, [string]$to) {
     [System.IO.Directory]::Move($from, $to)
 }
@@ -738,12 +751,16 @@ try {
     throw $inUse
 }
 
-# Step 2: copy exactly the payload into <dir>.new.
+# Step 2: copy exactly the payload into <dir>.new, clearing ReadOnly on each
+# copy so the lock probe can open it on a later upgrade or uninstall.
 try {
     foreach ($dest in $payload) {
         $target = [System.IO.Path]::Combine($new, $dest)
         [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($target))
         [System.IO.File]::Copy([System.IO.Path]::Combine($scriptDir, $dest), $target)
+        if (([System.IO.File]::GetAttributes($target) -band [System.IO.FileAttributes]::ReadOnly) -ne 0) {
+            [System.IO.File]::SetAttributes($target, [System.IO.FileAttributes]::Normal)
+        }
     }
 } catch {
     Remove-DirOrWarn $new
@@ -752,8 +769,8 @@ try {
 
 # Step 3: a marker naming another directory <prev> means display-name changed.
 # Delete a <prev>.removing left by an interrupted run (the marker moves on
-# below, which would orphan it), then rename <prev> aside, a lock probe like
-# step 4. On failure only <dir>.new has changed: delete it.
+# below, which would orphan it), then probe <prev> and rename it aside, as
+# in step 4. On failure only <dir>.new has changed: delete it.
 $prev = Get-MarkerDir
 if ($prev -and (Test-SamePath $prev $dir)) { $prev = $null }
 $prevRemoving = $null
@@ -761,6 +778,7 @@ if ($prev) {
     try {
         Remove-Dir ($prev + '.removing')
         if (Test-Dir $prev) {
+            Assert-DirNotInUse $prev
             Move-Dir $prev ($prev + '.removing')
             $prevRemoving = $prev + '.removing'
         }
@@ -770,11 +788,12 @@ if ($prev) {
     }
 }
 
-# Step 4: rename <dir> aside, the lock probe for the installed version. On
-# failure undo step 3 and delete <dir>.new.
+# Step 4: probe the installed version and rename <dir> aside. On failure
+# undo step 3 and delete <dir>.new.
 $movedOld = $false
 if (Test-Dir $dir) {
     try {
+        Assert-DirNotInUse $dir
         Move-Dir $dir $old
     } catch {
         if ($prevRemoving) { Move-Dir $prevRemoving $prev }
@@ -823,11 +842,12 @@ Remove-Dir ($target + '.new')
 Remove-Dir ($target + '.old')
 Remove-Dir $removing
 
-# Lock probe: rename the directory aside before touching PATH or the marker.
-# Nothing installed: nothing to probe.
+# Lock probe: check for open files, then rename the directory aside, before
+# touching PATH or the marker. Nothing installed: nothing to probe.
 $probed = $false
 if (Test-Dir $target) {
     try {
+        Assert-DirNotInUse $target
         Move-Dir $target $removing
     } catch {
         throw $inUse

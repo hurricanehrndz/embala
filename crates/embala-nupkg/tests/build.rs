@@ -879,6 +879,23 @@ fn assert_generated_script(name: &str, script: &str) {
     assert!(!script.contains("SetEnvironmentVariable"), "{name}");
 }
 
+/// Windows lets a directory be renamed while an exe inside it runs, so the
+/// rename alone misses a running app: the exclusive-open probe of the same
+/// directory must come right before every probing rename.
+fn assert_probe_precedes_renames(name: &str, script: &str, dirs: &[&str]) {
+    for dir in dirs {
+        let rename = format!("Move-Dir {dir} ");
+        let at = script
+            .find(&rename)
+            .unwrap_or_else(|| panic!("{name}: no rename of {dir}"));
+        let before = script[..at].trim_end();
+        assert!(
+            before.ends_with(&format!("Assert-DirNotInUse {dir}")),
+            "{name}: rename of {dir} is not preceded by its open probe"
+        );
+    }
+}
+
 #[test]
 fn embedded_generate_packs_scripts_and_hides_every_exe_from_the_shim() {
     let dir = tmp("payload-embedded-generate");
@@ -918,11 +935,22 @@ fn embedded_generate_packs_scripts_and_hides_every_exe_from_the_shim() {
     let uninstall = text(&entries, "tools/chocolateyUninstall.ps1");
     assert_generated_script("install", &install);
     assert_generated_script("uninstall", &uninstall);
+    assert_probe_precedes_renames("install", &install, &["$prev", "$dir"]);
+    assert_probe_precedes_renames("uninstall", &uninstall, &["$target"]);
     // Exactly the payload, as Windows paths: no scripts, .ignore files,
     // LICENSE.txt or VERIFICATION.txt land in the install directory.
     assert_eq!(
         payload_list(&install),
         vec!["'hello.exe'", "'bin\\Tool.EXE'", "'bin\\[data].txt'"]
+    );
+    // The lock probe reports a read-only file as in use, so every copy must
+    // drop ReadOnly or the next upgrade or uninstall refuses to run.
+    let copy = install.find("[System.IO.File]::Copy(").unwrap();
+    assert!(
+        install[copy..]
+            .find("SetAttributes($target, [System.IO.FileAttributes]::Normal)")
+            .is_some_and(|at| at < 400),
+        "install does not clear ReadOnly on its copies"
     );
     // The uninstall removes a directory; it copies nothing.
     assert!(!uninstall.contains("$payload"));
