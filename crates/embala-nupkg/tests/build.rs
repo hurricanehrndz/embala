@@ -835,10 +835,198 @@ fn generated_scripts_need_a_valid_directory_display_name() {
         validate(&spec).unwrap_or_else(|e| panic!("{bad:?}: {e}"));
     }
     validate(&base_spec(generate())).expect("a normal display name passes");
-    // Generation itself lands in a later phase.
-    let err = build(&base_spec(generate()), &tmp("generate.nupkg")).unwrap_err();
-    assert!(
-        matches!(err, embala_nupkg::Error::GenerateUnsupported),
-        "{err}"
+}
+
+/// A display name that needs `ps_quote` escaping and the BOM.
+const QUOTED_NAME: &str = "O'Hello Ünï";
+
+fn text(entries: &BTreeMap<String, Vec<u8>>, name: &str) -> String {
+    String::from_utf8(entries[name].clone()).unwrap()
+}
+
+/// The single-quoted literals of the script's `$payload = @( ... )` list.
+fn payload_list(script: &str) -> Vec<&str> {
+    let start = script.find("$payload = @(\n").expect("a payload list") + 14;
+    let end = start + script[start..].find("\n)\n").unwrap();
+    script[start..end].lines().map(str::trim).collect()
+}
+
+/// What every generated script must hold, whatever its job.
+fn assert_generated_script(name: &str, script: &str) {
+    // Windows PowerShell 5.1 reads a BOM-less file as ANSI and mangles a
+    // non-ASCII display name.
+    assert!(script.starts_with('\u{feff}'), "{name}: no BOM");
+    // A ' in the name would end the literal early and break the script.
+    assert!(script.contains("'O''Hello Ünï'"), "{name}");
+    assert!(!script.contains("O'Hello"), "{name}: unescaped name");
+    // Its own directory, never the MSI's <ProgramFiles>\<display-name>.
+    assert!(script.contains("' (nupkg)'"), "{name}");
+    // The same script must run under a script-only installer that has no
+    // Chocolatey helpers or variables.
+    let lowered = script.to_lowercase();
+    for choco in [
+        "chocolatey",
+        "install-binfile",
+        "uninstall-binfile",
+        "update-sessionenvironment",
+        "get-toolslocation",
+        "get-packageparameters",
+        "$env:choco",
+    ] {
+        assert!(!lowered.contains(choco), "{name} uses {choco}");
+    }
+    // Expands %SystemRoot% entries and writes REG_SZ.
+    assert!(!script.contains("SetEnvironmentVariable"), "{name}");
+}
+
+#[test]
+fn embedded_generate_packs_scripts_and_hides_every_exe_from_the_shim() {
+    let dir = tmp("payload-embedded-generate");
+    let mut spec = base_spec(Style::Embedded {
+        files: vec![
+            payload_file(&dir, "hello.exe", true),
+            // shim = false and .exe both ask for an .ignore: emitted once.
+            payload_file(&dir, "bin/Tool.EXE", false),
+            payload_file(&dir, "bin/[data].txt", true),
+        ],
+        scripts: Some(Scripts::Generate),
+    });
+    spec.display_name = QUOTED_NAME.to_string();
+    let out = tmp("embedded-generate.nupkg");
+    build(&spec, &out).unwrap();
+
+    let entries = read_entries(&out);
+    assert_eq!(
+        entry_names(&entries),
+        vec![
+            "[Content_Types].xml",
+            "_rels/.rels",
+            "hello.nuspec",
+            PSMDCP,
+            "tools/LICENSE.txt",
+            "tools/VERIFICATION.txt",
+            "tools/bin/Tool.EXE",
+            "tools/bin/Tool.EXE.ignore",
+            "tools/bin/[data].txt",
+            "tools/chocolateyInstall.ps1",
+            "tools/chocolateyUninstall.ps1",
+            "tools/hello.exe",
+            "tools/hello.exe.ignore",
+        ]
     );
+    let install = text(&entries, "tools/chocolateyInstall.ps1");
+    let uninstall = text(&entries, "tools/chocolateyUninstall.ps1");
+    assert_generated_script("install", &install);
+    assert_generated_script("uninstall", &uninstall);
+    // Exactly the payload, as Windows paths: no scripts, .ignore files,
+    // LICENSE.txt or VERIFICATION.txt land in the install directory.
+    assert_eq!(
+        payload_list(&install),
+        vec!["'hello.exe'", "'bin\\Tool.EXE'", "'bin\\[data].txt'"]
+    );
+    // The uninstall removes a directory; it copies nothing.
+    assert!(!uninstall.contains("$payload"));
+
+    // Reproducible, scripts included.
+    let again = tmp("embedded-generate-again.nupkg");
+    build(&spec, &again).unwrap();
+    assert_eq!(fs::read(&out).unwrap(), fs::read(&again).unwrap());
+}
+
+#[test]
+fn plain_generate_packs_plain_scripts_and_the_guard_only() {
+    let dir = tmp("payload-plain-generate");
+    let mut spec = base_spec(Style::Plain {
+        files: vec![payload_file(&dir, "hello.exe", true)],
+        scripts: Scripts::Generate,
+    });
+    spec.display_name = QUOTED_NAME.to_string();
+    let out = tmp("plain-generate.nupkg");
+    build(&spec, &out).unwrap();
+
+    let entries = read_entries(&out);
+    // No .ignore (the guard fails choco first) and no before-modify.
+    assert_eq!(
+        entry_names(&entries),
+        vec![
+            "[Content_Types].xml",
+            "_rels/.rels",
+            "hello.nuspec",
+            PSMDCP,
+            "tools/LICENSE.txt",
+            "tools/VERIFICATION.txt",
+            "tools/chocolateyInstall.ps1",
+            "tools/hello.exe",
+            "tools/install.ps1",
+            "tools/uninstall.ps1",
+        ]
+    );
+    let install = text(&entries, "tools/install.ps1");
+    assert_generated_script("install", &install);
+    assert_generated_script("uninstall", &text(&entries, "tools/uninstall.ps1"));
+    assert_eq!(payload_list(&install), vec!["'hello.exe'"]);
+    assert!(text(&entries, "tools/chocolateyInstall.ps1").contains("is not a Chocolatey package"));
+}
+
+#[test]
+fn typographic_quotes_in_the_display_name_are_doubled() {
+    // Why: PowerShell ends a single-quoted literal at ’ just as at ', so an
+    // undoubled one breaks the generated script.
+    let dir = tmp("payload-typographic");
+    let mut spec = base_spec(Style::Embedded {
+        files: vec![payload_file(&dir, "hello.exe", true)],
+        scripts: Some(Scripts::Generate),
+    });
+    spec.display_name = "Carlos’ Hello".to_string();
+    let out = tmp("typographic.nupkg");
+    build(&spec, &out).unwrap();
+
+    let entries = read_entries(&out);
+    for name in [
+        "tools/chocolateyInstall.ps1",
+        "tools/chocolateyUninstall.ps1",
+    ] {
+        let script = text(&entries, name);
+        assert!(
+            script.contains("$displayName = 'Carlos’’ Hello'\n"),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn generated_scripts_reject_dests_that_could_leave_the_install_dir() {
+    // Why: the generated install joins each dest onto the install directory
+    // with Path.Combine and runs as SYSTEM; a \ or : could escape it.
+    let dir = tmp("payload-generated-dest");
+    for bad in [
+        "..\\evil.exe",
+        "C:\\Windows\\evil.exe",
+        "C:evil.exe",
+        "bin\\x.exe",
+    ] {
+        for style in [
+            Style::Embedded {
+                files: vec![payload_file(&dir, bad, true)],
+                scripts: Some(Scripts::Generate),
+            },
+            Style::Plain {
+                files: vec![payload_file(&dir, bad, true)],
+                scripts: Scripts::Generate,
+            },
+        ] {
+            let err = validate(&base_spec(style)).unwrap_err();
+            assert!(
+                matches!(err, embala_nupkg::Error::GeneratedDest(ref d) if d == bad),
+                "{bad:?}: {err}"
+            );
+            assert!(err.to_string().starts_with("nupkg:"), "{err}");
+        }
+        // Without generate the older rules stand, so existing builds keep working.
+        validate(&base_spec(Style::Embedded {
+            files: vec![payload_file(&dir, bad, true)],
+            scripts: None,
+        }))
+        .unwrap_or_else(|e| panic!("{bad:?}: {e}"));
+    }
 }

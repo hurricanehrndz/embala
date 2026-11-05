@@ -889,10 +889,6 @@ impl Config {
             // embala-nupkg; run them now so a bad [nupkg] fails before any
             // format builds. No filesystem access.
             embala_nupkg::validate(&nupkg.spec(p, Path::new(""))?)?;
-            // Last, so the layout rules above already apply to it.
-            if matches!(nupkg.scripts, Some(NupkgScripts::Generate)) {
-                bail!("nupkg: scripts = \"generate\" is not supported yet");
-            }
         }
         if let Some(setup) = &self.setup {
             validate_setup(setup)?;
@@ -1920,8 +1916,9 @@ files = [{ src = "dist/hello.exe", dest = "hello.exe", shim = false }]"#,
     }
 
     #[test]
-    fn nupkg_generate_checks_the_display_name_then_is_rejected() {
-        // Generation lands in a later phase; its layout rules already apply.
+    fn nupkg_generate_needs_a_directory_display_name() {
+        // The generated install creates "<display-name> (nupkg)", so a name
+        // Windows cannot use as a directory fails at load, before any build.
         let generate =
             format!("[nupkg]\nstyle = \"embedded\"\nscripts = \"generate\"\nfiles = [{HELLO}]");
         let text = with_nupkg(&generate).replace(
@@ -1933,11 +1930,11 @@ files = [{ src = "dist/hello.exe", dest = "hello.exe", shim = false }]"#,
             err.contains("package.display-name must be a valid Windows directory name"),
             "{err}"
         );
-        let err = nupkg_err(&generate);
-        assert!(
-            err.contains("nupkg: scripts = \"generate\" is not supported yet"),
-            "{err}"
-        );
+        let config = parse(&with_nupkg(&generate)).unwrap();
+        assert!(matches!(
+            config.nupkg.unwrap().scripts,
+            Some(NupkgScripts::Generate)
+        ));
     }
 
     #[test]
