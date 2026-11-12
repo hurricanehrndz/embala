@@ -394,6 +394,16 @@ pub(crate) fn write<F: Read + Write + Seek>(
     package.insert_rows(Insert::into("Registry").rows(registry_rows))?;
 
     // --- Property ------------------------------------------------------------
+    // ProductVersion must be numeric, so the SemVer prerelease is cut off
+    // here. Build metadata that is a plain number up to 65535 becomes the
+    // fourth field (1.2.3+42 -> 1.2.3.42), as Tauri does; other metadata is
+    // dropped. ProductCode keeps the full string, which makes 1.2.3-beta.1
+    // and 1.2.3 distinct products with the same ProductVersion.
+    let (rest, build) = spec.version.split_once('+').unwrap_or((&spec.version, ""));
+    let mut product_version = rest.split('-').next().unwrap_or_default().to_string();
+    if let Ok(build) = build.parse::<u16>() {
+        product_version.push_str(&format!(".{build}"));
+    }
     let mut property_rows = vec![
         vec![
             Value::Str("ProductCode".to_string()),
@@ -405,7 +415,7 @@ pub(crate) fn write<F: Read + Write + Seek>(
         ],
         vec![
             Value::Str("ProductVersion".to_string()),
-            Value::Str(spec.version.clone()),
+            Value::Str(product_version.clone()),
         ],
         vec![
             Value::Str("ProductLanguage".to_string()),
@@ -453,17 +463,18 @@ pub(crate) fn write<F: Read + Write + Seek>(
     package.insert_rows(Insert::into("Upgrade").rows(vec![
         // Any older or same-x.y.z version: RemoveExistingProducts uninstalls
         // it, migrating feature states. VersionMax is inclusive (WiX's
-        // AllowSameVersionUpgrades) because Windows Installer ignores the
-        // fourth (build) field: with an exclusive max, 1.2.3.4 would not count
-        // as older than 1.2.3.5, and with distinct ProductCodes both would end
-        // up installed side by side. The accepted cost: a build-only
-        // downgrade (1.2.3.5 -> 1.2.3.4) replaces rather than being blocked.
-        // An identical version has the same ProductCode, which
-        // FindRelatedProducts skips, so plain rebuilds are unaffected.
+        // AllowSameVersionUpgrades) because ProductVersion carries no
+        // prerelease and Windows Installer ignores the fourth (build) field
+        // when comparing: with an exclusive max, 1.2.3-beta.1 would not count as
+        // older than 1.2.3-beta.2 or 1.2.3, and with distinct ProductCodes
+        // both would end up installed side by side. The accepted cost: a
+        // downgrade within one x.y.z (1.2.3 -> 1.2.3-beta.1) replaces rather
+        // than being blocked. An identical version has the same ProductCode,
+        // which FindRelatedProducts skips, so plain rebuilds are unaffected.
         vec![
             Value::Str(upgrade_code.clone()),
             Value::Null, // VersionMin: no lower bound
-            Value::Str(spec.version.clone()),
+            Value::Str(product_version.clone()),
             Value::Null, // Language: any
             Value::Int(UPGRADE_MIGRATE_FEATURES | UPGRADE_VERSION_MAX_INCLUSIVE),
             Value::Null, // Remove: all features
@@ -473,7 +484,7 @@ pub(crate) fn write<F: Read + Write + Seek>(
         // so the LaunchCondition below can refuse the downgrade.
         vec![
             Value::Str(upgrade_code),
-            Value::Str(spec.version.clone()),
+            Value::Str(product_version),
             Value::Null, // VersionMax: no upper bound
             Value::Null,
             Value::Int(UPGRADE_ONLY_DETECT),
