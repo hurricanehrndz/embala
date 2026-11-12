@@ -23,6 +23,14 @@ Prebuilt binaries are attached to each
 | Windows x86_64 | `embala-<version>-x86_64-pc-windows-gnu.zip` |
 | Windows aarch64 | `embala-<version>-aarch64-pc-windows-gnullvm.zip` |
 
+The Windows binaries are Authenticode-signed, and the macOS binary is signed
+with a Developer ID and notarized. Every archive carries a build-provenance
+attestation:
+
+```sh
+gh attestation verify embala-0.10.0-x86_64-unknown-linux-musl.tar.gz --repo hurricanehrndz/embala
+```
+
 The Linux builds are static musl — no glibc version to match, no runtime
 dependencies at all. The Windows builds import only OS DLLs. The macOS build
 links `libSystem` and friends, as every Mach-O binary must.
