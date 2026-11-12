@@ -123,8 +123,9 @@ pub struct MsiSpec {
     pub name: String,
     /// Human name: ProductName, install folder, shortcut label.
     pub display_name: String,
-    /// Numeric x.y.z, or x.y.z.build. Windows Installer ignores the build
-    /// field when comparing versions; see the Upgrade table in `tables.rs`.
+    /// SemVer 2.0. ProductVersion gets the numeric x.y.z, plus a fourth
+    /// field when the build metadata is a number up to 65535; the full
+    /// string seeds the ProductCode. See the Upgrade table in `tables.rs`.
     pub version: String,
     /// Reverse-DNS identity; the GUID derivation seed.
     pub identifier: String,

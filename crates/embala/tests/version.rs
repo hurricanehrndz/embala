@@ -1,6 +1,6 @@
 //! `--version` overrides `[package].version` so callers can pass a release
 //! version (e.g. from a git tag) without rewriting embala.toml. The override
-//! must reach every place the version lands and still pass the x.y.z check.
+//! must reach every place the version lands and still pass the SemVer check.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -84,7 +84,7 @@ fn build_version_overrides_the_config() {
 
 #[test]
 fn build_version_is_validated_like_the_config() {
-    // Why: the override must not bypass the x.y.z rule MSI depends on.
+    // Why: the override must not bypass the SemVer rule the config gets.
     let dir = tmp("version-invalid");
     let config = write_fixture(&dir);
     let result = embala(&[
@@ -94,11 +94,11 @@ fn build_version_is_validated_like_the_config() {
         "--out-dir",
         dir.join("dist").to_str().unwrap(),
         "--version",
-        "1.2.3-beta",
+        "1.2.3.4",
     ]);
     assert!(!result.status.success());
     let stderr = String::from_utf8_lossy(&result.stderr);
-    assert!(stderr.contains("numeric x.y.z"), "{stderr}");
+    assert!(stderr.contains("SemVer 2.0"), "{stderr}");
 }
 
 #[test]
@@ -144,4 +144,33 @@ fn top_level_version_flag_still_prints_embala_version() {
     let result = embala(&["--version"]);
     assert!(result.status.success());
     assert!(String::from_utf8_lossy(&result.stdout).contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn prerelease_version_builds_every_windows_format() {
+    // Why: alpha, beta and dev builds must package; the setup.exe shows the
+    // full SemVer string even though its numeric fields can't hold it.
+    let dir = tmp("version-prerelease");
+    let config = write_fixture(&dir);
+    let out = dir.join("dist");
+    let result = embala(&[
+        "build",
+        "--config",
+        config.to_str().unwrap(),
+        "--formats",
+        "msi,setup",
+        "--out-dir",
+        out.to_str().unwrap(),
+        "--version",
+        "1.2.3-beta.1+g1a2b3c",
+    ]);
+    assert!(
+        result.status.success(),
+        "build failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(out.join("hello-1.2.3-beta.1+g1a2b3c-x86_64.msi").exists());
+    let setup = fs::read(out.join("hello-1.2.3-beta.1+g1a2b3c-x86_64-setup.exe")).unwrap();
+    let needle = utf16("1.2.3-beta.1+g1a2b3c");
+    assert!(setup.windows(needle.len()).any(|w| w == needle));
 }

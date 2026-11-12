@@ -69,12 +69,34 @@ against msitools respectively.
 
 ## Versions
 
-`[package].version` (or `--version`) is numeric `x.y.z`, optionally followed by
-a build number: `x.y.z.build`, with the build no higher than 65535. Every format
-carries the full string, except that `.app` puts only `x.y.z` in
-`CFBundleShortVersionString`. Windows Installer ignores the build field when it
-compares versions, so the `.msi` replaces any install with the same `x.y.z`.
-That means a build-only bump upgrades, but a build-only downgrade isn't blocked.
+`[package].version` (or `--version`) is [SemVer 2.0](https://semver.org):
+`x.y.z`, an optional prerelease, and optional build metadata. `1.2.3`,
+`1.2.3-beta.1` and `1.2.3-dev.4+g1a2b3c` are all valid. The older four-part
+`x.y.z.build` form is rejected.
+
+Artifact file names that include the version carry the full string. Inside
+each format:
+
+| Format | What it stores |
+| --- | --- |
+| `setup.exe` | The full string in the `FileVersion` and `ProductVersion` strings and in `DisplayVersion`. The numeric VERSIONINFO fields get `x.y.z.N`. |
+| `.pkg` | The full string. |
+| `.nupkg` | The full string. |
+| `.app` | The full string in `CFBundleVersion` and `CFBundleShortVersionString`. Apple documents these as integers only and the App Store enforces that. |
+| `.msi` | `x.y.z` or `x.y.z.N` in `ProductVersion`, which Windows Installer requires to be numeric. |
+
+`N` is the build metadata when it is a plain number no higher than 65535, so
+`1.2.3+42` and `1.2.3-beta.1+42` both give `1.2.3.42`. Any other metadata, such
+as a commit hash, leaves `N` at 0 in the `setup.exe` and off the `.msi`.
+
+Windows Installer never sees the prerelease and ignores the fourth field when
+it compares versions, so the `.msi` replaces any install with the same `x.y.z`. Going from `1.2.3-beta.1` to `1.2.3-beta.2` or to `1.2.3`
+upgrades, but going back from `1.2.3` to `1.2.3-beta.1` isn't blocked.
+
+Dotted prerelease identifiers and build metadata in a `.nupkg` need Chocolatey
+2.0 or newer. For older clients and the Chocolatey Community Repository, use a
+prerelease that starts with a letter and has no dots, such as `1.2.3-beta1`,
+and no build metadata.
 
 Inside the `.msi`, each payload file that is a PE with a version resource
 gets that file version in `File.Version`, as WiX does. On an upgrade, a

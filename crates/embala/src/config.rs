@@ -797,20 +797,12 @@ impl Config {
         {
             bail!("package.name must match [a-z0-9-]+ (got {:?})", p.name);
         }
-        // An optional fourth component is a build number. MSI and VERSIONINFO
-        // store it as a 16-bit field, so it is capped at 65535.
-        let version_parts: Vec<&str> = p.version.split('.').collect();
-        if !(3..=4).contains(&version_parts.len())
-            || version_parts
-                .iter()
-                .any(|s| s.is_empty() || !s.chars().all(|c| c.is_ascii_digit()))
-            || version_parts
-                .get(3)
-                .is_some_and(|build| build.parse::<u16>().is_err())
-        {
+        // SemVer 2.0 only. Formats whose version fields are numeric (MSI
+        // ProductVersion, VERSIONINFO) take the x.y.z core.
+        if let Err(e) = semver::Version::parse(&p.version) {
             bail!(
-                "package.version must be numeric x.y.z or x.y.z.build (build <= 65535) — \
-                 MSI requires it (got {:?})",
+                "package.version must be SemVer 2.0, e.g. 1.2.3, 1.2.3-beta.1 or \
+                 1.2.3-dev.4+g1a2b3c (got {:?}): {e}",
                 p.version
             );
         }
@@ -1226,25 +1218,17 @@ mod tests {
     }
 
     #[test]
-    fn non_numeric_version_is_rejected() {
-        let text = fixture_toml().replace("version = \"0.1.0\"", "version = \"0.1.0-beta\"");
-        let err = parse(&text).unwrap_err().to_string();
-        assert!(err.contains("numeric x.y.z"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn build_number_is_accepted_up_to_sixteen_bits() {
-        // Why: CI stamps a build number as the fourth component; MSI and
-        // VERSIONINFO hold it in 16 bits, so anything larger would be truncated.
+    fn version_is_semver_2_only() {
+        // Why: alpha, beta and dev builds need prerelease and build metadata,
+        // and the old four-part x.y.z.build form is not SemVer.
         let with =
             |v: &str| fixture_toml().replace("version = \"0.1.0\"", &format!("version = \"{v}\""));
-        assert_eq!(
-            parse(&with("0.1.0.65535")).unwrap().package.version,
-            "0.1.0.65535"
-        );
-        for bad in ["0.1.0.65536", "0.1.0.", "0.1.0.1.2"] {
+        for good in ["0.1.0-beta.1", "0.1.0-dev.4+g1a2b3c", "0.1.0+42"] {
+            assert_eq!(parse(&with(good)).unwrap().package.version, good);
+        }
+        for bad in ["0.1.0.42", "0.1", "01.1.0", "0.1.0-", "0.1.0-beta..1"] {
             let err = parse(&with(bad)).unwrap_err().to_string();
-            assert!(err.contains("x.y.z.build"), "{bad}: {err}");
+            assert!(err.contains("SemVer 2.0"), "{bad}: {err}");
         }
     }
 

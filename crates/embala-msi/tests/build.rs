@@ -581,3 +581,39 @@ fn invalid_registry_values_are_rejected() {
         "{err}"
     );
 }
+
+#[test]
+fn prerelease_keeps_a_numeric_product_version_and_its_own_product_code() {
+    // Why: Windows Installer rejects a non-numeric ProductVersion, and two
+    // prereleases sharing a ProductCode could not upgrade one another.
+    let property = |version: &str, name: &str| {
+        let mut spec = test_spec(&tmp("payload-prerelease"));
+        spec.version = version.to_string();
+        let out = tmp("prerelease.msi");
+        build(&spec, &out).unwrap();
+        let mut package = msi::Package::open(fs::File::open(&out).unwrap()).unwrap();
+        let value = package
+            .select_rows(msi::Select::table("Property"))
+            .unwrap()
+            .find(|row| row[0].as_str() == Some(name))
+            .map(|row| row[1].as_str().unwrap().to_string());
+        value.unwrap()
+    };
+    assert_eq!(property("1.2.3-beta.1+g1a2b3c", "ProductVersion"), "1.2.3");
+    // A numeric build number is the fourth field; one too big for it is not.
+    assert_eq!(property("1.2.3-beta.1+42", "ProductVersion"), "1.2.3.42");
+    assert_eq!(property("1.2.3+65536", "ProductVersion"), "1.2.3");
+    let codes = ["1.2.3-beta.1", "1.2.3-beta.2", "1.2.3"].map(|v| property(v, "ProductCode"));
+    assert!(codes[0] != codes[1] && codes[1] != codes[2] && codes[0] != codes[2]);
+
+    let mut spec = test_spec(&tmp("payload-prerelease"));
+    spec.version = "1.2.3-beta.1".to_string();
+    let out = tmp("prerelease.msi");
+    build(&spec, &out).unwrap();
+    let mut package = msi::Package::open(fs::File::open(&out).unwrap()).unwrap();
+    let upgrade = rows(&mut package, "Upgrade");
+    assert!(
+        upgrade.iter().all(|row| !row.contains("beta")),
+        "Upgrade versions must be numeric: {upgrade:?}"
+    );
+}
