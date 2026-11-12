@@ -28,7 +28,7 @@ with a Developer ID and notarized. Every archive carries a build-provenance
 attestation:
 
 ```sh
-gh attestation verify embala-0.10.0-x86_64-unknown-linux-musl.tar.gz --repo hurricanehrndz/embala
+gh attestation verify embala-0.11.0-x86_64-unknown-linux-musl.tar.gz --repo hurricanehrndz/embala
 ```
 
 The Linux builds are static musl — no glibc version to match, no runtime
@@ -36,8 +36,8 @@ dependencies at all. The Windows builds import only OS DLLs. The macOS build
 links `libSystem` and friends, as every Mach-O binary must.
 
 ```sh
-tar -xzf embala-0.10.0-x86_64-unknown-linux-musl.tar.gz
-./embala-0.10.0-x86_64-unknown-linux-musl/embala --version
+tar -xzf embala-0.11.0-x86_64-unknown-linux-musl.tar.gz
+./embala-0.11.0-x86_64-unknown-linux-musl/embala --version
 ```
 
 Building from source needs the dev shell once, to cross-compile the embedded
