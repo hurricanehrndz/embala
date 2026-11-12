@@ -68,6 +68,10 @@ jobs:
   build:
     needs: [meta, stubs]
     runs-on: ${{ matrix.os }}
+    # Signing credentials live in the `release` environment, which only `v*`
+    # tags may deploy to. Only tag runs of the targets that sign enter it, so
+    # a workflow_dispatch build still runs, unsigned.
+    environment: ${{ (github.ref_type == 'tag' && matrix.sign) && 'release' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -88,15 +92,18 @@ jobs:
             cargo: zigbuild
             archive: zip
             suffix: .exe
+            sign: windows
           - target: aarch64-pc-windows-gnullvm
             os: ubuntu-latest
             cargo: zigbuild
             archive: zip
             suffix: .exe
+            sign: windows
           - target: aarch64-apple-darwin
             os: macos-latest
             cargo: build
             archive: tar
+            sign: macos
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
@@ -137,6 +144,82 @@ jobs:
               otool -L "$bin"
               ;;
           esac
+      # Authenticode through Azure Trusted Signing, with jsign from Linux, the
+      # same setup as sofcat (its reference/code-signing.md). The runner image
+      # supplies Java and the Azure CLI. A tag run is never released unsigned:
+      # a missing variable or secret fails the step.
+      - name: Sign (Windows)
+        if: github.ref_type == 'tag' && matrix.sign == 'windows'
+        env:
+          JSIGN_VERSION: "7.6"
+          JSIGN_SHA256: 6cf58aa080e7ff82656f320cff8d4a3bff30408df8766806dcba3740dd839fa5
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          TRUSTED_SIGNING_ENDPOINT: ${{ vars.TRUSTED_SIGNING_ENDPOINT }}
+          TRUSTED_SIGNING_ACCOUNT: ${{ vars.TRUSTED_SIGNING_ACCOUNT }}
+          TRUSTED_SIGNING_PROFILE: ${{ vars.TRUSTED_SIGNING_PROFILE }}
+        run: |
+          for v in AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET \
+            TRUSTED_SIGNING_ENDPOINT TRUSTED_SIGNING_ACCOUNT TRUSTED_SIGNING_PROFILE; do
+            [ -n "${!v}" ] || { echo "::error::$v is not set"; exit 1; }
+          done
+          curl -fsSL -o "$RUNNER_TEMP/jsign.jar" \
+            "https://github.com/ebourg/jsign/releases/download/$JSIGN_VERSION/jsign-$JSIGN_VERSION.jar"
+          echo "$JSIGN_SHA256  $RUNNER_TEMP/jsign.jar" | sha256sum -c -
+          az login --service-principal --username "$AZURE_CLIENT_ID" --password "$AZURE_CLIENT_SECRET" \
+            --tenant "$AZURE_TENANT_ID" --allow-no-subscriptions --output none
+          token=$(az account get-access-token --resource https://codesigning.azure.net --query accessToken --output tsv)
+          echo "::add-mask::$token"
+          java -jar "$RUNNER_TEMP/jsign.jar" --storetype TRUSTEDSIGNING \
+            --keystore "$TRUSTED_SIGNING_ENDPOINT" --storepass "$token" \
+            --alias "$TRUSTED_SIGNING_ACCOUNT/$TRUSTED_SIGNING_PROFILE" \
+            --tsaurl http://timestamp.acs.microsoft.com --tsmode RFC3161 \
+            --name embala --url https://github.com/hurricanehrndz/embala \
+            "target/${{ matrix.target }}/release/embala.exe"
+      # Developer ID signature (hardened runtime, timestamped) from a throwaway
+      # keychain, then notarization. A bare Mach-O cannot hold a stapled
+      # ticket, so Gatekeeper looks it up online on first run.
+      - name: Sign and notarize (macOS)
+        if: github.ref_type == 'tag' && matrix.sign == 'macos'
+        env:
+          APPLE_CODESIGN_P12_BASE64: ${{ secrets.APPLE_CODESIGN_P12_BASE64 }}
+          APPLE_CODESIGN_P12_PASSWORD: ${{ secrets.APPLE_CODESIGN_P12_PASSWORD }}
+          NOTARY_API_KEY_P8: ${{ secrets.NOTARY_API_KEY_P8 }}
+          NOTARY_API_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          NOTARY_API_ISSUER_ID: ${{ secrets.NOTARY_API_ISSUER_ID }}
+          CODESIGN_IDENTITY: ${{ vars.CODESIGN_IDENTITY }}
+        run: |
+          for v in APPLE_CODESIGN_P12_BASE64 APPLE_CODESIGN_P12_PASSWORD NOTARY_API_KEY_P8 \
+            NOTARY_API_KEY_ID NOTARY_API_ISSUER_ID CODESIGN_IDENTITY; do
+            [ -n "${!v}" ] || { echo "::error::$v is not set"; exit 1; }
+          done
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password=$(openssl rand -hex 16)
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          printf %s "$APPLE_CODESIGN_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/codesign.p12"
+          security import "$RUNNER_TEMP/codesign.p12" -P "$APPLE_CODESIGN_P12_PASSWORD" \
+            -f pkcs12 -k "$keychain" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/codesign.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+
+          bin="target/${{ matrix.target }}/release/embala"
+          codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$bin"
+          codesign --verify --strict --verbose=2 "$bin"
+
+          printf '%s\n' "$NOTARY_API_KEY_P8" > "$RUNNER_TEMP/AuthKey.p8"
+          ditto -c -k "$bin" "$RUNNER_TEMP/embala-notarize.zip"
+          # notarytool exits 0 on an Invalid verdict too, so check the status.
+          result=$(xcrun notarytool submit "$RUNNER_TEMP/embala-notarize.zip" \
+            --key "$RUNNER_TEMP/AuthKey.p8" --key-id "$NOTARY_API_KEY_ID" \
+            --issuer "$NOTARY_API_ISSUER_ID" --wait --output-format json)
+          rm "$RUNNER_TEMP/AuthKey.p8"
+          echo "$result"
+          [ "$(jq -r .status <<<"$result")" = Accepted ] \
+            || { echo "::error::notarization was not accepted"; exit 1; }
       - name: Package
         shell: bash
         run: |
@@ -160,6 +243,10 @@ jobs:
     needs: [meta, build]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # cut the release
+      id-token: write # sign the provenance with Sigstore
+      attestations: write # store the provenance attestation
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -168,6 +255,12 @@ jobs:
           path: dist
       - name: Checksums
         run: cd dist && sha256sum embala-* | tee SHA256SUMS
+      # Build provenance for every archive, including the Linux ones, which
+      # have no signature format of their own. Verify with
+      # `gh attestation verify <file> --repo hurricanehrndz/embala`.
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/embala-*
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
