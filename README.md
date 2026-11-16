@@ -142,6 +142,73 @@ registry = [
 All values share one component with a GUID derived from the identifier, so
 they live and die with the product: uninstall removes each value.
 
+## pkg directory sources and symlinks
+
+A `[pkg]` file entry's `src` can be a directory. Its whole tree installs under
+`dest`, and `dest = "."` puts the tree's contents directly at
+`install-location`:
+
+```toml
+[pkg]
+install-location = "/Applications"
+files = [{ src = "dist/Hello.app", dest = "Hello.app" }]
+```
+
+- Symlinks inside the tree ship as symlinks, as `pkgbuild --root` does, with
+  the target unchanged (relative, absolute, or dangling). They are never
+  followed, so `.app` bundles with framework `Versions/Current` links work. A
+  `src` that is itself a symlink is followed.
+- Files get `0755` if executable, else `0644`. Directories get `0755`.
+  Everything is owned by `root:wheel`. Setting `mode` on a directory entry is
+  an error; use `[[pkg.directories]]` to set a directory's mode.
+- A tree file whose dest matches another entry, or that sits where a
+  directory is needed, fails the build the same way two explicit entries
+  would.
+- Names and link targets must be valid UTF-8. Sockets, FIFOs, and device
+  files are rejected.
+- `optional = true` keeps a directory `src` that is present.
+
+## pkg components
+
+A flat `[pkg]` (`files`, `directories`, `install-location`, `scripts` directly
+in the section) builds one component named after `package.name` with receipt
+id `package.identifier`. To ship several receipts, install locations or script
+sets in one `.pkg`, list `[[pkg.component]]` tables instead:
+
+```toml
+[pkg]
+enable-user-home = false          # product-level
+
+[[pkg.component]]
+name = "app"                      # receipt id defaults to <package.identifier>.app
+install-location = "/Applications"
+files = [{ src = "build/Foo.app/Contents/MacOS/foo", dest = "Foo.app/Contents/MacOS/foo" }]
+
+[[pkg.component]]
+name = "daemon"
+identifier = "ca.example.foo.daemon"   # optional: keep an existing pkgbuild receipt
+install-location = "/Library/LaunchDaemons"
+files = [{ src = "launchd/foo.plist", dest = "foo.plist", mode = 0o644 }]
+scripts = "pkg-scripts/daemon"
+```
+
+Components install in config order, scripts included (`productbuild --package a.pkg --package b.pkg` order, checked with `installer` on macOS
+27.2), so a LaunchDaemon listed last can load its plist from `postinstall`
+with everything else in place. Every component shares `package.version`,
+needs at least one file, and takes `directories`, `mode` and `optional` as a
+flat `[pkg]` does.
+
+| Config | Error |
+| -- | -- |
+| flat payload keys and `[[pkg.component]]` together | `pkg: use either files/directories/install-location/scripts directly under [pkg] or [[pkg.component]] tables, not both` |
+| neither | `pkg: needs files and install-location, or [[pkg.component]] tables` |
+| a `name` outside `[A-Za-z0-9._-]`, starting with `.`, or `Distribution` | `pkg component name "..." must be [A-Za-z0-9._-]+, ...` |
+| two names equal ignoring case | `pkg: two components are named "..."` |
+| two identifiers equal (derived or set) | `pkg: two components share the identifier "..."` |
+| two components installing the same absolute file path, or a file where another needs a directory | `pkg: components "a" and "b" both install "..."` |
+
+Shared parent directories such as `/Library` are fine.
+
 ## nupkg install scripts and shims
 
 By default an embedded `.nupkg` ships its files under `tools/` with no install

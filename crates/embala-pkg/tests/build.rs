@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use apple_bom::ParsedBom;
 use apple_xar::reader::XarReader;
-use embala_pkg::{DirSpec, Error, FileSpec, PkgSpec, build};
+use embala_pkg::{DirSpec, Error, FileSpec, PkgSpec, ProductSpec};
 
 const HELLO: &[u8] = b"#!/bin/sh\necho hello\n";
 const README: &[u8] = b"read me\n";
@@ -25,15 +25,13 @@ fn write_src(dir: &Path, name: &str, bytes: &[u8], mode: u32) -> PathBuf {
 }
 
 /// The fixture shape the macOS verification used: one 0755 executable and
-/// one 0644 doc file, install location `/usr/local`, user-home installs on.
+/// one 0644 doc file, install location `/usr/local`.
 fn spec(src_dir: &Path) -> PkgSpec {
     PkgSpec {
         name: "hello".to_string(),
-        display_name: "Embala Hello".to_string(),
         identifier: "ca.hrndz.embala.hello".to_string(),
         version: "0.1.0".to_string(),
         install_location: "/usr/local".to_string(),
-        enable_user_home: true,
         files: vec![
             FileSpec {
                 src: write_src(src_dir, "hello.sh", HELLO, 0o755),
@@ -49,6 +47,21 @@ fn spec(src_dir: &Path) -> PkgSpec {
         directories: vec![],
         scripts: None,
     }
+}
+
+/// `components` as the fixture product: "Embala Hello", user-home installs on.
+fn product(components: Vec<PkgSpec>) -> ProductSpec {
+    ProductSpec {
+        name: "hello".to_string(),
+        display_name: "Embala Hello".to_string(),
+        enable_user_home: true,
+        components,
+    }
+}
+
+/// Build `spec` as the only component of the fixture product.
+fn build(spec: &PkgSpec, out: &Path) -> embala_pkg::Result<()> {
+    embala_pkg::build(&product(vec![spec.clone()]), out)
 }
 
 fn build_archive(dir: &Path, name: &str) -> Vec<u8> {
@@ -245,10 +258,10 @@ fn distribution_enables_user_home_and_references_component() {
     assert!(text.contains("#hello.pkg</pkg-ref>"), "component reference");
 
     // Without enable_user_home the domains stay system-only.
-    let mut system_only = spec(dir.path());
+    let mut system_only = product(vec![spec(dir.path())]);
     system_only.enable_user_home = false;
     let out = dir.path().join("system.pkg");
-    build(&system_only, &out).unwrap();
+    embala_pkg::build(&system_only, &out).unwrap();
     let mut reader = XarReader::new(Cursor::new(std::fs::read(out).unwrap())).unwrap();
     let xml = reader
         .get_file_data_from_path("Distribution")
@@ -401,6 +414,206 @@ fn rejects_bad_specs() {
 
     // Nothing above may leave a partial artifact behind.
     assert!(!out.exists());
+}
+
+/// A component named `name` installing one file `dest` under `location`.
+fn component(src_dir: &Path, name: &str, location: &str, dest: &str) -> PkgSpec {
+    PkgSpec {
+        name: name.to_string(),
+        identifier: format!("ca.hrndz.embala.hello.{name}"),
+        version: "0.1.0".to_string(),
+        install_location: location.to_string(),
+        files: vec![FileSpec {
+            src: write_src(
+                src_dir,
+                &format!("src-{}", name.replace('/', "_")),
+                HELLO,
+                0o755,
+            ),
+            dest: dest.to_string(),
+            mode: None,
+        }],
+        directories: vec![],
+        scripts: None,
+    }
+}
+
+fn app_lib_daemon(dir: &Path) -> Vec<PkgSpec> {
+    let mut daemon = component(dir, "daemon", "/Library/LaunchDaemons", "foo.plist");
+    daemon.scripts = Some(scripts_dir(dir));
+    vec![
+        component(dir, "app", "/Applications", "Foo.app/Contents/MacOS/foo"),
+        component(dir, "lib", "/usr/local", "lib/foo/libfoo.dylib"),
+        daemon,
+    ]
+}
+
+#[test]
+fn components_keep_config_order() {
+    // Installer installs components (and runs their scripts) in the order
+    // of the choices-outline, observed on macOS 27.2: a LaunchDaemon listed
+    // last must find everything else in place when its postinstall loads it.
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("multi.pkg");
+    embala_pkg::build(&product(app_lib_daemon(dir.path())), &out).unwrap();
+    let archive = std::fs::read(&out).unwrap();
+
+    // productbuild's xar layout: one directory per component, in order.
+    let reader = XarReader::new(Cursor::new(archive.clone())).unwrap();
+    let dirs: Vec<String> = reader
+        .files()
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n)
+        .filter(|n| !n.contains('/'))
+        .collect();
+    assert_eq!(dirs, ["app.pkg", "lib.pkg", "daemon.pkg", "Distribution"]);
+    assert!(component_file(&archive, "daemon.pkg/Scripts").is_some());
+    assert!(component_file(&archive, "app.pkg/Scripts").is_none());
+
+    // Each component carries its own receipt id and install location.
+    for (name, location) in [
+        ("app", "/Applications"),
+        ("lib", "/usr/local"),
+        ("daemon", "/Library/LaunchDaemons"),
+    ] {
+        let xml = component_file(&archive, &format!("{name}.pkg/PackageInfo")).unwrap();
+        let info = &element_attrs(&xml, "pkg-info")[0];
+        assert_eq!(info["identifier"], format!("ca.hrndz.embala.hello.{name}"));
+        assert_eq!(info["install-location"], location);
+    }
+
+    // productbuild's Distribution shape: outline lines in order, then per
+    // component a hidden choice and the full pkg-ref pointing at its dir.
+    let xml = component_file(&archive, "Distribution").unwrap();
+    let ids = ["app", "lib", "daemon"].map(|n| format!("ca.hrndz.embala.hello.{n}"));
+    let lines: Vec<String> = element_attrs(&xml, "line")
+        .into_iter()
+        .map(|l| l["choice"].clone())
+        .collect();
+    assert_eq!(lines, ["default", &ids[0], &ids[1], &ids[2]]);
+    let choices: Vec<String> = element_attrs(&xml, "choice")
+        .into_iter()
+        .map(|c| c["id"].clone())
+        .collect();
+    assert_eq!(choices, ["default", &ids[0], &ids[1], &ids[2]]);
+    let full: Vec<_> = element_attrs(&xml, "pkg-ref")
+        .into_iter()
+        .filter(|r| r.contains_key("version"))
+        .collect();
+    assert_eq!(full.len(), 3);
+    for ((pkg_ref, id), name) in full.iter().zip(&ids).zip(["app", "lib", "daemon"]) {
+        assert_eq!(&pkg_ref["id"], id);
+        let info = component_file(&archive, &format!("{name}.pkg/PackageInfo")).unwrap();
+        let payload = &element_attrs(&info, "payload")[0];
+        assert_eq!(
+            pkg_ref["installKBytes"], payload["installKBytes"],
+            "{name}'s own size"
+        );
+    }
+    let text = std::str::from_utf8(&xml).unwrap();
+    let refs: Vec<usize> = ["#app.pkg<", "#lib.pkg<", "#daemon.pkg<"]
+        .iter()
+        .map(|r| text.find(r).expect(r))
+        .collect();
+    assert!(refs.is_sorted(), "pkg-refs in config order");
+    // One product-level domains/options for all components.
+    assert_eq!(element_attrs(&xml, "domains").len(), 1);
+    assert_eq!(element_attrs(&xml, "options").len(), 1);
+
+    // Reordering the components reorders everything, nothing else.
+    let mut reversed = app_lib_daemon(dir.path());
+    reversed.reverse();
+    let out = dir.path().join("reversed.pkg");
+    embala_pkg::build(&product(reversed), &out).unwrap();
+    let reader = XarReader::new(Cursor::new(std::fs::read(&out).unwrap())).unwrap();
+    let first = reader.files().unwrap().into_iter().next().unwrap().0;
+    assert_eq!(first, "daemon.pkg");
+}
+
+#[test]
+fn rejects_bad_component_sets() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.pkg");
+    let try_build = |components: Vec<PkgSpec>| embala_pkg::build(&product(components), &out);
+    let comp = |name: &str, location: &str, dest: &str| component(dir.path(), name, location, dest);
+
+    assert!(matches!(try_build(vec![]), Err(Error::NoComponents)));
+
+    // Names become xar directories (and dirs on a case-insensitive disk
+    // when expanded), so they must be safe and distinct.
+    for bad in ["", "a/b", ".hidden", "..", "Distribution", "sp ace"] {
+        assert!(
+            matches!(
+                try_build(vec![comp(bad, "/usr/local", "x")]),
+                Err(Error::InvalidComponentName(_))
+            ),
+            "name {bad:?}"
+        );
+    }
+    assert!(matches!(
+        try_build(vec![comp("app", "/a", "x"), comp("App", "/b", "x")]),
+        Err(Error::DuplicateComponentName(_))
+    ));
+
+    // Identifiers are receipt ids and choice ids; a repeat would merge two
+    // components' receipts and choices.
+    let mut twin = comp("b", "/b", "x");
+    twin.identifier = "ca.hrndz.embala.hello.a".to_string();
+    assert!(matches!(
+        try_build(vec![comp("a", "/a", "x"), twin]),
+        Err(Error::DuplicateIdentifier(_))
+    ));
+
+    // Same absolute file through different location/dest splits: the later
+    // component would silently overwrite the earlier one's file.
+    let err = try_build(vec![
+        comp("a", "/usr/local", "bin/foo"),
+        comp("b", "/usr/local/bin/", "foo"),
+    ])
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::ComponentCollision { path, first, second }
+            if path == "/usr/local/bin/foo" && first == "a" && second == "b"),
+        "{err}"
+    );
+
+    // A file where another component needs a directory, either order.
+    for pair in [
+        [
+            comp("a", "/usr/local", "bin"),
+            comp("b", "/usr/local", "bin/foo"),
+        ],
+        [
+            comp("a", "/usr/local/bin", "foo"),
+            comp("b", "/usr/local", "bin"),
+        ],
+    ] {
+        assert!(matches!(
+            try_build(pair.to_vec()),
+            Err(Error::ComponentCollision { .. })
+        ));
+    }
+    let mut declared = comp("b", "/opt", "x");
+    declared.directories = vec![DirSpec {
+        dest: "local/bin".to_string(),
+        mode: None,
+    }];
+    declared.install_location = "/usr".to_string();
+    assert!(matches!(
+        try_build(vec![comp("a", "/usr/local", "bin"), declared]),
+        Err(Error::ComponentCollision { .. })
+    ));
+    assert!(!out.exists());
+
+    // Shared parent directories are normal (/Library, /usr/local/bin).
+    try_build(vec![
+        comp("a", "/Library/LaunchDaemons", "a.plist"),
+        comp("b", "/Library/Application Support/foo", "b"),
+        comp("c", "/usr/local", "bin/c"),
+        comp("d", "/usr/local", "bin/d"),
+    ])
+    .unwrap();
 }
 
 const CREDENTIALS: &[u8] = b"secret\n";

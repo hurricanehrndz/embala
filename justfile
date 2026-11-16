@@ -53,6 +53,13 @@ stubs:
         cp "target/$target/release/setup-stub.exe" "$dest/setup-stub.exe"
     done
 
+# macOS end-to-end run of a multi-component .pkg (directory tree with
+# symlinks, four receipts, postinstall order) on a macos-test-rig host
+# (default mac1; MAC_E2E_HOST overrides). Installs as root, then removes
+# everything it installed and forgets the receipts.
+pkg-e2e:
+    fixtures/pkg-e2e/run.sh
+
 # Mint a 10-year self-signed code-signing cert for local osslsigncode tests.
 # Outputs fixtures/certs/test-win.pfx (+ .pem public half). PFX password is the
 # fixed literal `embala-test`. Generated, never committed (.gitignore).

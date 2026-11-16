@@ -160,7 +160,10 @@ fn vars_index_to_vec(vars: &[(u32, &str)]) -> Vec<u8> {
 }
 
 fn validate_bom_path(s: &str) -> Result<()> {
-    if s.starts_with('.') || s.starts_with('/') || s.contains('\\') {
+    // Dotfiles (`.zshrc`) are fine, as pkgbuild ships them; only a `.` or
+    // `..` first segment would point outside the payload root.
+    let first = s.split('/').next().unwrap_or_default();
+    if first == "." || first == ".." || s.starts_with('/') || s.contains('\\') {
         Err(Error::BadBomPath(s.to_string()))
     } else {
         Ok(())
@@ -299,6 +302,30 @@ impl BomBuilder {
         Ok(())
     }
 
+    /// Add a symlink with an explicit `mode` (file-type bits included, e.g.
+    /// `0o120755`). Pinned against pkgbuild on macOS 27.2: size is the
+    /// target's length and the checksum is the `cksum` of the target string.
+    pub fn add_symlink(&mut self, bom_path: impl ToString, target: &str, mode: u16) -> Result<()> {
+        let bom_path = bom_path.to_string();
+        validate_bom_path(&bom_path)?;
+        let link_name = CString::new(target).map_err(|_| Error::BadBomPath(bom_path.clone()))?;
+        let mut cksum = Cksum::default();
+        cksum.update(target.as_bytes());
+        let (cksum, size) = cksum.finish();
+        let record = BomBlockPathRecord {
+            path_type: BomPathType::Link.into(),
+            mode,
+            size: size as u32,
+            checksum_or_type: cksum,
+            link_name_length: target.len() as u32 + 1,
+            link_name: Some(Cow::from(link_name)),
+            ..self.directory_record()
+        };
+        let path = BomPath::from_record(String::new(), &record)?;
+        self.paths.insert(bom_path, path);
+        Ok(())
+    }
+
     fn directory_record(&self) -> BomBlockPathRecord<'static> {
         BomBlockPathRecord {
             path_type: BomPathType::Directory.into(),
@@ -385,7 +412,12 @@ impl BomBuilder {
                         } else {
                             0
                         },
-                        link_name: entry.link_name_cstring().map(Cow::from),
+                        // PORT: `BomPath::link_name_cstring` appends its own
+                        // NUL before `CString::new`, the same panic as the
+                        // root record; build the C string from the bare name.
+                        link_name: entry
+                            .link_name()
+                            .map(|l| Cow::from(CString::new(l).expect("checked in add_symlink"))),
                     }
                 } else {
                     self.directory_record()
@@ -623,9 +655,13 @@ impl BomBuilder {
             // 31-byte records for directories. lsbom reads the full 35
             // bytes for file-type records and silently truncates the
             // listing when the block is only 31 bytes long.
+            // Symlink records (pkgbuild, macOS 27.2) carry 8 trailing zero
+            // bytes after the NUL-terminated link name.
             if let BomBlock::PathRecord(record) = block {
                 if record.path_type == u8::from(BomPathType::File) {
                     blocks_writer.write_all(&[0u8; 4])?;
+                } else if record.path_type == u8::from(BomPathType::Link) {
+                    blocks_writer.write_all(&[0u8; 8])?;
                 }
             }
 
