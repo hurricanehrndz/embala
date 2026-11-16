@@ -160,7 +160,10 @@ fn vars_index_to_vec(vars: &[(u32, &str)]) -> Vec<u8> {
 }
 
 fn validate_bom_path(s: &str) -> Result<()> {
-    if s.starts_with('.') || s.starts_with('/') || s.contains('\\') {
+    // Dotfiles (`.zshrc`) are fine, as pkgbuild ships them; only a `.` or
+    // `..` first segment would point outside the payload root.
+    let first = s.split('/').next().unwrap_or_default();
+    if first == "." || first == ".." || s.starts_with('/') || s.contains('\\') {
         Err(Error::BadBomPath(s.to_string()))
     } else {
         Ok(())

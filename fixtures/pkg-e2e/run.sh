@@ -33,6 +33,7 @@ chmod 755 app/EmbalaE2E.app/Contents/MacOS/EmbalaE2E
 printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict><key>CFBundleIdentifier</key><string>%s.app</string><key>CFBundleExecutable</key><string>EmbalaE2E</string></dict></plist>\n' "$id" >app/EmbalaE2E.app/Contents/Info.plist
 echo 'fake framework binary' >"$fw/Versions/A/Fake"
 echo 'framework resource' >"$fw/Versions/A/Resources/res.txt"
+echo dotfile >"$fw/Versions/A/Resources/.keep"
 ln -s A "$fw/Versions/Current"
 ln -s Versions/Current/Fake "$fw/Fake"
 ln -s Versions/Current/Resources "$fw/Resources"
@@ -132,4 +133,5 @@ check 4-symlinks "[ \"\$(readlink $a/Versions/Current)\" = A ] && [ \"\$(readlin
 check 5-modes "[ \"\$(stat -f %Lp '/Library/Application Support/EmbalaE2E/embala-e2e')\" = 755 ] && [ \"\$(stat -f %Lp /Library/LaunchDaemons/$id.daemon.plist)\" = 644 ] && [ \"\$(stat -f %Su:%Sg /Library/LaunchDaemons/$id.daemon.plist)\" = root:wheel ] && echo ok || echo 'wrong mode or owner'"
 check 6-app-runs "[ \"\$(/Applications/EmbalaE2E.app/Contents/MacOS/EmbalaE2E)\" = 'embala-e2e app' ] && echo ok"
 check 7-receipt-owns-link "pkgutil --files $id.app | grep -qx 'EmbalaE2E.app/Contents/Frameworks/Fake.framework/Versions/Current' && echo ok || echo 'symlink missing from the app receipt'"
+check 8-dotfile "[ \"\$(cat $a/Resources/.keep)\" = dotfile ] && pkgutil --files $id.app | grep -q Resources/.keep\$ && echo ok || echo 'dotfile missing'"
 exit $fail

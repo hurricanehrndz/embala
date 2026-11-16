@@ -417,3 +417,117 @@ fn tree_file_colliding_with_another_component_is_an_error() {
         "{err}"
     );
 }
+
+/// A component named `name` installing `files` at `location`.
+fn component(name: &str, location: &str, files: Vec<FileSpec>) -> PkgSpec {
+    let mut spec = spec(files);
+    spec.name = name.to_string();
+    spec.identifier = format!("t.{name}");
+    spec.install_location = location.to_string();
+    spec
+}
+
+#[test]
+fn disjoint_dot_trees_may_share_an_install_location() {
+    // Why: splitting one staging root into components (bin and share both
+    // under /usr/local) is the point of `dest = "."`; only real file
+    // overlaps should fail.
+    let tmp = tempfile::tempdir().unwrap();
+    write(&tmp.path().join("bin/bin/tool"), b"x", 0o755);
+    write(&tmp.path().join("share/share/doc"), b"x", 0o644);
+    let product = product(vec![
+        component(
+            "bin",
+            "/usr/local",
+            vec![entry(&tmp.path().join("bin"), ".")],
+        ),
+        component(
+            "share",
+            "/usr/local/",
+            vec![entry(&tmp.path().join("share"), ".")],
+        ),
+    ]);
+    embala_pkg::build(&product, &tmp.path().join("x.pkg")).unwrap();
+}
+
+#[test]
+fn dotfiles_in_a_tree_ship() {
+    // Why: pkgbuild ships dotfiles; a tree's contents aren't typed by the
+    // user, so a stray `.keep` must not fail the build at the BOM stage.
+    let tmp = tempfile::tempdir().unwrap();
+    write(&tmp.path().join("root/.zshrc"), b"x", 0o644);
+    write(&tmp.path().join("root/etc/.keep"), b"", 0o644);
+    let built = Built::new(
+        &spec(vec![entry(&tmp.path().join("root"), ".")]),
+        tmp.path(),
+    );
+    let names: Vec<String> = built.cpio().into_iter().map(|e| e.0).collect();
+    assert!(names.contains(&"./.zshrc".to_string()), "{names:?}");
+    assert!(names.contains(&"./etc/.keep".to_string()), "{names:?}");
+    let bom: Vec<String> = built
+        .bom_paths()
+        .iter()
+        .map(|p| p.path().to_string())
+        .collect();
+    assert!(bom.iter().any(|p| p.ends_with(".zshrc")), "{bom:?}");
+}
+
+#[test]
+fn install_locations_that_alias_another_are_rejected() {
+    // Why: `/usr//local` and `/usr/local/.` install where `/usr/local` does
+    // but compare unequal, so they would slip past the collision check.
+    let tmp = tempfile::tempdir().unwrap();
+    write(&tmp.path().join("f"), b"x", 0o644);
+    for location in ["/usr//local", "/usr/local/.", "/usr/../local", "usr/local"] {
+        let spec = component("c", location, vec![entry(&tmp.path().join("f"), "f")]);
+        let err = build(&spec, &tmp.path().join("x.pkg")).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInstallLocation(_)),
+            "{location}: {err}"
+        );
+    }
+    for location in ["/", "/usr/local/"] {
+        let spec = component("c", location, vec![entry(&tmp.path().join("f"), "f")]);
+        build(&spec, &tmp.path().join("x.pkg")).unwrap();
+    }
+}
+
+#[test]
+fn components_differing_only_in_case_collide() {
+    // Why: macOS volumes are case-insensitive by default, so Foo.app and
+    // foo.app are one bundle and the later component would overwrite it.
+    let tmp = tempfile::tempdir().unwrap();
+    write(&tmp.path().join("f"), b"x", 0o755);
+    let product = product(vec![
+        component(
+            "a",
+            "/Applications",
+            vec![entry(&tmp.path().join("f"), "Foo.app/Contents/MacOS/foo")],
+        ),
+        component(
+            "b",
+            "/Applications",
+            vec![entry(&tmp.path().join("f"), "foo.app/Contents/MacOS/foo")],
+        ),
+    ]);
+    let err = embala_pkg::validate(&product).unwrap_err();
+    assert!(
+        matches!(&err, Error::ComponentCollision { path, .. } if path == "/Applications/foo.app/Contents/MacOS/foo"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_declared_dot_directory_is_rejected() {
+    // Why: "." is the install root itself, not a directory to declare; it
+    // used to pass validation and fail later with a BOM path error.
+    let tmp = tempfile::tempdir().unwrap();
+    write(&tmp.path().join("f"), b"x", 0o644);
+    let mut spec = spec(vec![entry(&tmp.path().join("f"), "f")]);
+    spec.directories = vec![DirSpec {
+        dest: ".".to_string(),
+        mode: None,
+    }];
+    let err = embala_pkg::validate(&product(vec![spec])).unwrap_err();
+    assert!(matches!(err, Error::InvalidDest(_)), "{err}");
+}

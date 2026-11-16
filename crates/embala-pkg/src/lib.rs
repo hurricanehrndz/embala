@@ -485,7 +485,12 @@ pub fn validate(product: &ProductSpec) -> Result<()> {
                 dest,
                 is_dir,
             };
-            let files = spec.files.iter().map(|f| entry(f.dest.as_str(), false));
+            // A "." dest is a tree at the install location: a directory here,
+            // its files are compared once build() has expanded it.
+            let files = spec
+                .files
+                .iter()
+                .map(|f| entry(f.dest.as_str(), f.dest == "."));
             let dirs = spec
                 .directories
                 .iter()
@@ -506,11 +511,11 @@ struct InstallEntry<'a> {
 
 impl InstallEntry<'_> {
     fn absolute(&self) -> String {
-        format!(
-            "{}/{}",
-            self.install_location.trim_end_matches('/'),
-            self.dest
-        )
+        let location = self.install_location.trim_end_matches('/');
+        if self.dest == "." {
+            return location.to_string();
+        }
+        format!("{location}/{}", self.dest)
     }
 }
 
@@ -518,28 +523,34 @@ impl InstallEntry<'_> {
 /// installs (as a file, or as a directory it needs, declared or implied).
 /// Shared directories are fine: several components may populate `/Library`.
 /// `components` pairs each component name with its entries.
+///
+/// Paths compare case-insensitively, since macOS volumes default to that:
+/// `Foo.app` in one component and `foo.app` in another would overwrite each
+/// other. On a case-sensitive volume that is a false alarm, which is the
+/// cheaper mistake.
 fn check_cross_component(components: &[(&str, Vec<InstallEntry>)]) -> Result<()> {
-    // Absolute path -> first component claiming it.
-    let mut files: BTreeMap<String, &str> = BTreeMap::new();
+    // Lowercased absolute path -> (path as written, first component claiming it).
+    let mut files: BTreeMap<String, (String, &str)> = BTreeMap::new();
     let mut dirs: BTreeMap<String, &str> = BTreeMap::new();
     for (name, entries) in components {
         for entry in entries {
             let path = entry.absolute();
+            let key = path.to_lowercase();
             // Ancestors of an absolute path start with "" (the root); skip it.
-            for dir in ancestors(&path).skip(1) {
+            for dir in ancestors(&key).skip(1) {
                 dirs.entry(dir.to_string()).or_insert(name);
             }
             if entry.is_dir {
-                dirs.entry(path).or_insert(name);
-            } else if let Some(first) = files.insert(path.clone(), name) {
+                dirs.entry(key).or_insert(name);
+            } else if let Some((_, first)) = files.insert(key, (path.clone(), name)) {
                 return Err(collision(path, first, name));
             }
         }
     }
     // A component's own file never sits on its own directory (checked per
     // component), so any overlap here is between two components.
-    for (path, name) in &files {
-        if let Some(first) = dirs.get(path) {
+    for (key, (path, name)) in &files {
+        if let Some(first) = dirs.get(key) {
             return Err(collision(path.clone(), first, name));
         }
     }
@@ -559,20 +570,27 @@ fn validate_component(spec: &PkgSpec) -> Result<()> {
     if spec.files.is_empty() {
         return Err(Error::NoFiles);
     }
-    if !spec.install_location.starts_with('/') {
+    let bad_segment = |s: &str| s.is_empty() || s == "." || s == "..";
+    // Normalised, so the cross-component check sees `/usr//local` and
+    // `/usr/local/.` as the `/usr/local` they install to. A trailing `/` is
+    // harmless and trimmed there.
+    let location = spec.install_location.trim_end_matches('/');
+    if !spec.install_location.starts_with('/')
+        || (!location.is_empty() && location[1..].split('/').any(bad_segment))
+    {
         return Err(Error::InvalidInstallLocation(spec.install_location.clone()));
     }
     let entries = spec
         .files
         .iter()
-        .map(|f| (&f.dest, f.mode))
-        .chain(spec.directories.iter().map(|d| (&d.dest, d.mode)));
+        .map(|f| (&f.dest, f.mode, true))
+        .chain(spec.directories.iter().map(|d| (&d.dest, d.mode, false)));
     let mut seen = BTreeSet::new();
-    for (dest, mode) in entries {
+    for (dest, mode, is_file) in entries {
         // A lone "." is a directory src's tree at the install location; a
         // "." segment anywhere else would reach the BOM/cpio paths verbatim.
-        let bad_segment = |s: &str| s.is_empty() || s == "." || s == "..";
-        if dest != "." && dest.split('/').any(bad_segment) {
+        // Declared directories get no such exemption: "." is the root itself.
+        if !(is_file && dest == ".") && dest.split('/').any(bad_segment) {
             return Err(Error::InvalidDest(dest.clone()));
         }
         if !seen.insert(dest.as_str()) {
