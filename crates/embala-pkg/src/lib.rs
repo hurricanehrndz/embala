@@ -164,9 +164,37 @@ const DIR_MODE: u32 = 0o755;
 /// (xar TOC, cpio, gzip) and sorted payload entries.
 pub fn build(spec: &PkgSpec, out: &Path) -> Result<()> {
     validate(spec)?;
+    let component = build_component(spec)?;
+    let distribution = distribution_xml(spec, component.install_kbytes)?;
 
-    // Payload tree model: relative path -> node, sorted (BTreeMap order
-    // matches pkgbuild's cpio/BOM ordering: parents before children).
+    // Product-archive layout, mirroring productbuild: the component
+    // directory first, Distribution last.
+    let entries = [
+        component_entry(&component),
+        XarEntry {
+            name: "Distribution",
+            kind: XarEntryKind::File {
+                data: &distribution,
+                mode: 0o644,
+                store: false,
+            },
+        },
+    ];
+
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut archive = Vec::new();
+    write_xar(&entries, &mut archive)?;
+    std::fs::write(out, archive)?;
+    Ok(())
+}
+
+/// Payload tree model for `spec`: relative path -> node, sorted (BTreeMap
+/// order matches pkgbuild's cpio/BOM ordering: parents before children).
+fn payload_nodes(spec: &PkgSpec) -> Result<BTreeMap<String, Node>> {
     let mut nodes: BTreeMap<String, Node> = BTreeMap::new();
     let implied_dir = || Node::Dir { mode: DIR_MODE };
     for file in &spec.files {
@@ -194,12 +222,15 @@ pub fn build(spec: &PkgSpec, out: &Path) -> Result<()> {
         let mode = dir.mode.unwrap_or(DIR_MODE);
         nodes.insert(dir.dest.clone(), Node::Dir { mode });
     }
+    Ok(nodes)
+}
 
-    // pkg-info bookkeeping. numberOfFiles counts every BOM path including
-    // the root ".". installKBytes uses pkgbuild's rule (pinned empirically
-    // against eight pkgbuild runs): every file occupies ceil(size/512)
-    // 512-byte blocks, every directory except the root occupies one block,
-    // and the total is rounded up to whole KiB.
+/// pkg-info bookkeeping: `(numberOfFiles, installKBytes)`. numberOfFiles
+/// counts every BOM path including the root ".". installKBytes uses
+/// pkgbuild's rule (pinned empirically against eight pkgbuild runs): every
+/// file occupies ceil(size/512) 512-byte blocks, every directory except the
+/// root occupies one block, and the total is rounded up to whole KiB.
+fn payload_stats(nodes: &BTreeMap<String, Node>) -> (u32, u64) {
     let mut blocks = 0u64;
     for node in nodes.values() {
         blocks += match node {
@@ -207,15 +238,29 @@ pub fn build(spec: &PkgSpec, out: &Path) -> Result<()> {
             Node::File { bytes, .. } => (bytes.len() as u64).div_ceil(512),
         };
     }
-    let number_of_files = 1 + nodes.len() as u32;
-    let install_kbytes = blocks.div_ceil(2);
+    (1 + nodes.len() as u32, blocks.div_ceil(2))
+}
+
+/// One component's `<name>.pkg/` contents, ready to lay into the xar.
+struct BuiltComponent {
+    dir_name: String,
+    bom: Vec<u8>,
+    payload: Vec<u8>,
+    scripts: Option<Vec<u8>>,
+    package_info: Vec<u8>,
+    install_kbytes: u64,
+}
+
+fn build_component(spec: &PkgSpec) -> Result<BuiltComponent> {
+    let nodes = payload_nodes(spec)?;
+    let (number_of_files, install_kbytes) = payload_stats(&nodes);
 
     // BOM over the payload tree (root:wheel, 0:0).
     let bom = bom_from_nodes(&nodes, 0, 0)?;
 
     let payload = gzip(&payload_cpio(&nodes))?;
-    let scripts = spec.scripts.as_deref().map(script_nodes).transpose()?;
-    let script_archive = scripts
+    let script_nodes = spec.scripts.as_deref().map(script_nodes).transpose()?;
+    let scripts = script_nodes
         .as_ref()
         .map(|s| gzip(&payload_cpio(s)))
         .transpose()?;
@@ -223,25 +268,31 @@ pub fn build(spec: &PkgSpec, out: &Path) -> Result<()> {
     let hooks: Vec<&str> = ["preinstall", "postinstall"]
         .into_iter()
         .filter(|name| {
-            scripts
+            script_nodes
                 .as_ref()
                 .is_some_and(|s| matches!(s.get(*name), Some(Node::File { .. })))
         })
         .collect();
     let package_info = package_info_xml(spec, number_of_files, install_kbytes, &hooks)?;
-    let distribution = distribution_xml(spec, install_kbytes)?;
+    Ok(BuiltComponent {
+        dir_name: format!("{}.pkg", spec.name),
+        bom,
+        payload,
+        scripts,
+        package_info,
+        install_kbytes,
+    })
+}
 
-    // Product-archive layout, mirroring productbuild: the component
-    // directory first (children in Apple's order: Bom, Payload, Scripts,
-    // PackageInfo), Distribution last. Payload and Scripts are already
-    // gzipped, so they are stored raw (application/octet-stream) exactly as
-    // Apple does.
-    let component = format!("{}.pkg", spec.name);
+/// The component directory entry, children in Apple's order: Bom, Payload,
+/// Scripts, PackageInfo. Payload and Scripts are already gzipped, so they
+/// are stored raw (application/octet-stream) exactly as Apple does.
+fn component_entry(component: &BuiltComponent) -> XarEntry<'_> {
     let mut children = vec![
         XarEntry {
             name: "Bom",
             kind: XarEntryKind::File {
-                data: &bom,
+                data: &component.bom,
                 mode: 0o644,
                 store: false,
             },
@@ -249,17 +300,17 @@ pub fn build(spec: &PkgSpec, out: &Path) -> Result<()> {
         XarEntry {
             name: "Payload",
             kind: XarEntryKind::File {
-                data: &payload,
+                data: &component.payload,
                 mode: 0o644,
                 store: true,
             },
         },
     ];
-    if let Some(script_archive) = &script_archive {
+    if let Some(scripts) = &component.scripts {
         children.push(XarEntry {
             name: "Scripts",
             kind: XarEntryKind::File {
-                data: script_archive,
+                data: scripts,
                 mode: 0o644,
                 store: true,
             },
@@ -268,38 +319,18 @@ pub fn build(spec: &PkgSpec, out: &Path) -> Result<()> {
     children.push(XarEntry {
         name: "PackageInfo",
         kind: XarEntryKind::File {
-            data: &package_info,
+            data: &component.package_info,
             mode: 0o644,
             store: false,
         },
     });
-    let entries = [
-        XarEntry {
-            name: &component,
-            kind: XarEntryKind::Directory {
-                mode: 0o700,
-                children,
-            },
+    XarEntry {
+        name: &component.dir_name,
+        kind: XarEntryKind::Directory {
+            mode: 0o700,
+            children,
         },
-        XarEntry {
-            name: "Distribution",
-            kind: XarEntryKind::File {
-                data: &distribution,
-                mode: 0o644,
-                store: false,
-            },
-        },
-    ];
-
-    if let Some(parent) = out.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
     }
-    let mut archive = Vec::new();
-    write_xar(&entries, &mut archive)?;
-    std::fs::write(out, archive)?;
-    Ok(())
 }
 
 /// Check `spec` without touching the filesystem: dests are relative and
