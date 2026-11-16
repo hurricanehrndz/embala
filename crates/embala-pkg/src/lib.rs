@@ -1,12 +1,15 @@
 //! macOS flat-package (`.pkg`) builder — product archives on any OS.
 //!
-//! [`build`] writes the same shape `productbuild` emits: a xar archive
-//! holding a `Distribution` script plus a `<name>.pkg/` component directory
-//! with `PackageInfo`, `Bom`, a gzipped odc-cpio `Payload`, and (with
+//! [`build`] writes the same shape `productbuild --package ...` emits: a xar
+//! archive holding one `<name>.pkg/` directory per component of a
+//! [`ProductSpec`], in install order, then a `Distribution` script. Each
+//! component ([`PkgSpec`]) has its own receipt identifier, install location,
+//! `PackageInfo`, `Bom`, gzipped odc-cpio `Payload` and (with
 //! [`PkgSpec::scripts`]) a `Scripts` archive in the same format. Every layer
 //! was pinned against Apple tooling on macOS 26.5 (pkgbuild/productbuild
 //! output dissected byte-by-byte; results verified with `pkgutil
-//! --expand-full`, `lsbom`, and `installer`).
+//! --expand-full`, `lsbom`, and `installer`); the multi-component
+//! Distribution and xar order were pinned on macOS 27.2.
 //!
 //! Lower-level pieces are public for reuse and testing: [`write_xar`]
 //! (xar archives with nested directories) and [`write_bom`] (Bill of
@@ -115,6 +118,29 @@ pub enum Error {
 
     #[error("pkg src {0} is not a regular file, directory, or symlink")]
     UnsupportedFileType(PathBuf),
+
+    // components
+    #[error("pkg: no components to package")]
+    NoComponents,
+
+    #[error(
+        "pkg component name {0:?} must be [A-Za-z0-9._-]+, not start with '.', \
+         and not be \"Distribution\""
+    )]
+    InvalidComponentName(String),
+
+    #[error("pkg: two components are named {0:?} (names are compared case-insensitively)")]
+    DuplicateComponentName(String),
+
+    #[error("pkg: two components share the identifier {0:?}")]
+    DuplicateIdentifier(String),
+
+    #[error("pkg: components {first:?} and {second:?} both install {path:?}")]
+    ComponentCollision {
+        path: String,
+        first: String,
+        second: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -154,20 +180,33 @@ pub struct DirSpec {
 /// Everything needed to author one product archive. Deliberately independent
 /// of the embala config types so the crate is usable on its own.
 #[derive(Debug, Clone)]
-pub struct PkgSpec {
-    /// Package name; names the artifact and the inner `<name>.pkg` component.
+pub struct ProductSpec {
+    /// Product name; callers use it to name the artifact.
     pub name: String,
     /// Human name: the Distribution `<title>` Installer.app displays.
     pub display_name: String,
-    /// Reverse-DNS package identifier (`pkgutil` receipt id).
-    pub identifier: String,
-    pub version: String,
-    /// Absolute path the payload tree installs under (e.g. `/usr/local`).
-    pub install_location: String,
     /// Adds `enable_currentUserHome` to the Distribution's `<domains>` so
     /// `installer -target CurrentUserHomeDirectory` is legal (the sudo-free
     /// install path).
     pub enable_user_home: bool,
+    /// Components in install order: Installer runs them (scripts included)
+    /// in the order of the Distribution's choices-outline, which follows
+    /// this list, as `productbuild --package` does.
+    pub components: Vec<PkgSpec>,
+}
+
+/// One component package: its own receipt, install location and scripts.
+#[derive(Debug, Clone)]
+pub struct PkgSpec {
+    /// Component name; names the inner `<name>.pkg` directory, so it must be
+    /// filename-safe (`[A-Za-z0-9._-]`, not starting with `.`).
+    pub name: String,
+    /// Reverse-DNS package identifier (`pkgutil` receipt id), also the
+    /// component's Distribution choice id.
+    pub identifier: String,
+    pub version: String,
+    /// Absolute path the payload tree installs under (e.g. `/usr/local`).
+    pub install_location: String,
     pub files: Vec<FileSpec>,
     pub directories: Vec<DirSpec>,
     /// Directory packed as the component's `Scripts` archive, like
@@ -192,27 +231,50 @@ const DIR_MODE: u32 = 0o755;
 /// on link permissions (Linux reports `0777`), so the macOS value is fixed.
 const SYMLINK_MODE: u32 = 0o120755;
 
-/// Build the product-archive `.pkg` described by `spec` at `out` (parent
+/// Build the product-archive `.pkg` described by `product` at `out` (parent
 /// dirs are created). Output is deterministic: fixed timestamps everywhere
 /// (xar TOC, cpio, gzip) and sorted payload entries.
-pub fn build(spec: &PkgSpec, out: &Path) -> Result<()> {
-    validate(spec)?;
-    let component = build_component(spec)?;
-    let distribution = distribution_xml(spec, component.install_kbytes)?;
+pub fn build(product: &ProductSpec, out: &Path) -> Result<()> {
+    validate(product)?;
+    let components = product
+        .components
+        .iter()
+        .map(build_component)
+        .collect::<Result<Vec<_>>>()?;
+    // validate() compared declared dests only; a directory src is known only
+    // once expanded, so compare what each component actually installs.
+    let installs: Vec<(&str, Vec<InstallEntry>)> = product
+        .components
+        .iter()
+        .zip(&components)
+        .map(|(spec, built)| {
+            let entries = built
+                .installed
+                .iter()
+                .map(|(dest, is_dir)| InstallEntry {
+                    install_location: &spec.install_location,
+                    dest,
+                    is_dir: *is_dir,
+                })
+                .collect();
+            (spec.name.as_str(), entries)
+        })
+        .collect();
+    check_cross_component(&installs)?;
+    let install_kbytes: Vec<u64> = components.iter().map(|c| c.install_kbytes).collect();
+    let distribution = distribution_xml(product, &install_kbytes)?;
 
     // Product-archive layout, mirroring productbuild: the component
-    // directory first, Distribution last.
-    let entries = [
-        component_entry(&component),
-        XarEntry {
-            name: "Distribution",
-            kind: XarEntryKind::File {
-                data: &distribution,
-                mode: 0o644,
-                store: false,
-            },
+    // directories in install order, Distribution last.
+    let mut entries: Vec<XarEntry> = components.iter().map(component_entry).collect();
+    entries.push(XarEntry {
+        name: "Distribution",
+        kind: XarEntryKind::File {
+            data: &distribution,
+            mode: 0o644,
+            store: false,
         },
-    ];
+    });
 
     if let Some(parent) = out.parent() {
         if !parent.as_os_str().is_empty() {
@@ -288,11 +350,18 @@ struct BuiltComponent {
     scripts: Option<Vec<u8>>,
     package_info: Vec<u8>,
     install_kbytes: u64,
+    /// Every payload path with whether it is a directory, after tree
+    /// expansion, for the cross-component check.
+    installed: Vec<(String, bool)>,
 }
 
 fn build_component(spec: &PkgSpec) -> Result<BuiltComponent> {
     let nodes = payload_nodes(spec)?;
     let (number_of_files, install_kbytes) = payload_stats(&nodes);
+    let installed = nodes
+        .iter()
+        .map(|(dest, node)| (dest.clone(), matches!(node, Node::Dir { .. })))
+        .collect();
 
     // BOM over the payload tree (root:wheel, 0:0).
     let bom = bom_from_nodes(&nodes, 0, 0)?;
@@ -320,6 +389,7 @@ fn build_component(spec: &PkgSpec) -> Result<BuiltComponent> {
         scripts,
         package_info,
         install_kbytes,
+        installed,
     })
 }
 
@@ -372,12 +442,120 @@ fn component_entry(component: &BuiltComponent) -> XarEntry<'_> {
     }
 }
 
-/// Check `spec` without touching the filesystem: dests are relative and
+/// Check `product` without touching the filesystem: component names are
+/// filename-safe and unique, identifiers are unique, no two components
+/// install the same path, and within each component dests are relative and
 /// unique, no file sits where a directory must be, and modes are permission
 /// bits only. [`build`] runs this first; it is public so callers can reject a
 /// bad layout before building anything. What a directory `src` expands to is
 /// only known by reading it, so [`build`] checks the expanded tree again.
-pub fn validate(spec: &PkgSpec) -> Result<()> {
+pub fn validate(product: &ProductSpec) -> Result<()> {
+    if product.components.is_empty() {
+        return Err(Error::NoComponents);
+    }
+    // Names become xar directories that `pkgutil --expand` writes to a
+    // possibly case-insensitive disk; identifiers become choice ids.
+    let mut names = BTreeSet::new();
+    let mut identifiers = BTreeSet::new();
+    for spec in &product.components {
+        let name = &spec.name;
+        if name.is_empty()
+            || name.starts_with('.')
+            || name == "Distribution"
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        {
+            return Err(Error::InvalidComponentName(name.clone()));
+        }
+        if !names.insert(name.to_ascii_lowercase()) {
+            return Err(Error::DuplicateComponentName(name.clone()));
+        }
+        if !identifiers.insert(spec.identifier.as_str()) {
+            return Err(Error::DuplicateIdentifier(spec.identifier.clone()));
+        }
+        validate_component(spec)?;
+    }
+    let installs: Vec<(&str, Vec<InstallEntry>)> = product
+        .components
+        .iter()
+        .map(|spec| {
+            let entry = |dest, is_dir| InstallEntry {
+                install_location: &spec.install_location,
+                dest,
+                is_dir,
+            };
+            let files = spec.files.iter().map(|f| entry(f.dest.as_str(), false));
+            let dirs = spec
+                .directories
+                .iter()
+                .map(|d| entry(d.dest.as_str(), true));
+            (spec.name.as_str(), files.chain(dirs).collect())
+        })
+        .collect();
+    check_cross_component(&installs)
+}
+
+/// One payload path as a component installs it.
+struct InstallEntry<'a> {
+    install_location: &'a str,
+    /// Relative to `install_location`, already validated.
+    dest: &'a str,
+    is_dir: bool,
+}
+
+impl InstallEntry<'_> {
+    fn absolute(&self) -> String {
+        format!(
+            "{}/{}",
+            self.install_location.trim_end_matches('/'),
+            self.dest
+        )
+    }
+}
+
+/// Fail when a file of one component lands on a path another component also
+/// installs (as a file, or as a directory it needs, declared or implied).
+/// Shared directories are fine: several components may populate `/Library`.
+/// `components` pairs each component name with its entries.
+fn check_cross_component(components: &[(&str, Vec<InstallEntry>)]) -> Result<()> {
+    // Absolute path -> first component claiming it.
+    let mut files: BTreeMap<String, &str> = BTreeMap::new();
+    let mut dirs: BTreeMap<String, &str> = BTreeMap::new();
+    for (name, entries) in components {
+        for entry in entries {
+            let path = entry.absolute();
+            // Ancestors of an absolute path start with "" (the root); skip it.
+            for dir in ancestors(&path).skip(1) {
+                dirs.entry(dir.to_string()).or_insert(name);
+            }
+            if entry.is_dir {
+                dirs.entry(path).or_insert(name);
+            } else if let Some(first) = files.insert(path.clone(), name) {
+                return Err(collision(path, first, name));
+            }
+        }
+    }
+    // A component's own file never sits on its own directory (checked per
+    // component), so any overlap here is between two components.
+    for (path, name) in &files {
+        if let Some(first) = dirs.get(path) {
+            return Err(collision(path.clone(), first, name));
+        }
+    }
+    Ok(())
+}
+
+fn collision(path: String, first: &str, second: &str) -> Error {
+    Error::ComponentCollision {
+        path,
+        first: first.to_string(),
+        second: second.to_string(),
+    }
+}
+
+/// [`validate`] for one component's own layout.
+fn validate_component(spec: &PkgSpec) -> Result<()> {
     if spec.files.is_empty() {
         return Err(Error::NoFiles);
     }
@@ -770,19 +948,24 @@ fn package_info_xml(
     Ok(writer.into_inner().into_inner())
 }
 
-fn distribution_xml(spec: &PkgSpec, install_kbytes: u64) -> XmlResult {
-    let id = spec.identifier.as_str();
+/// `install_kbytes` is per component, in `product.components` order.
+///
+/// Per component, productbuild (macOS 27.2, `--package` repeated) emits one
+/// outline line, then a hidden choice wrapping a bare pkg-ref followed by
+/// the full pkg-ref, all in `--package` order; Installer installs in outline
+/// order (observed with postinstall markers).
+fn distribution_xml(product: &ProductSpec, install_kbytes: &[u64]) -> XmlResult {
     let mut writer = xml_writer()?;
     writer
         .create_element("installer-gui-script")
         .with_attribute(("minSpecVersion", "2"))
         .write_inner_content(|w| {
             w.create_element("title")
-                .write_text_content(BytesText::new(&spec.display_name))?;
+                .write_text_content(BytesText::new(&product.display_name))?;
             let domains = w
                 .create_element("domains")
                 .with_attribute(("enable_localSystem", "true"));
-            if spec.enable_user_home {
+            if product.enable_user_home {
                 domains
                     .with_attribute(("enable_currentUserHome", "true"))
                     .write_empty()?;
@@ -802,9 +985,11 @@ fn distribution_xml(spec: &PkgSpec, install_kbytes: u64) -> XmlResult {
                     w.create_element("line")
                         .with_attribute(("choice", "default"))
                         .write_inner_content(|w| {
-                            w.create_element("line")
-                                .with_attribute(("choice", id))
-                                .write_empty()?;
+                            for spec in &product.components {
+                                w.create_element("line")
+                                    .with_attribute(("choice", spec.identifier.as_str()))
+                                    .write_empty()?;
+                            }
                             Ok::<(), std::io::Error>(())
                         })?;
                     Ok::<(), std::io::Error>(())
@@ -812,22 +997,25 @@ fn distribution_xml(spec: &PkgSpec, install_kbytes: u64) -> XmlResult {
             w.create_element("choice")
                 .with_attribute(("id", "default"))
                 .write_empty()?;
-            w.create_element("choice")
-                .with_attribute(("id", id))
-                .with_attribute(("visible", "false"))
-                .write_inner_content(|w| {
-                    w.create_element("pkg-ref")
-                        .with_attribute(("id", id))
-                        .write_empty()?;
-                    Ok::<(), std::io::Error>(())
-                })?;
-            w.create_element("pkg-ref")
-                .with_attribute(("id", id))
-                .with_attribute(("version", spec.version.as_str()))
-                .with_attribute(("onConclusion", "none"))
-                .with_attribute(("installKBytes", install_kbytes.to_string().as_str()))
-                .with_attribute(("updateKBytes", "0"))
-                .write_text_content(BytesText::new(&format!("#{}.pkg", spec.name)))?;
+            for (spec, kbytes) in product.components.iter().zip(install_kbytes) {
+                let id = spec.identifier.as_str();
+                w.create_element("choice")
+                    .with_attribute(("id", id))
+                    .with_attribute(("visible", "false"))
+                    .write_inner_content(|w| {
+                        w.create_element("pkg-ref")
+                            .with_attribute(("id", id))
+                            .write_empty()?;
+                        Ok::<(), std::io::Error>(())
+                    })?;
+                w.create_element("pkg-ref")
+                    .with_attribute(("id", id))
+                    .with_attribute(("version", spec.version.as_str()))
+                    .with_attribute(("onConclusion", "none"))
+                    .with_attribute(("installKBytes", kbytes.to_string().as_str()))
+                    .with_attribute(("updateKBytes", "0"))
+                    .write_text_content(BytesText::new(&format!("#{}.pkg", spec.name)))?;
+            }
             Ok::<(), std::io::Error>(())
         })?;
     Ok(writer.into_inner().into_inner())

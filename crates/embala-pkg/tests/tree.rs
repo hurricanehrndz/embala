@@ -13,20 +13,32 @@ use std::path::Path;
 
 use apple_bom::ParsedBom;
 use apple_xar::reader::XarReader;
-use embala_pkg::{DirSpec, Error, FileSpec, PkgSpec, build};
+use embala_pkg::{DirSpec, Error, FileSpec, PkgSpec, ProductSpec};
 
 fn spec(files: Vec<FileSpec>) -> PkgSpec {
     PkgSpec {
         name: "tree".to_string(),
-        display_name: "Tree".to_string(),
         identifier: "t.tree".to_string(),
         version: "1.0.0".to_string(),
         install_location: "/usr/local".to_string(),
-        enable_user_home: false,
         files,
         directories: vec![],
         scripts: None,
     }
+}
+
+fn product(components: Vec<PkgSpec>) -> ProductSpec {
+    ProductSpec {
+        name: "tree".to_string(),
+        display_name: "Tree".to_string(),
+        enable_user_home: false,
+        components,
+    }
+}
+
+/// Build `spec` as the only component of a product.
+fn build(spec: &PkgSpec, out: &Path) -> embala_pkg::Result<()> {
+    embala_pkg::build(&product(vec![spec.clone()]), out)
 }
 
 fn entry(src: &Path, dest: &str) -> FileSpec {
@@ -376,4 +388,32 @@ fn nested_symlinked_dirs_are_not_followed_but_a_symlinked_src_is() {
         "links are leaves; nothing is walked through them"
     );
     assert_eq!(built.cpio_entry("./alias"), (0o120755, b"real".to_vec()));
+}
+
+#[test]
+fn tree_file_colliding_with_another_component_is_an_error() {
+    // Why: validate() compares declared dests only, and a tree's contents are
+    // known only once read. Two components writing the same absolute path
+    // would leave whichever installs last, and both receipts would claim it.
+    let tmp = tempfile::tempdir().unwrap();
+    let tree = tmp.path().join("tree");
+    write(&tree.join("LaunchDaemons/foo.plist"), b"<plist/>", 0o644);
+    let plist = tmp.path().join("foo.plist");
+    write(&plist, b"<plist/>", 0o644);
+
+    let mut whole = spec(vec![entry(&tree, ".")]);
+    whole.name = "root".to_string();
+    whole.identifier = "t.root".to_string();
+    whole.install_location = "/Library".to_string();
+    let mut daemon = spec(vec![entry(&plist, "foo.plist")]);
+    daemon.name = "daemon".to_string();
+    daemon.identifier = "t.daemon".to_string();
+    daemon.install_location = "/Library/LaunchDaemons".to_string();
+
+    let out = tmp.path().join("x.pkg");
+    let err = embala_pkg::build(&product(vec![whole, daemon]), &out).unwrap_err();
+    assert!(
+        matches!(&err, Error::ComponentCollision { path, .. } if path == "/Library/LaunchDaemons/foo.plist"),
+        "{err}"
+    );
 }

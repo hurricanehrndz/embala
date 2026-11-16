@@ -364,38 +364,101 @@ pub struct AppSection {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct PkgSection {
-    pub files: Vec<PkgFileEntry>,
-    /// Directories to create with an explicit mode, even if empty.
-    #[serde(default)]
-    pub directories: Vec<PkgDirEntry>,
-    pub install_location: String,
     /// Marks the package installable into the user's home directory
     /// (`installer -target CurrentUserHomeDirectory`) — the sudo-free test hook.
     #[serde(default)]
     pub enable_user_home: bool,
+    /// `[[pkg.component]]` tables, in install order. Without any, the flat
+    /// payload keys below form one implicit component named after the
+    /// package; mixing the two is an error.
+    #[serde(default)]
+    pub component: Vec<PkgComponent>,
+    #[serde(default)]
+    pub files: Vec<PkgFileEntry>,
+    /// Directories to create with an explicit mode, even if empty.
+    #[serde(default)]
+    pub directories: Vec<PkgDirEntry>,
+    pub install_location: Option<String>,
     /// `pkgbuild --scripts` directory (relative to the config dir): packed
     /// whole; top-level `preinstall`/`postinstall` run as install hooks.
     pub scripts: Option<PathBuf>,
 }
 
+/// One `[[pkg.component]]`: its own receipt, install location and scripts.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct PkgComponent {
+    /// Names the inner `<name>.pkg`; also the identifier suffix.
+    pub name: String,
+    /// Receipt id; defaults to `<package.identifier>.<name>`. Set it to keep
+    /// the receipts of an existing pkgbuild setup.
+    pub identifier: Option<String>,
+    pub install_location: String,
+    pub files: Vec<PkgFileEntry>,
+    #[serde(default)]
+    pub directories: Vec<PkgDirEntry>,
+    pub scripts: Option<PathBuf>,
+}
+
 impl PkgSection {
-    /// Drop absent optional files. Nothing else in `[pkg]` names a file dest.
+    /// Flat payload keys and `[[pkg.component]]` are exclusive, and one of
+    /// them must be present. The layout rules live in `embala_pkg::validate`.
+    fn check_shape(&self) -> Result<()> {
+        let flat = !self.files.is_empty()
+            || !self.directories.is_empty()
+            || self.install_location.is_some()
+            || self.scripts.is_some();
+        match (flat, self.component.is_empty()) {
+            (true, false) => bail!(
+                "pkg: use either files/directories/install-location/scripts directly under \
+                 [pkg] or [[pkg.component]] tables, not both"
+            ),
+            (false, true) => {
+                bail!("pkg: needs files and install-location, or [[pkg.component]] tables")
+            }
+            (true, true) if self.install_location.is_none() => {
+                bail!("pkg: install-location is required")
+            }
+            _ => {}
+        }
+        for component in &self.component {
+            if let Some(id) = &component.identifier {
+                if !is_reverse_dns(id) {
+                    bail!(
+                        "pkg: component {:?} identifier must be reverse-DNS-like, e.g. \
+                         com.example.app (got {id:?})",
+                        component.name
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop absent optional files, per component. Nothing else in `[pkg]`
+    /// names a file dest.
     pub fn drop_absent_optional(&mut self, base: &Path) -> Result<()> {
-        drop_absent("pkg", &mut self.files, base).map(drop)
+        drop_absent("pkg", &mut self.files, base)?;
+        for component in &mut self.component {
+            drop_absent("pkg", &mut component.files, base)?;
+        }
+        Ok(())
     }
 
     /// The `embala-pkg` spec for this section, with `src` and `scripts`
     /// resolved against `base` (the config file's directory).
-    pub fn spec(&self, package: &Package, base: &Path) -> embala_pkg::PkgSpec {
-        embala_pkg::PkgSpec {
-            name: package.name.clone(),
-            display_name: package.display_name.clone(),
-            identifier: package.identifier.clone(),
+    pub fn spec(&self, package: &Package, base: &Path) -> embala_pkg::ProductSpec {
+        let component = |name: &str,
+                         identifier: String,
+                         install_location: &str,
+                         files: &[PkgFileEntry],
+                         directories: &[PkgDirEntry],
+                         scripts: Option<&PathBuf>| embala_pkg::PkgSpec {
+            name: name.to_string(),
+            identifier,
             version: package.version.clone(),
-            install_location: self.install_location.clone(),
-            enable_user_home: self.enable_user_home,
-            files: self
-                .files
+            install_location: install_location.to_string(),
+            files: files
                 .iter()
                 .map(|f| embala_pkg::FileSpec {
                     src: base.join(&f.src),
@@ -403,17 +466,57 @@ impl PkgSection {
                     mode: f.mode,
                 })
                 .collect(),
-            directories: self
-                .directories
+            directories: directories
                 .iter()
                 .map(|d| embala_pkg::DirSpec {
                     dest: d.dest.clone(),
                     mode: d.mode,
                 })
                 .collect(),
-            scripts: self.scripts.as_ref().map(|s| base.join(s)),
+            scripts: scripts.map(|s| base.join(s)),
+        };
+        let components = if self.component.is_empty() {
+            vec![component(
+                &package.name,
+                package.identifier.clone(),
+                self.install_location.as_deref().unwrap_or_default(),
+                &self.files,
+                &self.directories,
+                self.scripts.as_ref(),
+            )]
+        } else {
+            self.component
+                .iter()
+                .map(|c| {
+                    component(
+                        &c.name,
+                        c.identifier
+                            .clone()
+                            .unwrap_or_else(|| format!("{}.{}", package.identifier, c.name)),
+                        &c.install_location,
+                        &c.files,
+                        &c.directories,
+                        c.scripts.as_ref(),
+                    )
+                })
+                .collect()
+        };
+        embala_pkg::ProductSpec {
+            name: package.name.clone(),
+            display_name: package.display_name.clone(),
+            enable_user_home: self.enable_user_home,
+            components,
         }
     }
+}
+
+/// `com.example.app`: two or more non-empty `[A-Za-z0-9-]` segments.
+fn is_reverse_dns(id: &str) -> bool {
+    let segments: Vec<&str> = id.split('.').collect();
+    segments.len() >= 2
+        && segments
+            .iter()
+            .all(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -817,12 +920,7 @@ impl Config {
                 p.version
             );
         }
-        let id_segments: Vec<&str> = p.identifier.split('.').collect();
-        if id_segments.len() < 2
-            || id_segments
-                .iter()
-                .any(|s| s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
-        {
+        if !is_reverse_dns(&p.identifier) {
             bail!(
                 "package.identifier must be reverse-DNS-like, e.g. com.example.app (got {:?})",
                 p.identifier
@@ -897,9 +995,11 @@ impl Config {
             validate_setup(setup)?;
         }
         if let Some(pkg) = &self.pkg {
-            // Layout rules (dest shape, duplicates, file/directory
-            // conflicts) belong to embala-pkg; run them now so a bad [pkg]
-            // fails before any format builds. No filesystem access.
+            pkg.check_shape()?;
+            // Layout rules (component names and identifiers, dest shape,
+            // duplicates, file/directory and cross-component conflicts)
+            // belong to embala-pkg; run them now so a bad [pkg] fails before
+            // any format builds. No filesystem access.
             embala_pkg::validate(&pkg.spec(p, Path::new("")))?;
         }
         if let Some(sign) = &self.sign {
@@ -1515,6 +1615,167 @@ shortcuts = [{ name = "Hello", target = "hello.exe" }]
             let err = format!("{:#}", parse(&text).unwrap_err());
             assert!(err.contains(needle), "{directories}: {err}");
         }
+    }
+
+    /// The fixture with its `[pkg]` section replaced by `block`.
+    fn with_pkg_section(block: &str) -> String {
+        let base = fixture_toml();
+        let start = base.find("\n[pkg]").unwrap();
+        let end = base.find("\n[nupkg]").unwrap();
+        format!("{}\n{block}\n{}", &base[..start], &base[end..])
+    }
+
+    const APP_AND_DAEMON: &str = r#"[pkg]
+enable-user-home = true
+
+[[pkg.component]]
+name = "app"
+install-location = "/Applications"
+files = [{ src = "dist/foo", dest = "Foo.app/Contents/MacOS/foo" }]
+
+[[pkg.component]]
+name = "daemon"
+identifier = "ca.example.foo.daemon"
+install-location = "/Library/LaunchDaemons"
+files = [{ src = "launchd/foo.plist", dest = "foo.plist", mode = 0o644 }]
+scripts = "pkg-scripts/daemon"
+"#;
+
+    #[test]
+    fn flat_pkg_is_one_component_named_after_the_package() {
+        // Existing configs must keep their receipt id and `<name>.pkg`, or
+        // upgrades would leave the old receipt behind.
+        let config = parse(&fixture_toml()).unwrap();
+        let spec = config.pkg.unwrap().spec(&config.package, Path::new("cfg"));
+        assert_eq!(spec.display_name, "Embala Hello");
+        assert!(spec.enable_user_home);
+        let [only] = spec.components.as_slice() else {
+            panic!("one implicit component");
+        };
+        assert_eq!(only.name, "hello");
+        assert_eq!(only.identifier, "ca.hrndz.embala.hello");
+        assert_eq!(only.install_location, "/usr/local");
+        assert_eq!(only.scripts.as_deref(), Some(Path::new("cfg/scripts")));
+    }
+
+    #[test]
+    fn pkg_components_resolve_in_order() {
+        let config = parse(&with_pkg_section(APP_AND_DAEMON)).unwrap();
+        let spec = config.pkg.unwrap().spec(&config.package, Path::new("cfg"));
+        assert!(spec.enable_user_home, "product-level");
+        let summary: Vec<_> = spec
+            .components
+            .iter()
+            .map(|c| {
+                (
+                    c.name.as_str(),
+                    c.identifier.as_str(),
+                    c.install_location.as_str(),
+                    c.version.as_str(),
+                )
+            })
+            .collect();
+        // Config order is install order; the identifier defaults to
+        // <package.identifier>.<name> and an override keeps old receipts.
+        assert_eq!(
+            summary,
+            [
+                ("app", "ca.hrndz.embala.hello.app", "/Applications", "0.1.0"),
+                (
+                    "daemon",
+                    "ca.example.foo.daemon",
+                    "/Library/LaunchDaemons",
+                    "0.1.0"
+                ),
+            ]
+        );
+        let daemon = &spec.components[1];
+        assert_eq!(daemon.files[0].src, Path::new("cfg/launchd/foo.plist"));
+        assert_eq!(daemon.files[0].mode, Some(0o644));
+        assert_eq!(
+            daemon.scripts.as_deref(),
+            Some(Path::new("cfg/pkg-scripts/daemon"))
+        );
+    }
+
+    #[test]
+    fn bad_pkg_component_configs_are_rejected() {
+        let component = |name: &str, extra: &str| {
+            format!(
+                "[[pkg.component]]\nname = \"{name}\"\ninstall-location = \"/opt/{name}\"\n\
+                 files = [{{ src = \"hello.sh\", dest = \"x\" }}]\n{extra}\n"
+            )
+        };
+        let two = |a: String, b: String| format!("[pkg]\n{a}{b}");
+        for (block, needle) in [
+            // Which keys belong to which component would be a guess.
+            (
+                format!(
+                    "[pkg]\ninstall-location = \"/usr/local\"\n{}",
+                    component("a", "")
+                ),
+                "not both",
+            ),
+            (
+                format!("[pkg]\nscripts = \"scripts\"\n{}", component("a", "")),
+                "not both",
+            ),
+            ("[pkg]\nenable-user-home = true".to_string(), "needs files"),
+            (
+                "[pkg]\nfiles = [{ src = \"hello.sh\", dest = \"x\" }]".to_string(),
+                "install-location is required",
+            ),
+            (
+                two(component("a", ""), component("a", "")),
+                "two components are named",
+            ),
+            (
+                two(
+                    component("a", ""),
+                    component("b", "identifier = \"ca.hrndz.embala.hello.a\""),
+                ),
+                "share the identifier",
+            ),
+            (
+                format!("[pkg]\n{}", component("a b", "")),
+                "component name \"a b\"",
+            ),
+            (
+                format!("[pkg]\n{}", component("a", "identifier = \"nodots\"")),
+                "identifier must be reverse-DNS-like",
+            ),
+            (
+                two(
+                    component("a", ""),
+                    "[[pkg.component]]\nname = \"b\"\ninstall-location = \"/opt\"\n\
+                     files = [{ src = \"hello.sh\", dest = \"a/x\" }]\n"
+                        .to_string(),
+                ),
+                "both install \"/opt/a/x\"",
+            ),
+        ] {
+            let err = format!("{:#}", parse(&with_pkg_section(&block)).unwrap_err());
+            assert!(err.contains(needle), "{block}\n=> {err}");
+        }
+    }
+
+    #[test]
+    fn optional_files_drop_per_component() {
+        let dir = optional_dir("pkg-components");
+        let text = with_pkg_section(&format!(
+            "[pkg]\n[[pkg.component]]\nname = \"a\"\ninstall-location = \"/opt\"\n\
+             files = [{{ src = \"dist/hello.exe\", dest = \"hello.exe\" }}, {ABSENT}]\n"
+        ));
+        let mut config = parse(&text).unwrap();
+        let pkg = config.pkg.as_mut().unwrap();
+        pkg.drop_absent_optional(&dir).unwrap();
+        let dests: Vec<&str> = pkg.component[0]
+            .files
+            .iter()
+            .map(|f| f.dest.as_str())
+            .collect();
+        assert_eq!(dests, ["hello.exe"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Fresh per-test dir holding `dist/hello.exe`, the only payload present.
