@@ -224,6 +224,47 @@ both. They use different directories (`<display-name>` and
 the MSI's `add-to-path` both directories end up on PATH and the first one
 wins, so uninstalling it silently hands the command to the other copy.
 
+## pkg components
+
+A flat `[pkg]` (`files`, `directories`, `install-location`, `scripts` directly
+in the section) builds one component named after `package.name` with receipt
+id `package.identifier`. To ship several receipts, install locations or script
+sets in one `.pkg`, list `[[pkg.component]]` tables instead:
+
+```toml
+[pkg]
+enable-user-home = false          # product-level
+
+[[pkg.component]]
+name = "app"                      # receipt id defaults to <package.identifier>.app
+install-location = "/Applications"
+files = [{ src = "build/Foo.app/Contents/MacOS/foo", dest = "Foo.app/Contents/MacOS/foo" }]
+
+[[pkg.component]]
+name = "daemon"
+identifier = "ca.example.foo.daemon"   # optional: keep an existing pkgbuild receipt
+install-location = "/Library/LaunchDaemons"
+files = [{ src = "launchd/foo.plist", dest = "foo.plist", mode = 0o644 }]
+scripts = "pkg-scripts/daemon"
+```
+
+Components install in config order, scripts included (`productbuild --package a.pkg --package b.pkg` order, checked with `installer` on macOS
+27.2), so a LaunchDaemon listed last can load its plist from `postinstall`
+with everything else in place. Every component shares `package.version`,
+needs at least one file, and takes `directories`, `mode` and `optional` as a
+flat `[pkg]` does.
+
+| Config | Error |
+| -- | -- |
+| flat payload keys and `[[pkg.component]]` together | `pkg: use either files/directories/install-location/scripts directly under [pkg] or [[pkg.component]] tables, not both` |
+| neither | `pkg: needs files and install-location, or [[pkg.component]] tables` |
+| a `name` outside `[A-Za-z0-9._-]`, starting with `.`, or `Distribution` | `pkg component name "..." must be [A-Za-z0-9._-]+, ...` |
+| two names equal ignoring case | `pkg: two components are named "..."` |
+| two identifiers equal (derived or set) | `pkg: two components share the identifier "..."` |
+| two components installing the same absolute file path, or a file where another needs a directory | `pkg: components "a" and "b" both install "..."` |
+
+Shared parent directories such as `/Library` are fine.
+
 ## Signing — SmartScreen & Gatekeeper
 
 embala artifacts are **signable**: an optional `[sign]` section in `embala.toml`
