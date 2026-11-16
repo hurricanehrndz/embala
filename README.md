@@ -142,6 +142,32 @@ registry = [
 All values share one component with a GUID derived from the identifier, so
 they live and die with the product: uninstall removes each value.
 
+## pkg directory sources and symlinks
+
+A `[pkg]` file entry's `src` can be a directory. Its whole tree installs under
+`dest`, and `dest = "."` puts the tree's contents directly at
+`install-location`:
+
+```toml
+[pkg]
+install-location = "/Applications"
+files = [{ src = "dist/Hello.app", dest = "Hello.app" }]
+```
+
+- Symlinks inside the tree ship as symlinks, as `pkgbuild --root` does, with
+  the target unchanged (relative, absolute, or dangling). They are never
+  followed, so `.app` bundles with framework `Versions/Current` links work. A
+  `src` that is itself a symlink is followed.
+- Files get `0755` if executable, else `0644`. Directories get `0755`.
+  Everything is owned by `root:wheel`. Setting `mode` on a directory entry is
+  an error; use `[[pkg.directories]]` to set a directory's mode.
+- A tree file whose dest matches another entry, or that sits where a
+  directory is needed, fails the build the same way two explicit entries
+  would.
+- Names and link targets must be valid UTF-8. Sockets, FIFOs, and device
+  files are rejected.
+- `optional = true` keeps a directory `src` that is present.
+
 ## nupkg install scripts and shims
 
 By default an embedded `.nupkg` ships its files under `tools/` with no install

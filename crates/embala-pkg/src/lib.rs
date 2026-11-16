@@ -75,7 +75,9 @@ pub enum Error {
     #[error("pkg: no files to package")]
     NoFiles,
 
-    #[error("pkg dest {0:?} must be a relative /-separated path without empty or '..' segments")]
+    #[error(
+        "pkg dest {0:?} must be a relative /-separated path without empty, '.' or '..' segments"
+    )]
     InvalidDest(String),
 
     #[error("pkg: two entries share the dest {0:?}")]
@@ -95,6 +97,24 @@ pub enum Error {
 
     #[error("pkg script {0} must be executable (installer cannot run it otherwise)")]
     ScriptNotExecutable(PathBuf),
+
+    // tree sources
+    #[error(
+        "pkg dest {0:?}: mode cannot be set on a directory src (tree files get 0755/0644 from their exec bit)"
+    )]
+    DirSrcMode(String),
+
+    #[error("pkg dest \".\" needs a directory src, but {0} is not one")]
+    DotDestNotDir(PathBuf),
+
+    #[error("pkg src path {0} is not valid UTF-8")]
+    NonUtf8Path(PathBuf),
+
+    #[error("pkg src symlink {0} has an empty target")]
+    EmptyLinkTarget(PathBuf),
+
+    #[error("pkg src {0} is not a regular file, directory, or symlink")]
+    UnsupportedFileType(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -107,12 +127,18 @@ const SHA1_LEN: u64 = 20;
 
 /// A payload file: `src` on disk (already resolved to a real path), `dest`
 /// the `/`-separated path relative to the install location.
+///
+/// `src` may be a directory: its tree installs under `dest` (`"."` puts the
+/// tree's contents at the install location itself). Symlinks inside the tree
+/// ship as symlinks with their target verbatim and are never followed; a
+/// `src` that is itself a symlink is followed.
 #[derive(Debug, Clone)]
 pub struct FileSpec {
     pub src: PathBuf,
     pub dest: String,
     /// Permission bits (`0o000`-`0o777`). `None` installs `0o755` if the
-    /// source is executable, else `0o644`.
+    /// source is executable, else `0o644`. Must be `None` for a directory
+    /// `src`, whose files take their mode from their own exec bit.
     pub mode: Option<u32>,
 }
 
@@ -154,10 +180,17 @@ pub struct PkgSpec {
 enum Node {
     Dir { mode: u32 },
     File { bytes: Vec<u8>, mode: u32 },
+    Symlink { target: String },
 }
 
 /// pkgbuild's mode for a directory nothing else describes.
 const DIR_MODE: u32 = 0o755;
+
+/// Full mode (type bits included) of a payload symlink. pkgbuild records the
+/// link's own lstat mode, which on macOS is `0755` under the usual umask
+/// (pinned on macOS 27.2: cpio and BOM both carry `0o120755`). Hosts disagree
+/// on link permissions (Linux reports `0777`), so the macOS value is fixed.
+const SYMLINK_MODE: u32 = 0o120755;
 
 /// Build the product-archive `.pkg` described by `spec` at `out` (parent
 /// dirs are created). Output is deterministic: fixed timestamps everywhere
@@ -195,23 +228,26 @@ pub fn build(spec: &PkgSpec, out: &Path) -> Result<()> {
 /// Payload tree model for `spec`: relative path -> node, sorted (BTreeMap
 /// order matches pkgbuild's cpio/BOM ordering: parents before children).
 fn payload_nodes(spec: &PkgSpec) -> Result<BTreeMap<String, Node>> {
+    let mut entries = Vec::new();
+    for file in &spec.files {
+        expand_file(file, &mut entries)?;
+    }
+    // validate() only saw the top-level dests; a tree can still collide with
+    // another entry, which the inserts below would silently overwrite.
+    check_expanded(&entries, &spec.directories)?;
+
     let mut nodes: BTreeMap<String, Node> = BTreeMap::new();
     let implied_dir = || Node::Dir { mode: DIR_MODE };
-    for file in &spec.files {
-        for ancestor in ancestors(&file.dest) {
+    for (dest, node) in entries {
+        for ancestor in ancestors(&dest) {
             nodes
                 .entry(ancestor.to_string())
                 .or_insert_with(implied_dir);
         }
-        let bytes = std::fs::read(&file.src)?;
-        let mode = match file.mode {
-            Some(mode) => mode,
-            None if executable(&file.src)? => 0o755,
-            None => 0o644,
-        };
-        nodes.insert(file.dest.clone(), Node::File { bytes, mode });
+        // Two trees may share a directory; it is the same 0o755 either way.
+        nodes.entry(dest).or_insert(node);
     }
-    // Declared directories override the implied mode; validation already
+    // Declared directories override the implied mode; the checks above
     // ruled out a declared directory landing on a file.
     for dir in &spec.directories {
         for ancestor in ancestors(&dir.dest) {
@@ -229,13 +265,16 @@ fn payload_nodes(spec: &PkgSpec) -> Result<BTreeMap<String, Node>> {
 /// counts every BOM path including the root ".". installKBytes uses
 /// pkgbuild's rule (pinned empirically against eight pkgbuild runs): every
 /// file occupies ceil(size/512) 512-byte blocks, every directory except the
-/// root occupies one block, and the total is rounded up to whole KiB.
+/// root occupies one block, and the total is rounded up to whole KiB. A
+/// symlink counts like a file whose content is its target (pinned on macOS
+/// 27.2: a 600-byte target adds two blocks, short ones one).
 fn payload_stats(nodes: &BTreeMap<String, Node>) -> (u32, u64) {
     let mut blocks = 0u64;
     for node in nodes.values() {
         blocks += match node {
             Node::Dir { .. } => 1,
             Node::File { bytes, .. } => (bytes.len() as u64).div_ceil(512),
+            Node::Symlink { target } => (target.len() as u64).div_ceil(512),
         };
     }
     (1 + nodes.len() as u32, blocks.div_ceil(2))
@@ -336,7 +375,8 @@ fn component_entry(component: &BuiltComponent) -> XarEntry<'_> {
 /// Check `spec` without touching the filesystem: dests are relative and
 /// unique, no file sits where a directory must be, and modes are permission
 /// bits only. [`build`] runs this first; it is public so callers can reject a
-/// bad layout before building anything.
+/// bad layout before building anything. What a directory `src` expands to is
+/// only known by reading it, so [`build`] checks the expanded tree again.
 pub fn validate(spec: &PkgSpec) -> Result<()> {
     if spec.files.is_empty() {
         return Err(Error::NoFiles);
@@ -351,7 +391,10 @@ pub fn validate(spec: &PkgSpec) -> Result<()> {
         .chain(spec.directories.iter().map(|d| (&d.dest, d.mode)));
     let mut seen = BTreeSet::new();
     for (dest, mode) in entries {
-        if dest.split('/').any(|s| s.is_empty() || s == "..") {
+        // A lone "." is a directory src's tree at the install location; a
+        // "." segment anywhere else would reach the BOM/cpio paths verbatim.
+        let bad_segment = |s: &str| s.is_empty() || s == "." || s == "..";
+        if dest != "." && dest.split('/').any(bad_segment) {
             return Err(Error::InvalidDest(dest.clone()));
         }
         if !seen.insert(dest.as_str()) {
@@ -431,6 +474,104 @@ fn ancestors(dest: &str) -> impl Iterator<Item = &str> {
     dest.char_indices()
         .filter(|(_, c)| *c == '/')
         .map(|(i, _)| &dest[..i])
+}
+
+/// Expand one [`FileSpec`] into `(dest, node)` entries: a single file, or a
+/// directory's whole tree (the directory itself included unless `dest` is
+/// `"."`).
+fn expand_file(file: &FileSpec, out: &mut Vec<(String, Node)>) -> Result<()> {
+    // `metadata`, not `symlink_metadata`: a top-level src that is a symlink
+    // is followed, as it always has been for file srcs.
+    if std::fs::metadata(&file.src)?.is_dir() {
+        if file.mode.is_some() {
+            return Err(Error::DirSrcMode(file.dest.clone()));
+        }
+        let prefix = if file.dest == "." {
+            ""
+        } else {
+            out.push((file.dest.clone(), Node::Dir { mode: DIR_MODE }));
+            file.dest.as_str()
+        };
+        return walk_tree(&file.src, prefix, out);
+    }
+    if file.dest == "." {
+        return Err(Error::DotDestNotDir(file.src.clone()));
+    }
+    let bytes = std::fs::read(&file.src)?;
+    let mode = match file.mode {
+        Some(mode) => mode,
+        None if executable(&file.src)? => 0o755,
+        None => 0o644,
+    };
+    out.push((file.dest.clone(), Node::File { bytes, mode }));
+    Ok(())
+}
+
+/// Append `dir`'s tree under `prefix` (`""` = the install location). Nested
+/// symlinks are recorded, never followed, so a link to a directory cannot
+/// pull in a second copy of a tree or loop forever.
+fn walk_tree(dir: &Path, prefix: &str, out: &mut Vec<(String, Node)>) -> Result<()> {
+    // Sorted so the walk (and which error surfaces first) does not depend on
+    // the host's readdir order; the payload itself is sorted later anyway.
+    let mut entries = std::fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| Error::NonUtf8Path(path.clone()))?;
+        let rel = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            let target = std::fs::read_link(&path)?
+                .into_os_string()
+                .into_string()
+                .map_err(|_| Error::NonUtf8Path(path.clone()))?;
+            if target.is_empty() {
+                return Err(Error::EmptyLinkTarget(path));
+            }
+            out.push((rel, Node::Symlink { target }));
+        } else if file_type.is_dir() {
+            out.push((rel.clone(), Node::Dir { mode: DIR_MODE }));
+            walk_tree(&path, &rel, out)?;
+        } else if file_type.is_file() {
+            let mode = if executable(&path)? { 0o755 } else { 0o644 };
+            let bytes = std::fs::read(&path)?;
+            out.push((rel, Node::File { bytes, mode }));
+        } else {
+            return Err(Error::UnsupportedFileType(path));
+        }
+    }
+    Ok(())
+}
+
+/// [`validate`]'s dest rules, applied to the expanded entries: no two files
+/// or symlinks share a dest, and none sits where a directory must be (a tree
+/// directory, a declared one, or any entry's ancestor). Directories may
+/// repeat: two trees can both contain `bin/`.
+fn check_expanded(entries: &[(String, Node)], declared: &[DirSpec]) -> Result<()> {
+    let mut dirs: BTreeSet<&str> = declared
+        .iter()
+        .flat_map(|d| ancestors(&d.dest).chain([d.dest.as_str()]))
+        .collect();
+    let mut leaves = BTreeSet::new();
+    for (dest, node) in entries {
+        dirs.extend(ancestors(dest));
+        if matches!(node, Node::Dir { .. }) {
+            dirs.insert(dest);
+        } else if !leaves.insert(dest.as_str()) {
+            return Err(Error::DuplicateDest(dest.clone()));
+        }
+    }
+    match leaves.into_iter().find(|leaf| dirs.contains(leaf)) {
+        Some(leaf) => Err(Error::DestConflict(leaf.to_string())),
+        None => Ok(()),
+    }
 }
 
 /// Does this payload file install as `0o755` rather than `0o644`?
@@ -518,6 +659,11 @@ fn payload_cpio(nodes: &BTreeMap<String, Node>) -> Vec<u8> {
             }
             Node::File { bytes, mode } => {
                 odc_record(&mut out, &name, 0o100000 | mode, 1, inode, mtime, bytes);
+            }
+            // pkgbuild stores the target as the data, with no NUL.
+            Node::Symlink { target } => {
+                let data = target.as_bytes();
+                odc_record(&mut out, &name, SYMLINK_MODE, 1, inode, mtime, data);
             }
         }
     }
@@ -884,6 +1030,9 @@ fn bom_from_nodes(nodes: &BTreeMap<String, Node>, uid: u32, gid: u32) -> Result<
                 let entry = builder.add_file_from_bytes(path, bytes)?;
                 entry.set_file_mode((0o100000 | (mode & 0o7777)) as u16);
                 entry.set_modified_time(mtime);
+            }
+            Node::Symlink { target } => {
+                builder.add_symlink(path, target, SYMLINK_MODE as u16)?;
             }
         }
     }

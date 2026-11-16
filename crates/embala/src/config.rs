@@ -56,10 +56,12 @@ pub struct FileEntry {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PkgFileEntry {
+    /// A file, or a directory whose tree installs under `dest` (`"."` for
+    /// the install location itself); symlinks inside it ship as symlinks.
     pub src: PathBuf,
     pub dest: String,
     /// Permission bits, e.g. `0o600`. Absent: `0o755` if `src` is
-    /// executable, else `0o644`.
+    /// executable, else `0o644`. Not allowed on a directory `src`.
     #[serde(default, deserialize_with = "permission_bits")]
     pub mode: Option<u32>,
     /// Drop the entry from the build when `src` is not found.
@@ -72,6 +74,11 @@ trait Payload {
     fn src(&self) -> &Path;
     fn dest(&self) -> &str;
     fn optional(&self) -> bool;
+    /// Whether a present directory `src` is valid. Only `[pkg]` expands
+    /// directory trees; the other formats take regular files only.
+    fn dir_src_allowed(&self) -> bool {
+        false
+    }
 }
 
 impl Payload for FileEntry {
@@ -96,6 +103,9 @@ impl Payload for PkgFileEntry {
     fn optional(&self) -> bool {
         self.optional
     }
+    fn dir_src_allowed(&self) -> bool {
+        true
+    }
 }
 
 /// An `optional` entry [`drop_absent`] removed: its dest and resolved src.
@@ -111,7 +121,7 @@ fn drop_absent<T: Payload>(section: &str, files: &mut Vec<T>, base: &Path) -> Re
     let mut kept = Vec::with_capacity(files.len());
     for file in files.drain(..) {
         let src = base.join(file.src());
-        if file.optional() && optional_src_absent(&src)? {
+        if file.optional() && optional_src_absent(&src, file.dir_src_allowed())? {
             eprintln!("{section}: skipped optional {} (not found)", src.display());
             dropped.push(Dropped {
                 dest: file.dest().to_string(),
@@ -130,8 +140,9 @@ fn drop_absent<T: Payload>(section: &str, files: &mut Vec<T>, base: &Path) -> Re
 /// follow symlinks and report a dangling one as absent. A dangling symlink,
 /// at `src` or at its nearest existing ancestor, is a broken build input, so
 /// it is an error, as is a present `src` that is not a regular file or any
-/// other I/O error (e.g. permission denied).
-fn optional_src_absent(src: &Path) -> Result<bool> {
+/// other I/O error (e.g. permission denied). With `dir_allowed` (`[pkg]`), a
+/// present directory counts as present too.
+fn optional_src_absent(src: &Path, dir_allowed: bool) -> Result<bool> {
     use std::io::ErrorKind::NotFound;
     // With a trailing separator or `.`, lstat follows a final symlink and a
     // dangling one reads as NotFound.
@@ -144,7 +155,7 @@ fn optional_src_absent(src: &Path) -> Result<bool> {
                     anyhow::Error::new(e).context(format!("reading optional src {}", src.display()))
                 }
             })?;
-            if !meta.is_file() {
+            if !(meta.is_file() || dir_allowed && meta.is_dir()) {
                 bail!("optional src {} is not a regular file", src.display());
             }
             Ok(false)
@@ -1640,11 +1651,35 @@ files = [{ src = "absent.exe", dest = "hello.exe", optional = true }, { src = "d
     #[test]
     fn only_not_found_counts_as_absent() {
         let dir = optional_dir("probe");
-        assert!(optional_src_absent(&dir.join("missing")).unwrap());
-        assert!(optional_src_absent(&dir.join("no/such/dir/file")).unwrap());
-        assert!(!optional_src_absent(&dir.join("dist/hello.exe")).unwrap());
-        let err = optional_src_absent(&dir.join("dist")).unwrap_err();
+        assert!(optional_src_absent(&dir.join("missing"), false).unwrap());
+        assert!(optional_src_absent(&dir.join("no/such/dir/file"), false).unwrap());
+        assert!(!optional_src_absent(&dir.join("dist/hello.exe"), false).unwrap());
+        let err = optional_src_absent(&dir.join("dist"), false).unwrap_err();
         assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+
+    #[test]
+    fn a_present_directory_is_kept_only_for_pkg() {
+        // Why: [pkg] installs a directory src as a tree, so an optional one
+        // that exists must ship; msi/nupkg/setup take files only and must
+        // keep rejecting it rather than silently packaging nothing.
+        let dir = optional_dir("pkg-dir");
+        let mut pkg: PkgSection = toml::from_str(
+            r#"install-location = "/usr/local"
+files = [{ src = "dist", dest = "lib/hello", optional = true }]"#,
+        )
+        .unwrap();
+        pkg.drop_absent_optional(&dir).unwrap();
+        assert_eq!(pkg.files.len(), 1);
+
+        let mut msi: MsiSection = toml::from_str(
+            r#"arch = "x86_64"
+main-executable = "hello.exe"
+files = [{ src = "dist", dest = "hello.exe", optional = true }]"#,
+        )
+        .unwrap();
+        let err = msi.drop_absent_optional(&dir).unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{err}");
     }
 
     #[cfg(unix)]
@@ -1654,18 +1689,18 @@ files = [{ src = "absent.exe", dest = "hello.exe", optional = true }, { src = "d
         // broken staging step must fail the build, not quietly drop a file.
         let dir = optional_dir("dangling");
         std::os::unix::fs::symlink(dir.join("gone"), dir.join("link")).unwrap();
-        let err = optional_src_absent(&dir.join("link")).unwrap_err();
+        let err = optional_src_absent(&dir.join("link"), false).unwrap_err();
         assert!(err.to_string().contains("dangling symlink"), "{err}");
-        let err = optional_src_absent(&dir.join("link/credentials")).unwrap_err();
+        let err = optional_src_absent(&dir.join("link/credentials"), false).unwrap_err();
         assert!(err.to_string().contains("dangling symlink"), "{err}");
         // A trailing separator makes lstat follow the link and report
         // NotFound, which must not read as an absent file.
         for spelling in ["link/", "link/."] {
-            let err = optional_src_absent(&dir.join(spelling)).unwrap_err();
+            let err = optional_src_absent(&dir.join(spelling), false).unwrap_err();
             assert!(err.to_string().contains("dangling symlink"), "{err}");
         }
         std::os::unix::fs::symlink(dir.join("dist/hello.exe"), dir.join("good")).unwrap();
-        assert!(!optional_src_absent(&dir.join("good")).unwrap());
+        assert!(!optional_src_absent(&dir.join("good"), false).unwrap());
     }
 
     #[test]
