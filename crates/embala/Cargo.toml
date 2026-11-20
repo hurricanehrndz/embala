@@ -36,4 +36,4 @@ embala-setup-overlay = { version = "0.15.0", path = "../embala-setup-overlay" }
 # and the setup.exe payload zip; the same crates the writers use.
 apple-xar = { version = "0.20", default-features = false }
 flate2 = "1"
-zip = "8"
+zip = "9"

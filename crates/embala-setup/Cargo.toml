@@ -22,7 +22,7 @@ embala-setup-overlay = { version = "0.15.0", path = "../embala-setup-overlay" }
 editpe = "0.2.3"
 thiserror = "2.0.18"
 # Deterministic payload zip, mirroring embala-nupkg's option style.
-zip = "8"
+zip = "9"
 
 [dev-dependencies]
 tempfile = "3"

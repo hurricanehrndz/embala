@@ -45,7 +45,7 @@ winsafe = { version = "0.0.28", features = [
 # Self-extraction reads the payload zip; Windows-only (the extractor runs only
 # there) with just the pure-Rust zlib-rs deflate backend so zig cross-linking
 # stays trivial — no bzip2/zstd/lzma C.
-zip = { version = "8", default-features = false, features = [
+zip = { version = "9", default-features = false, features = [
     "deflate-flate2-zlib-rs",
 ] }
 # WinHTTP (system TLS) for embala.download + sha2 for checksum verify — no
