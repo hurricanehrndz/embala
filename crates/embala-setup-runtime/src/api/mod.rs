@@ -566,12 +566,10 @@ fn apply_reversal(reversal: &Reversal) -> std::io::Result<()> {
             let _ = std::fs::remove_dir(path);
             Ok(())
         }
-        Reversal::DeleteRegistryValue {
-            hive,
-            key,
-            name,
-            remove_key_if_empty,
-        } => registry::reverse_registry(*hive, key, name.as_deref(), *remove_key_if_empty),
+        Reversal::DeleteRegistryValue { hive, key, name } => {
+            registry::reverse_registry(*hive, key, name.as_deref())
+        }
+        Reversal::RemoveKeyIfEmpty { hive, key } => registry::remove_key_if_empty(*hive, key),
         Reversal::DeleteArp { hive, identifier } => registry::reverse_arp(*hive, identifier),
         Reversal::DeleteEnv { name, scope } => registry::reverse_env(name, *scope),
     }

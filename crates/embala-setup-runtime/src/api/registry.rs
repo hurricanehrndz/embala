@@ -270,41 +270,42 @@ impl Engine {
 // Reversal executors (called from api::apply_reversal)
 // ---------------------------------------------------------------------------
 
-pub fn reverse_registry(
-    hive: Hive,
-    key: &str,
-    name: Option<&str>,
-    remove_key_if_empty: bool,
-) -> io::Result<()> {
+pub fn reverse_registry(hive: Hive, key: &str, name: Option<&str>) -> io::Result<()> {
+    if let Ok(guard) =
+        hive_key(hive).RegOpenKeyEx(Some(key), co::REG_OPTION::default(), co::KEY::WRITE)
+    {
+        let _ = guard.RegDeleteValue(name);
+    }
+    Ok(())
+}
+
+/// Delete `key` if it has no values or subkeys left ([`log::remove_key`]).
+/// A key that cannot be opened or counted is kept.
+pub fn remove_key_if_empty(hive: Hive, key: &str) -> io::Result<()> {
     let root = hive_key(hive);
-    let access = if remove_key_if_empty {
-        co::KEY::WRITE | co::KEY::QUERY_VALUE
-    } else {
-        co::KEY::WRITE
-    };
-    let Ok(guard) = root.RegOpenKeyEx(Some(key), co::REG_OPTION::default(), access) else {
+    let Ok(guard) = root.RegOpenKeyEx(Some(key), co::REG_OPTION::default(), co::KEY::QUERY_VALUE)
+    else {
         return Ok(());
     };
-    let _ = guard.RegDeleteValue(name);
-    if remove_key_if_empty {
-        let (mut subkeys, mut values) = (0, 0);
-        let counted = guard
-            .RegQueryInfoKey(
-                None,
-                Some(&mut subkeys),
-                None,
-                None,
-                Some(&mut values),
-                None,
-                None,
-                None,
-                None,
-            )
-            .is_ok();
-        drop(guard);
-        if counted && log::remove_key(remove_key_if_empty, values, subkeys) {
-            let _ = root.RegDeleteKey(key);
-        }
+    let (mut subkeys, mut values) = (0, 0);
+    let counted = guard
+        .RegQueryInfoKey(
+            None,
+            Some(&mut subkeys),
+            None,
+            None,
+            Some(&mut values),
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_ok();
+    drop(guard);
+    if counted && log::remove_key(values, subkeys) {
+        // Something could write to the key between the count and the delete;
+        // Win32 has no delete-if-empty, so that window stays.
+        let _ = root.RegDeleteKey(key);
     }
     Ok(())
 }
