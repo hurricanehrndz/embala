@@ -1,0 +1,3 @@
+# Match treefmt, which runs rustfmt with --edition 2024 while the crates are
+# edition 2021, so `cargo fmt` and editors agree with the committed style.
+style_edition = "2024"

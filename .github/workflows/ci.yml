@@ -1,0 +1,24 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/zig-toolchain
+      # msiextract: the embala-msi round-trip test fails rather than skips
+      # without it, as it would outside the devenv shell.
+      - run: sudo apt-get update -q && sudo apt-get install -yq msitools
+      # embala-setup include_bytes!-embeds both Windows stubs, so nothing in
+      # the workspace compiles until `just stubs` has built them.
+      - run: just stubs
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
