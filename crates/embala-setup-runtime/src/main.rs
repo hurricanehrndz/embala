@@ -21,6 +21,8 @@ mod cli;
 mod log;
 #[cfg(any(windows, test))]
 mod mode;
+#[cfg(any(windows, test))]
+mod rollback;
 // Pure wizard page-flow logic (spec R15/R16); host-testable, so its unit tests
 // run on Linux. The winsafe renderer that consumes it is Windows-only.
 #[cfg(any(windows, test))]

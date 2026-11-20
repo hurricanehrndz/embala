@@ -143,8 +143,10 @@ pub fn run(exe: &Path, args: &Args, attached: bool) -> ExitCode {
         }
     }
 
-    // Remove the sidecars we can delete directly.
+    // Remove the sidecars we can delete directly, and the partial log an
+    // install killed mid-run may have left.
     let _ = std::fs::remove_file(&log_path);
+    let _ = std::fs::remove_file(dir.join("install.log.partial"));
     let _ = std::fs::remove_file(&uninstall_lua);
     let _ = std::fs::remove_file(dir.join("manifest.json"));
 
@@ -202,7 +204,10 @@ fn run_uninstall_script(
     engine
         .borrow_mut()
         .seed_options(declared.clone(), selected.clone());
-    host::run_script(&engine, &script)
+    let result = host::run_script(&engine, &script);
+    // Uninstall never rolls back: drop any backups the script's own writes made.
+    engine.borrow().journal().discard();
+    result
 }
 
 /// Display name when the sidecar is missing/unparseable (spec R3 degrade): the

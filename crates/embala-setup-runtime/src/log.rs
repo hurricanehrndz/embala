@@ -15,7 +15,7 @@
 //! [R14]: uninstaller reversal semantics
 //! [`crate::api`]: the Win32 execution layer
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -113,12 +113,34 @@ pub fn decode(text: &str) -> Result<Vec<Record>, serde_json::Error> {
         .collect()
 }
 
+/// `install.log.partial` beside `log_path`: where a run flushes its records
+/// after each one. `install.log` itself is written only by [`commit`], so a
+/// failed run leaves an existing install's log, which its uninstaller replays,
+/// byte for byte as it was.
+pub fn partial_path(log_path: &Path) -> PathBuf {
+    log_path.with_extension("log.partial")
+}
+
+/// Best-effort flush of the records so far to the partial log.
+pub fn flush_partial(log_path: &Path, records: &[Record]) -> std::io::Result<()> {
+    std::fs::write(partial_path(log_path), encode(records))
+}
+
+/// The run succeeded: write `install.log` and drop the partial log.
+pub fn commit(log_path: &Path, records: &[Record]) -> std::io::Result<()> {
+    std::fs::write(log_path, encode(records))?;
+    let _ = std::fs::remove_file(partial_path(log_path));
+    Ok(())
+}
+
 /// Map an install log to its undo actions in **LIFO** order (spec R14).
 pub fn reversal_plan(records: &[Record]) -> Vec<Reversal> {
     records.iter().rev().map(reverse_one).collect()
 }
 
-fn reverse_one(record: &Record) -> Reversal {
+/// The undo action for one record. Also used by rollback for a record that
+/// replaced nothing ([`crate::rollback`]).
+pub fn reverse_one(record: &Record) -> Reversal {
     match record {
         Record::File { path } => Reversal::DeleteFile(path.clone()),
         Record::Mkdir { path } => Reversal::RemoveDirIfEmpty(path.clone()),
@@ -220,6 +242,87 @@ mod tests {
                 Reversal::RemoveDirIfEmpty(PathBuf::from("/opt/app")),
             ]
         );
+    }
+
+    #[test]
+    fn a_failed_run_leaves_the_previous_install_log_alone() {
+        // Why: after a failed upgrade the previous version's uninstaller is
+        // still on disk and replays install.log; if the run had replaced it, that
+        // uninstaller would no longer know what the previous install put where.
+        let dir = std::env::temp_dir().join(format!("embala-log-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log_path = dir.join("install.log");
+        let old = encode(&sample()[..2]);
+        std::fs::write(&log_path, &old).unwrap();
+
+        // A run records, then fails: rollback removes the partial log.
+        flush_partial(&log_path, &sample()).unwrap();
+        let _ = std::fs::remove_file(partial_path(&log_path));
+        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), old);
+
+        // A run records, then succeeds: its log replaces the old one.
+        flush_partial(&log_path, &sample()).unwrap();
+        commit(&log_path, &sample()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&log_path).unwrap(),
+            encode(&sample())
+        );
+        assert!(!partial_path(&log_path).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_log_written_by_0_12_0_still_decodes() {
+        // Why: the uninstaller on disk may be newer than the log beside it (an
+        // install made by 0.12.0, upgraded later). If the format drifts, the
+        // replay is skipped as unreadable and the whole install is left behind.
+        let text = concat!(
+            r#"{"op":"mkdir","path":"C:\\Program Files\\App"}"#,
+            "\n",
+            r#"{"op":"file","path":"C:\\Program Files\\App\\app.exe"}"#,
+            "\n",
+            r#"{"op":"shortcut","path":"C:\\ProgramData\\App.lnk"}"#,
+            "\n",
+            r#"{"op":"registry","hive":"hklm","key":"Software\\App","name":null,"key_created":true}"#,
+            "\n",
+            r#"{"op":"arp","hive":"hklm","identifier":"com.example.app"}"#,
+            "\n",
+            r#"{"op":"env","name":"APP_HOME","scope":"machine"}"#,
+            "\n",
+        );
+        let records = decode(text).expect("0.12.0 log decodes");
+        assert_eq!(
+            records,
+            vec![
+                Record::Mkdir {
+                    path: PathBuf::from(r"C:\Program Files\App"),
+                },
+                Record::File {
+                    path: PathBuf::from(r"C:\Program Files\App\app.exe"),
+                },
+                Record::Shortcut {
+                    path: PathBuf::from(r"C:\ProgramData\App.lnk"),
+                },
+                Record::Registry {
+                    hive: Hive::Hklm,
+                    key: r"Software\App".to_string(),
+                    name: None,
+                    key_created: true,
+                },
+                Record::Arp {
+                    hive: Hive::Hklm,
+                    identifier: "com.example.app".to_string(),
+                },
+                Record::Env {
+                    name: "APP_HOME".to_string(),
+                    scope: EnvScope::Machine,
+                },
+            ]
+        );
+        // This version writes the same bytes, so an older uninstaller can read
+        // a log written by this one.
+        assert_eq!(encode(&records), text);
     }
 
     #[test]

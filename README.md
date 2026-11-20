@@ -321,6 +321,58 @@ An installer's VERSIONINFO describes the installer, which is not always the
 app it installs: self-extracting archives often carry no version, and you
 have to extract the payload and run `info` on the inner exe.
 
+## setup.exe rollback and upgrades
+
+`setup.exe` runs `install.lua` against the `embala.*` API and journals each
+change it makes. If the script raises an error or the user cancels, setup
+rolls the run back, last change first, and leaves the machine as it was before
+the run, including when the run is an upgrade over an existing install:
+
+- A file written by `fs.copy`, `fs.copy_tree` or `download` over an existing
+  file gets the old contents back. A file the run created is deleted.
+- A shortcut from `shortcut.create` over an existing one is restored.
+- `arp.register` over an existing entry restores the entry's old values.
+- `registry.set` and `env.set` over an existing value restore the old value.
+  A value the run created is deleted, as before.
+- The existing `install.log` is left byte for byte, so the uninstaller already
+  on disk still removes the previous install. A successful run replaces it.
+
+Before overwriting a file, setup copies it to `%TEMP%\embala-backup-<pid>`.
+It deletes that directory when the run ends, whether it succeeded or rolled
+back.
+
+Commands run by `embala.exec` are not undone, except by the `undo` command
+you give with them. It runs only if this run rolls back, in reverse order
+with the other changes, and the uninstaller never runs it:
+
+```lua
+local exe = embala.install_dir .. "\\app.exe"
+-- Stop and remove the old service. On rollback, after the old app.exe is
+-- back, install the service from it again.
+embala.exec{ cmd = exe, args = { "-serviceremove" },
+             undo = { cmd = exe, args = { "-serviceinstall" } } }
+embala.fs.copy("app.exe", "app.exe")
+embala.arp.register{ ... }
+local r = embala.exec{ cmd = exe, args = { "-serviceinstall" } }
+if r.code ~= 0 then error("service install failed: " .. r.code) end
+```
+
+`undo` takes `cmd`, `args` and `cwd`, like `exec`. Setup records it before the
+command starts, so it runs on rollback even if the command failed. Its exit
+code is ignored, and a failing `undo` does not stop the rest of the rollback.
+
+Limits:
+
+- `fs.remove`, `fs.remove_tree` and `registry.delete` are not journaled, so
+  rollback does not bring back what they removed.
+- A restore fails if the file is in use, for example an exe the run started.
+  Setup skips it and continues.
+- If the process is killed (not cancelled), nothing is rolled back. The
+  previous `install.log` stays as it was. The run's records are in
+  `install.log.partial` and the backups stay in `%TEMP%\embala-backup-<pid>`.
+- The uninstaller reverses only what the last successful run logged. A file
+  only an earlier version installed is left behind.
+
 ## Signing — SmartScreen & Gatekeeper
 
 embala artifacts are **signable**: an optional `[sign]` section in `embala.toml`

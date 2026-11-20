@@ -53,9 +53,10 @@ unsafe extern "system" fn ctrl_handler(ctrl_type: u32) -> i32 {
 }
 
 /// Register the Ctrl+C/Ctrl+Break handler. Best-effort; a failure just means the
-/// default (immediate terminate) applies, which is still safe (no partial ARP is
-/// left because rollback only runs on a caught cancel — an OS kill leaves the
-/// install log for the uninstaller).
+/// default (immediate terminate) applies: rollback only runs on a caught cancel,
+/// and an OS kill skips it, leaving what the run did so far, an existing
+/// install's `install.log`, the run's records in `install.log.partial` and the
+/// backups of overwritten files under `%TEMP%\embala-backup-<pid>`.
 pub fn install_ctrl_handler() {
     unsafe {
         SetConsoleCtrlHandler(Some(ctrl_handler), TRUE);

@@ -1,7 +1,9 @@
 //! Install flow (spec R9/R13/R14): resolve the mode (relaunching elevated for
 //! per-machine), extract the payload to a staging dir, run `install.lua` over the
 //! `embala.*` host, then write the uninstaller. On any script error or cancel the
-//! in-memory install log is replayed LIFO so no partial install survives.
+//! in-memory journal is unwound LIFO, so the machine is left as it was before
+//! the run: files, shortcuts and registry values it overwrote are restored, what
+//! it created is removed, and an existing install's `install.log` is untouched.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -129,6 +131,7 @@ fn do_install(
             // the engine's final value for the uninstaller + completion message.
             let final_dir = engine.borrow().install_dir().to_path_buf();
             write_uninstaller(exe, trailer, &final_dir, manifest, &engine.borrow())?;
+            engine.borrow().journal().discard();
             let _ = std::fs::remove_dir_all(&payload_dir);
             if created_default_dir && final_dir != install_dir {
                 let _ = std::fs::remove_dir(&install_dir);
@@ -144,18 +147,15 @@ fn do_install(
             ))
         }
         Err(e) => {
-            // Close the wizard, then reverse everything logged so far, LIFO (spec
-            // R14 engine), and drop the staging dir + flushed log + install dir.
+            // Close the wizard, then unwind this run LIFO (spec R14 engine):
+            // restore what it overwrote, reverse what it created, run its undo
+            // commands. Then drop the staging dir, the partial log and the
+            // install dir if empty. `install.log` is only written on success, so
+            // an existing install's log is left as it was for its uninstaller.
             engine.borrow_mut().close_ui();
-            let records = engine.borrow().records().to_vec();
-            api::reverse_all(&records);
+            api::roll_back(engine.borrow().journal());
             let final_dir = engine.borrow().install_dir().to_path_buf();
-            // `install.log` is flushed with the first record, so with no records
-            // this run wrote none, and the file there belongs to an existing
-            // install the script refused to replace: its uninstaller needs it.
-            if !records.is_empty() {
-                let _ = std::fs::remove_file(final_dir.join("install.log"));
-            }
+            let _ = std::fs::remove_file(engine.borrow().partial_log_path());
             let _ = std::fs::remove_dir_all(&payload_dir);
             let _ = std::fs::remove_dir(&final_dir);
             if created_default_dir && final_dir != install_dir {

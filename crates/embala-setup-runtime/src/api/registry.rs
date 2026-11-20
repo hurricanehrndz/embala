@@ -11,6 +11,7 @@ use winsafe::{self as w, co, msg};
 
 use super::{Engine, to_lua};
 use crate::log::{EnvScope, Hive, Record};
+use crate::rollback::Prior;
 
 /// The Uninstall root the ARP entry lives under (spec R11/R14).
 const UNINSTALL_ROOT: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall";
@@ -151,12 +152,21 @@ impl Engine {
         value: w::RegistryValue,
     ) -> io::Result<()> {
         let (guard, created) = create_key(hive, key)?;
-        self.record(Record::Registry {
-            hive,
-            key: key.to_string(),
-            name: name.map(str::to_string),
-            key_created: created,
-        });
+        let prior = if created {
+            None
+        } else {
+            registry_get(hive, key, name)?
+                .map(|v| Prior::Values(vec![(name.unwrap_or_default().to_string(), v)]))
+        };
+        self.record_over(
+            Record::Registry {
+                hive,
+                key: key.to_string(),
+                name: name.map(str::to_string),
+                key_created: created,
+            },
+            prior,
+        );
         guard.RegSetValueEx(name, value).map_err(win)?;
         Ok(())
     }
@@ -181,11 +191,18 @@ impl Engine {
         let hive = self.mode.hive();
         let identifier = self.manifest.package.identifier.clone();
         let key = format!(r"{UNINSTALL_ROOT}\{identifier}");
-        let (guard, _created) = create_key(hive, &key)?;
+        let (guard, created) = create_key(hive, &key)?;
+        // Over an existing entry (an upgrade), save its values first so
+        // rollback puts them back instead of deleting the entry.
+        let prior = if created {
+            None
+        } else {
+            Some(Prior::Values(read_values(hive, &key)?))
+        };
 
         // Reversal deletes the whole Uninstall\<id> key regardless of who created
         // it, so the record is an `Arp` (not a plain Registry value).
-        self.record(Record::Arp { hive, identifier });
+        self.record_over(Record::Arp { hive, identifier }, prior);
 
         let sz = |v: &str| w::RegistryValue::Sz(v.to_string());
         guard
@@ -230,10 +247,15 @@ impl Engine {
         let scope = parse_scope(scope, self.mode);
         let (hive, key) = env_location(scope);
         let (guard, _created) = create_key(hive, key)?;
-        self.record(Record::Env {
-            name: name.to_string(),
-            scope,
-        });
+        let prior = registry_get(hive, key, Some(name))?
+            .map(|v| Prior::Values(vec![(name.to_string(), v)]));
+        self.record_over(
+            Record::Env {
+                name: name.to_string(),
+                scope,
+            },
+            prior,
+        );
         // ExpandSz so a value containing %VARS% (e.g. a PATH addition) expands.
         guard
             .RegSetValueEx(Some(name), w::RegistryValue::ExpandSz(value.to_string()))
@@ -268,6 +290,33 @@ pub fn reverse_registry(
 pub fn reverse_arp(hive: Hive, identifier: &str) -> io::Result<()> {
     let key = format!(r"{UNINSTALL_ROOT}\{identifier}");
     let _ = hive_key(hive).RegDeleteTree(Some(&key));
+    Ok(())
+}
+
+/// Rollback only: put back the values `record` overwrote. For an ARP entry the
+/// values this run wrote are dropped first, so the key ends as it was.
+pub fn restore(record: &Record, values: &[(String, w::RegistryValue)]) -> io::Result<()> {
+    let (hive, key) = match record {
+        Record::Arp { hive, identifier } => (*hive, format!(r"{UNINSTALL_ROOT}\{identifier}")),
+        Record::Registry { hive, key, .. } => (*hive, key.clone()),
+        Record::Env { scope, .. } => {
+            let (hive, key) = env_location(*scope);
+            (hive, key.to_string())
+        }
+        _ => return Ok(()),
+    };
+    let (guard, _created) = create_key(hive, &key)?;
+    if matches!(record, Record::Arp { .. }) {
+        for name in value_names(hive, &key).unwrap_or_default() {
+            let _ = guard.RegDeleteValue(Some(&name));
+        }
+    }
+    for (name, value) in values {
+        let _ = guard.RegSetValueEx(Some(name), value.clone());
+    }
+    if matches!(record, Record::Env { .. }) {
+        broadcast_env_change();
+    }
     Ok(())
 }
 
@@ -308,6 +357,31 @@ fn registry_get(hive: Hive, key: &str, name: Option<&str>) -> io::Result<Option<
         Err(co::ERROR::FILE_NOT_FOUND) => Ok(None),
         Err(e) => Err(win(e)),
     }
+}
+
+/// The names of every value under `key` (`""` = the default value).
+fn value_names(hive: Hive, key: &str) -> io::Result<Vec<String>> {
+    let guard = hive_key(hive)
+        .RegOpenKeyEx(Some(key), co::REG_OPTION::default(), co::KEY::READ)
+        .map_err(win)?;
+    let names = guard
+        .RegEnumValue()
+        .map_err(win)?
+        .map(|v| v.map(|(name, _kind)| name).map_err(win))
+        .collect();
+    names
+}
+
+/// Every value under `key`, to restore on rollback. A type winsafe does not
+/// map reads back as `REG_NONE` and is restored as such (no ARP value uses one).
+fn read_values(hive: Hive, key: &str) -> io::Result<Vec<(String, w::RegistryValue)>> {
+    value_names(hive, key)?
+        .into_iter()
+        .map(|name| {
+            let value = registry_get(hive, key, Some(&name))?.unwrap_or(w::RegistryValue::None);
+            Ok((name, value))
+        })
+        .collect()
 }
 
 /// Create-or-open `key` under `hive`, returning the guard and whether this call

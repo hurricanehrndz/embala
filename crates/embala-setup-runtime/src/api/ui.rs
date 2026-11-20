@@ -230,7 +230,7 @@ impl Engine {
         if new == self.install_dir {
             return Ok(());
         }
-        if !self.records.is_empty() {
+        if !self.journal.records().is_empty() {
             return Err("ui.page{kind=directory} must run before any install action".to_string());
         }
         self.log_path = new.join("install.log");
