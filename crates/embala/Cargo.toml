@@ -19,7 +19,7 @@ embala-pkg = { version = "0.15.0", path = "../embala-pkg" }
 embala-setup = { version = "0.15.0", path = "../embala-setup" }
 editpe = "0.2.3"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
-msi = "0.10"
+msi = "0.11"
 plist = "1"
 semver = "1.0.28"
 serde = { version = "1.0.228", features = ["derive"] }
