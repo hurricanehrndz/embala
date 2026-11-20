@@ -52,7 +52,7 @@ zip = { version = "8", default-features = false, features = [
 # rustls/openssl pulled in. windows-sys covers the Win32 bits winsafe 0.0.28
 # lacks: WinHTTP, RtlGetVersion, SetConsoleCtrlHandler, and ShellExecuteExW with
 # a process handle to wait on (winsafe's ShellExecuteEx drops the child handle).
-sha2 = "0.10"
+sha2 = "0.11"
 windows-sys = { version = "0.61", features = [
     "Wdk_System_SystemServices",       # RtlGetVersion
     "Win32_Foundation",
