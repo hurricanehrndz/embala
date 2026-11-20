@@ -10,7 +10,7 @@ use mlua::{Lua, Table};
 use winsafe::{self as w, co, msg};
 
 use super::{Engine, to_lua};
-use crate::log::{EnvScope, Hive, Record};
+use crate::log::{self, EnvScope, Hive, Record};
 use crate::rollback::Prior;
 
 /// The Uninstall root the ARP entry lives under (spec R11/R14).
@@ -274,21 +274,44 @@ pub fn reverse_registry(
     hive: Hive,
     key: &str,
     name: Option<&str>,
-    delete_key: bool,
+    remove_key_if_empty: bool,
 ) -> io::Result<()> {
     let root = hive_key(hive);
-    if delete_key {
-        // The install created the key: remove it and everything under it.
-        let _ = root.RegDeleteTree(Some(key));
-    } else if let Ok(guard) =
-        root.RegOpenKeyEx(Some(key), co::REG_OPTION::default(), co::KEY::WRITE)
-    {
-        let _ = guard.RegDeleteValue(name);
+    let access = if remove_key_if_empty {
+        co::KEY::WRITE | co::KEY::QUERY_VALUE
+    } else {
+        co::KEY::WRITE
+    };
+    let Ok(guard) = root.RegOpenKeyEx(Some(key), co::REG_OPTION::default(), access) else {
+        return Ok(());
+    };
+    let _ = guard.RegDeleteValue(name);
+    if remove_key_if_empty {
+        let (mut subkeys, mut values) = (0, 0);
+        let counted = guard
+            .RegQueryInfoKey(
+                None,
+                Some(&mut subkeys),
+                None,
+                None,
+                Some(&mut values),
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_ok();
+        drop(guard);
+        if counted && log::remove_key(remove_key_if_empty, values, subkeys) {
+            let _ = root.RegDeleteKey(key);
+        }
     }
     Ok(())
 }
 
 pub fn reverse_arp(hive: Hive, identifier: &str) -> io::Result<()> {
+    // The package's own `Uninstall\<identifier>` entry, which nothing else
+    // writes to: the whole tree goes, unlike a `registry.set` key.
     let key = format!(r"{UNINSTALL_ROOT}\{identifier}");
     let _ = hive_key(hive).RegDeleteTree(Some(&key));
     Ok(())

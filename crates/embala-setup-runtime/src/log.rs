@@ -54,8 +54,8 @@ pub enum Record {
     /// A `.lnk` shortcut was created at `path`. Reverse: delete it.
     Shortcut { path: PathBuf },
     /// A registry value was set. `key_created` records whether *this* call
-    /// created the key (so reversal can delete the whole key, not just the
-    /// value). Kept simple: only a key created by this install is removed.
+    /// created the key. Reverse: delete the value, then the key if this
+    /// install created it and nothing else is left in it.
     Registry {
         hive: Hive,
         key: String,
@@ -81,8 +81,9 @@ pub enum Reversal {
         hive: Hive,
         key: String,
         name: Option<String>,
-        /// Delete the whole key after the value (the install created it).
-        delete_key: bool,
+        /// After the value, delete the key if it is left empty (the install
+        /// created it). See [`remove_key`].
+        remove_key_if_empty: bool,
     },
     DeleteArp {
         hive: Hive,
@@ -273,26 +274,61 @@ fn dedupe_key(record: &Record) -> String {
 
 /// Map an install log to its undo actions in **LIFO** order (spec R14).
 pub fn reversal_plan(records: &[Record]) -> Vec<Reversal> {
-    records.iter().rev().map(reverse_one).collect()
+    let created = created_keys(records);
+    records
+        .iter()
+        .rev()
+        .map(|r| reverse_one(r, &created))
+        .collect()
+}
+
+/// The registry keys `records` say this install created, as hive + key,
+/// case-insensitive. Each value under such a key may remove it once empty,
+/// so the key goes with whichever of its values is reversed last.
+pub fn created_keys(records: &[Record]) -> BTreeSet<String> {
+    records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Registry {
+                hive,
+                key,
+                key_created: true,
+                ..
+            } => Some(key_id(*hive, key)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn key_id(hive: Hive, key: &str) -> String {
+    format!("{hive:?}\0{}", key.to_lowercase())
+}
+
+/// Whether to delete a registry key once a reversal has deleted its value:
+/// only a key the install created, and only if no value or subkey is left,
+/// as a directory is removed only if empty. Anything left was written by
+/// something else (another product, an administrator, the app itself).
+/// Win32 `RegDeleteKey` deletes a key that still holds values, so the caller
+/// counts them rather than relying on the delete to fail.
+pub fn remove_key(remove_key_if_empty: bool, values: u32, subkeys: u32) -> bool {
+    remove_key_if_empty && values == 0 && subkeys == 0
 }
 
 /// The undo action for one record. Also used by rollback for a record that
-/// replaced nothing ([`crate::rollback`]).
-pub fn reverse_one(record: &Record) -> Reversal {
+/// replaced nothing ([`crate::rollback`]). `created` is [`created_keys`] of the
+/// records being reversed.
+pub fn reverse_one(record: &Record, created: &BTreeSet<String>) -> Reversal {
     match record {
         Record::File { path } => Reversal::DeleteFile(path.clone()),
         Record::Mkdir { path } => Reversal::RemoveDirIfEmpty(path.clone()),
         Record::Shortcut { path } => Reversal::DeleteShortcut(path.clone()),
         Record::Registry {
-            hive,
-            key,
-            name,
-            key_created,
+            hive, key, name, ..
         } => Reversal::DeleteRegistryValue {
             hive: *hive,
             key: key.clone(),
             name: name.clone(),
-            delete_key: *key_created,
+            remove_key_if_empty: created.contains(&key_id(*hive, key)),
         },
         Record::Arp { hive, identifier } => Reversal::DeleteArp {
             hive: *hive,
@@ -642,8 +678,82 @@ mod tests {
                 hive: Hive::Hklm,
                 key: r"Software\X".to_string(),
                 name: None,
-                delete_key: false,
+                remove_key_if_empty: false,
             }]
+        );
+    }
+
+    /// Replay a plan's registry reversals on one key holding `values` and
+    /// `subkeys`, as `api::registry::reverse_registry` does. Whether the key
+    /// was removed.
+    fn replay(plan: &[Reversal], values: &[&str], subkeys: u32) -> bool {
+        let mut values: BTreeSet<String> = values.iter().map(|v| v.to_string()).collect();
+        for reversal in plan {
+            if let Reversal::DeleteRegistryValue {
+                name,
+                remove_key_if_empty,
+                ..
+            } = reversal
+            {
+                values.remove(name.as_deref().unwrap());
+                if remove_key(*remove_key_if_empty, values.len() as u32, subkeys) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn a_created_key_is_removed_only_when_nothing_else_is_left_in_it() {
+        // Why: a created key may later hold another product's values or an
+        // administrator's subkey; uninstall must remove only what it wrote,
+        // as it does for a folder. Win32 deletes a key that still has values,
+        // so the value count must be part of the decision.
+        let plan = reversal_plan(&[reg("Version", true)]);
+        assert!(replay(&plan, &["Version"], 0), "empty: removed");
+        assert!(!replay(&plan, &["Version", "Foreign"], 0), "foreign value");
+        assert!(!replay(&plan, &["Version"], 1), "subkey");
+        let not_created = reversal_plan(&[reg("Version", false)]);
+        assert!(!replay(&not_created, &["Version"], 0), "never created");
+    }
+
+    #[test]
+    fn a_created_key_goes_with_its_last_value_in_any_order() {
+        // Why: only the call that created the key records it, and an upgrade's
+        // merge can move that record before its siblings in the log. Whichever
+        // of the install's values is reversed last must still remove the key.
+        for records in [
+            vec![reg("A", true), reg("B", false)],
+            vec![reg("B", false), reg("A", true)],
+        ] {
+            let plan = reversal_plan(&records);
+            assert!(replay(&plan, &["A", "B"], 0), "{records:?}");
+            assert!(!replay(&plan, &["A", "B", "Foreign"], 0), "{records:?}");
+        }
+        // Keys match case-insensitively, per hive.
+        let other_case = Record::Registry {
+            hive: Hive::Hklm,
+            key: r"SOFTWARE\APP".to_string(),
+            name: Some("B".to_string()),
+            key_created: false,
+        };
+        let plan = reversal_plan(&[other_case, reg("A", true)]);
+        assert!(replay(&plan, &["A", "B"], 0));
+        let hkcu = Record::Registry {
+            hive: Hive::Hkcu,
+            key: r"Software\App".to_string(),
+            name: Some("B".to_string()),
+            key_created: false,
+        };
+        assert_eq!(
+            reversal_plan(&[hkcu, reg("A", true)])[1],
+            Reversal::DeleteRegistryValue {
+                hive: Hive::Hkcu,
+                key: r"Software\App".to_string(),
+                name: Some("B".to_string()),
+                remove_key_if_empty: false,
+            }
         );
     }
 }

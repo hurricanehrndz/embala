@@ -170,6 +170,9 @@ impl Journal {
 
     /// The rollback actions, LIFO.
     pub fn rollback_plan(&self) -> Vec<Action> {
+        // Only keys this run created: a key an earlier install created is
+        // left to its uninstaller.
+        let created = log::created_keys(&self.records());
         self.steps
             .iter()
             .rev()
@@ -184,7 +187,7 @@ impl Journal {
                 Step::Record {
                     record,
                     prior: None,
-                } => Action::Reverse(log::reverse_one(record)),
+                } => Action::Reverse(log::reverse_one(record, &created)),
                 Step::Sidecar {
                     path,
                     prior: Some(prior),
@@ -460,6 +463,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn rollback_removes_only_a_key_this_run_created_and_only_if_empty() {
+        // Why: a failed fresh install must leave no key it created behind,
+        // whichever of its values is reversed last, but a key that existed
+        // before the run (an upgrade) is never removed by its rollback.
+        let reg = |key: &str, name: &str, key_created| Record::Registry {
+            hive: log::Hive::Hkcu,
+            key: key.to_string(),
+            name: Some(name.to_string()),
+            key_created,
+        };
+        let mut j = Journal::new(tmp("reg-rollback").join("backup"));
+        j.push(reg(r"Software\New", "A", true), None);
+        j.push(reg(r"Software\New", "B", false), None);
+        j.push(reg(r"Software\Old", "C", false), None);
+        let remove: Vec<_> = j
+            .rollback_plan()
+            .iter()
+            .map(|a| match a {
+                Action::Reverse(Reversal::DeleteRegistryValue {
+                    name,
+                    remove_key_if_empty,
+                    ..
+                }) => (name.clone().unwrap(), *remove_key_if_empty),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            remove,
+            vec![
+                ("C".to_string(), false),
+                ("B".to_string(), true),
+                ("A".to_string(), true),
+            ]
+        );
+    }
+
     /// An existing install: its log, uninstaller and script, and app.exe "v1".
     /// Returns the journal after a run overwrote app.exe with "v2".
     /// The previous install's records: app.exe and old.dll.
@@ -680,7 +720,7 @@ mod tests {
             hive: log::Hive::Hklm,
             key: r"Software\App".to_string(),
             name: Some("Version".to_string()),
-            delete_key: true,
+            remove_key_if_empty: true,
         }));
         for reversal in &plan {
             match reversal {

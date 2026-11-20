@@ -570,8 +570,8 @@ fn apply_reversal(reversal: &Reversal) -> std::io::Result<()> {
             hive,
             key,
             name,
-            delete_key,
-        } => registry::reverse_registry(*hive, key, name.as_deref(), *delete_key),
+            remove_key_if_empty,
+        } => registry::reverse_registry(*hive, key, name.as_deref(), *remove_key_if_empty),
         Reversal::DeleteArp { hive, identifier } => registry::reverse_arp(*hive, identifier),
         Reversal::DeleteEnv { name, scope } => registry::reverse_env(name, *scope),
     }
