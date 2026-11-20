@@ -378,8 +378,13 @@ Limits:
 - If the process is killed (not cancelled), nothing is rolled back. The
   previous `install.log` stays as it was. The run's records are in
   `install.log.partial` and the backups stay in `%TEMP%\embala-backup-<pid>`.
-- The uninstaller reverses only what the last successful run logged. A file
-  only an earlier version installed is left behind.
+- A successful run over an existing install keeps the previous
+  `install.log`'s records and adds its own, one entry per file, folder,
+  shortcut, registry value, ARP entry and environment variable. So the
+  uninstaller removes what any version installed, including a file or a
+  setting a later version stopped shipping, and the install folder ends
+  empty. A previous log that cannot be read is dropped, with a line on
+  stderr, and the new log lists only this run.
 
 ## Signing — SmartScreen & Gatekeeper
 

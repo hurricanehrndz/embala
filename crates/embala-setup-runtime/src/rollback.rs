@@ -203,7 +203,8 @@ impl Journal {
 
 /// End an install run. If the script succeeded, `write_uninstaller` writes the
 /// uninstaller's files through the journal, then `install.log` is written the
-/// same way. If the script or either write failed, the whole run rolls back
+/// same way: the previous log's records, if `log_path` held one, merged with
+/// this run's ([`log::committed_records`]). If the script or either write failed, the whole run rolls back
 /// (`system` as for [`Journal::roll_back`]), so the uninstaller and the log on
 /// disk are the previous install's again. Else the backups are discarded. The
 /// partial log is removed either way.
@@ -214,12 +215,21 @@ pub fn conclude(
     write_uninstaller: impl FnOnce(&mut Journal) -> Result<(), String>,
     system: impl FnMut(&Action) -> io::Result<()>,
 ) -> Result<(), String> {
+    // An existing install's log, read before this run writes its own over it:
+    // its records are carried into the new log. Missing or unreadable as text
+    // counts as none.
+    let previous = std::fs::read(log_path)
+        .ok()
+        .map(|b| String::from_utf8_lossy(&b).into_owned());
     let result = script
         .and_then(|()| write_uninstaller(journal))
         .and_then(|()| {
-            let text = log::encode(&journal.records());
+            let (records, warning) = log::committed_records(previous.as_deref(), journal.records());
+            if let Some(warning) = warning {
+                eprintln!("setup: {warning}");
+            }
             journal
-                .write_sidecar(log_path, text.as_bytes())
+                .write_sidecar(log_path, log::encode(&records).as_bytes())
                 .map_err(|e| e.to_string())
         });
     match result {
@@ -510,6 +520,80 @@ mod tests {
         assert!(!dir.join("uninstall.lua").exists());
         assert!(!dir.join("install.log.partial").exists());
         assert!(!dir.join("backup").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn after_an_upgrade_the_uninstaller_removes_what_only_v1_owned() {
+        // Why: v2's own records do not know v1 created the data folder and the
+        // registry key, or shipped old.dll; the committed log must, so that
+        // uninstall leaves nothing behind.
+        let dir = tmp("carry");
+        let data = dir.join("data");
+        std::fs::create_dir(&data).unwrap();
+        for f in ["app.exe", "old.dll", "data/a.txt"] {
+            std::fs::write(dir.join(f), "v1").unwrap();
+        }
+        let key = Record::Registry {
+            hive: log::Hive::Hklm,
+            key: r"Software\App".to_string(),
+            name: Some("Version".to_string()),
+            key_created: true,
+        };
+        let v1 = vec![
+            Record::Mkdir { path: data.clone() },
+            Record::File {
+                path: data.join("a.txt"),
+            },
+            Record::File {
+                path: dir.join("app.exe"),
+            },
+            Record::File {
+                path: dir.join("old.dll"),
+            },
+            key,
+        ];
+        let log_path = dir.join("install.log");
+        std::fs::write(&log_path, log::encode(&v1)).unwrap();
+
+        // v2: overwrites app.exe and a.txt, adds b.txt, sets the value in the
+        // now-existing key, drops old.dll.
+        let mut j = Journal::new(dir.join("backup"));
+        write_over(&mut j, &dir.join("app.exe"), "v2");
+        write_over(&mut j, &data.join("a.txt"), "v2");
+        write_over(&mut j, &data.join("b.txt"), "v2");
+        j.push(
+            Record::Registry {
+                hive: log::Hive::Hklm,
+                key: r"Software\App".to_string(),
+                name: Some("Version".to_string()),
+                key_created: false,
+            },
+            None,
+        );
+        let result = conclude(&mut j, &log_path, Ok(()), |_| Ok(()), host_system);
+        assert_eq!(result, Ok(()));
+
+        // The uninstaller's replay of the committed log.
+        let plan = log::reversal_plan(&log::decode(&read(log_path.clone())).unwrap());
+        assert!(plan.contains(&Reversal::DeleteRegistryValue {
+            hive: log::Hive::Hklm,
+            key: r"Software\App".to_string(),
+            name: Some("Version".to_string()),
+            delete_key: true,
+        }));
+        for reversal in &plan {
+            match reversal {
+                Reversal::DeleteFile(p) => std::fs::remove_file(p).unwrap(),
+                Reversal::RemoveDirIfEmpty(p) => std::fs::remove_dir(p).unwrap(),
+                _ => {}
+            }
+        }
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("install.log")]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

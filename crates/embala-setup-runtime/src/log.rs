@@ -15,6 +15,7 @@
 //! [R14]: uninstaller reversal semantics
 //! [`crate::api`]: the Win32 execution layer
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -126,6 +127,96 @@ pub fn flush_partial(log_path: &Path, records: &[Record]) -> std::io::Result<()>
     std::fs::write(partial_path(log_path), encode(records))
 }
 
+/// The records a successful run commits to `install.log`. `previous` is the
+/// install's existing log text (`None` when there is none): its records are
+/// carried forward ahead of this run's ([`merge`]), so the uninstaller removes
+/// what any version installed. A fresh install commits `current` unchanged.
+/// A previous log that does not decode is dropped with a warning (returned),
+/// not an error: the install itself succeeded.
+pub fn committed_records(
+    previous: Option<&str>,
+    current: Vec<Record>,
+) -> (Vec<Record>, Option<String>) {
+    match previous.map(decode) {
+        None => (current, None),
+        Some(Ok(previous)) => (merge(&previous, &current), None),
+        Some(Err(e)) => (
+            current,
+            Some(format!(
+                "previous install.log unreadable ({e}); it lists only this install now"
+            )),
+        ),
+    }
+}
+
+/// The previous log's records followed by this run's, one record per thing
+/// owned. The dedupe key is case-insensitive (Windows paths and registry names
+/// are): a path for `File`, `Mkdir` and `Shortcut` (each kind separately);
+/// hive + key + value name for `Registry`; hive + identifier for `Arp`; name +
+/// scope for `Env`.
+///
+/// Position decides LIFO reversal order. A `Mkdir` stays at its earliest
+/// position, so it is reversed after every file put under it by any version.
+/// Every other record moves to its latest position: removing a file or value
+/// early never hurts. Ownership is sticky: if any occurrence of a registry
+/// value says this product created the key, the merged record does too.
+/// Merging a run's own records again changes nothing, so the log stays bounded
+/// across repeated upgrades and reinstalls.
+pub fn merge(previous: &[Record], current: &[Record]) -> Vec<Record> {
+    let all: Vec<&Record> = previous.iter().chain(current).collect();
+    let keys: Vec<String> = all.iter().map(|r| dedupe_key(r)).collect();
+    let created: BTreeSet<&str> = all
+        .iter()
+        .zip(&keys)
+        .filter(|(r, _)| {
+            matches!(
+                r,
+                Record::Registry {
+                    key_created: true,
+                    ..
+                }
+            )
+        })
+        .map(|(_, k)| k.as_str())
+        .collect();
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for (i, (record, key)) in all.iter().zip(&keys).enumerate() {
+        let keep = match record {
+            Record::Mkdir { .. } => seen.insert(key.as_str()),
+            _ => !keys[i + 1..].contains(key),
+        };
+        if !keep {
+            continue;
+        }
+        let mut record = (*record).clone();
+        if let Record::Registry { key_created, .. } = &mut record {
+            *key_created = created.contains(key.as_str());
+        }
+        out.push(record);
+    }
+    out
+}
+
+fn dedupe_key(record: &Record) -> String {
+    let fold = |s: &str| s.to_lowercase();
+    let path = |p: &Path| fold(&p.to_string_lossy());
+    match record {
+        Record::File { path: p } => format!("file\0{}", path(p)),
+        Record::Mkdir { path: p } => format!("mkdir\0{}", path(p)),
+        Record::Shortcut { path: p } => format!("shortcut\0{}", path(p)),
+        Record::Registry {
+            hive, key, name, ..
+        } => format!(
+            "registry\0{hive:?}\0{}\0{}",
+            fold(key),
+            name.as_deref().map(fold).unwrap_or_default()
+        ),
+        Record::Arp { hive, identifier } => format!("arp\0{hive:?}\0{}", fold(identifier)),
+        Record::Env { name, scope } => format!("env\0{scope:?}\0{}", fold(name)),
+    }
+}
+
 /// Map an install log to its undo actions in **LIFO** order (spec R14).
 pub fn reversal_plan(records: &[Record]) -> Vec<Reversal> {
     records.iter().rev().map(reverse_one).collect()
@@ -235,6 +326,142 @@ mod tests {
                 Reversal::RemoveDirIfEmpty(PathBuf::from("/opt/app")),
             ]
         );
+    }
+
+    fn file(p: &str) -> Record {
+        Record::File {
+            path: PathBuf::from(p),
+        }
+    }
+    fn mkdir(p: &str) -> Record {
+        Record::Mkdir {
+            path: PathBuf::from(p),
+        }
+    }
+    fn reg(name: &str, key_created: bool) -> Record {
+        Record::Registry {
+            hive: Hive::Hklm,
+            key: r"Software\App".to_string(),
+            name: Some(name.to_string()),
+            key_created,
+        }
+    }
+
+    /// v1: created the data subfolder, shipped old.dll, created the key.
+    fn v1() -> Vec<Record> {
+        vec![
+            mkdir("/app/data"),
+            file("/app/data/a.txt"),
+            file("/app/app.exe"),
+            file("/app/old.dll"),
+            reg("Version", true),
+        ]
+    }
+    /// v2 over v1: the folder and key exist, so no Mkdir and key_created=false;
+    /// adds b.txt under the folder; no longer ships old.dll.
+    fn v2() -> Vec<Record> {
+        vec![
+            file("/app/data/a.txt"),
+            file("/app/data/b.txt"),
+            file("/app/app.exe"),
+            reg("Version", false),
+        ]
+    }
+
+    #[test]
+    fn an_upgrade_carries_what_only_the_previous_version_owned() {
+        // Why: v2's log alone would leave v1's folder, old.dll and key behind
+        // at uninstall. The folder must be reversed after every file under it,
+        // v2's b.txt included, and the key still deleted as v1 created it.
+        let merged = merge(&v1(), &v2());
+        assert_eq!(
+            merged,
+            vec![
+                mkdir("/app/data"),
+                file("/app/old.dll"),
+                file("/app/data/a.txt"),
+                file("/app/data/b.txt"),
+                file("/app/app.exe"),
+                reg("Version", true),
+            ]
+        );
+        assert_eq!(
+            reversal_plan(&merged).last(),
+            Some(&Reversal::RemoveDirIfEmpty(PathBuf::from("/app/data")))
+        );
+    }
+
+    #[test]
+    fn dedupe_ignores_case_and_keeps_key_ownership_from_any_version() {
+        let v1 = vec![reg("Version", true), file(r"C:\App\App.exe")];
+        let v2 = vec![
+            Record::Registry {
+                hive: Hive::Hklm,
+                key: r"SOFTWARE\APP".to_string(),
+                name: Some("version".to_string()),
+                key_created: false,
+            },
+            file(r"c:\app\app.exe"),
+        ];
+        let merged = merge(&v1, &v2);
+        assert_eq!(merged.len(), 2);
+        assert!(matches!(
+            merged[0],
+            Record::Registry {
+                key_created: true,
+                ..
+            }
+        ));
+        // Ownership sticks whichever version created the key.
+        assert!(matches!(
+            merge(&v2, &v1)[0],
+            Record::Registry {
+                key_created: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn repeated_upgrades_and_reinstalls_converge() {
+        // Why: without dedupe every reinstall would append its records and the
+        // log would grow without bound.
+        let once = merge(&v1(), &v2());
+        let twice = merge(&once, &v2());
+        assert_eq!(twice, once);
+        assert_eq!(merge(&twice, &v2()), once);
+        assert_eq!(merge(&v1(), &v1()), merge(&[], &v1()));
+    }
+
+    #[test]
+    fn a_fresh_install_commits_its_records_unchanged() {
+        // Even its own duplicates: byte for byte what earlier versions wrote.
+        let current = vec![file("/app/a"), file("/app/a")];
+        assert_eq!(committed_records(None, current.clone()), (current, None));
+    }
+
+    #[test]
+    fn a_corrupt_previous_log_is_dropped_with_a_warning() {
+        let (records, warning) = committed_records(Some("{not json\n"), v2());
+        assert_eq!(records, v2());
+        assert!(warning.unwrap().contains("unreadable"));
+    }
+
+    #[test]
+    fn a_0_12_0_previous_log_is_carried() {
+        let previous = concat!(
+            r#"{"op":"mkdir","path":"/app/data"}"#,
+            "\n",
+            r#"{"op":"file","path":"/app/old.dll"}"#,
+            "\n",
+            r#"{"op":"registry","hive":"hklm","key":"Software\\App","name":"Version","key_created":true}"#,
+            "\n",
+        );
+        let (records, warning) = committed_records(Some(previous), v2());
+        assert_eq!(warning, None);
+        assert_eq!(records[0], mkdir("/app/data"));
+        assert!(records.contains(&file("/app/old.dll")));
+        assert!(records.contains(&reg("Version", true)));
     }
 
     #[test]
