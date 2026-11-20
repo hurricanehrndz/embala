@@ -37,7 +37,7 @@ use embala_setup_overlay::Manifest;
 
 use crate::log::{self, Record, Reversal};
 use crate::mode::ResolvedMode;
-use crate::rollback::{Action, Journal, Prior};
+use crate::rollback::{self, Action, Journal, Prior};
 use crate::wizard;
 
 use ui::Page;
@@ -55,7 +55,7 @@ pub struct Engine {
     /// rollback. Its records are what `install.log` persists for uninstall.
     journal: Journal,
     /// `<install_dir>\install.log`, written once the install succeeds. Until
-    /// then the records are flushed best-effort to [`Engine::partial_log_path`],
+    /// then the records are flushed best-effort to `install.log.partial`,
     /// so a failed run leaves an existing install's log as it was.
     log_path: PathBuf,
     /// Buffered `log` lines for the future progress page (spec R11).
@@ -154,16 +154,21 @@ impl Engine {
         self.selected_components = selected;
     }
 
-    /// Write the whole log to `<install_dir>\install.log` (spec R12). Called at
-    /// the end of a successful install.
-    pub fn flush_log(&self) -> std::io::Result<()> {
-        log::commit(&self.log_path, &self.journal.records())
-    }
-
-    /// `<install_dir>\install.log.partial`: the records so far, flushed after
-    /// each one. Removed when the run ends; left behind only by an OS kill.
-    pub fn partial_log_path(&self) -> PathBuf {
-        log::partial_path(&self.log_path)
+    /// End the install run ([`rollback::conclude`]): after a successful
+    /// `script`, write the uninstaller through `write_uninstaller` and then
+    /// `install.log` (spec R12); if any of it failed, roll the whole run back.
+    pub fn conclude(
+        &mut self,
+        script: Result<(), String>,
+        write_uninstaller: impl FnOnce(&mut Journal) -> Result<(), String>,
+    ) -> Result<(), String> {
+        rollback::conclude(
+            &mut self.journal,
+            &self.log_path,
+            script,
+            write_uninstaller,
+            apply_action,
+        )
     }
 
     /// `embala.log(msg)`: buffer for the progress page, echo when a console is
@@ -524,19 +529,17 @@ pub fn reverse_all(records: &[Record]) {
     }
 }
 
-/// Roll a failed or cancelled install back, LIFO, best-effort: restore what
-/// this run overwrote, reverse what it created, run its `undo` commands, then
-/// discard the backups.
-pub fn roll_back(journal: &Journal) {
-    journal.roll_back(|action| match action {
+/// The Win32 side of a rollback: reversals and registry restores. File
+/// restores and undo commands are run by the journal itself.
+fn apply_action(action: &Action) -> std::io::Result<()> {
+    match action {
         Action::Reverse(reversal) => apply_reversal(reversal),
         Action::Restore {
             record,
             prior: Prior::Values(values),
         } => registry::restore(record, values),
-        // File restores and undo commands are run by the journal itself.
         Action::Restore { .. } | Action::Run(_) => Ok(()),
-    });
+    }
 }
 
 /// Execute one undo action against the system.

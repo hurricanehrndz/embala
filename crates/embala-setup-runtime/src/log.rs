@@ -114,9 +114,9 @@ pub fn decode(text: &str) -> Result<Vec<Record>, serde_json::Error> {
 }
 
 /// `install.log.partial` beside `log_path`: where a run flushes its records
-/// after each one. `install.log` itself is written only by [`commit`], so a
-/// failed run leaves an existing install's log, which its uninstaller replays,
-/// byte for byte as it was.
+/// after each one. `install.log` itself is written only once the run succeeds
+/// ([`crate::rollback::conclude`]), so a failed run leaves an existing
+/// install's log, which its uninstaller replays, byte for byte as it was.
 pub fn partial_path(log_path: &Path) -> PathBuf {
     log_path.with_extension("log.partial")
 }
@@ -124,13 +124,6 @@ pub fn partial_path(log_path: &Path) -> PathBuf {
 /// Best-effort flush of the records so far to the partial log.
 pub fn flush_partial(log_path: &Path, records: &[Record]) -> std::io::Result<()> {
     std::fs::write(partial_path(log_path), encode(records))
-}
-
-/// The run succeeded: write `install.log` and drop the partial log.
-pub fn commit(log_path: &Path, records: &[Record]) -> std::io::Result<()> {
-    std::fs::write(log_path, encode(records))?;
-    let _ = std::fs::remove_file(partial_path(log_path));
-    Ok(())
 }
 
 /// Map an install log to its undo actions in **LIFO** order (spec R14).
@@ -242,34 +235,6 @@ mod tests {
                 Reversal::RemoveDirIfEmpty(PathBuf::from("/opt/app")),
             ]
         );
-    }
-
-    #[test]
-    fn a_failed_run_leaves_the_previous_install_log_alone() {
-        // Why: after a failed upgrade the previous version's uninstaller is
-        // still on disk and replays install.log; if the run had replaced it, that
-        // uninstaller would no longer know what the previous install put where.
-        let dir = std::env::temp_dir().join(format!("embala-log-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let log_path = dir.join("install.log");
-        let old = encode(&sample()[..2]);
-        std::fs::write(&log_path, &old).unwrap();
-
-        // A run records, then fails: rollback removes the partial log.
-        flush_partial(&log_path, &sample()).unwrap();
-        let _ = std::fs::remove_file(partial_path(&log_path));
-        assert_eq!(std::fs::read_to_string(&log_path).unwrap(), old);
-
-        // A run records, then succeeds: its log replaces the old one.
-        flush_partial(&log_path, &sample()).unwrap();
-        commit(&log_path, &sample()).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&log_path).unwrap(),
-            encode(&sample())
-        );
-        assert!(!partial_path(&log_path).exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

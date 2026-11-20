@@ -10,7 +10,9 @@
 //! Rollback walks the steps LIFO: a record with a prior is restored (the earlier
 //! file contents or registry values), one without is reversed as the
 //! uninstaller would (delete-if-exists), and an undo command runs. So a failed
-//! upgrade leaves what was there before the run.
+//! upgrade leaves what was there before the run. The uninstaller's own files
+//! and `install.log` are written through the journal too ([`conclude`]), as
+//! rollback-only steps, so a failure writing them rolls the run back as well.
 //!
 //! Crash-ordering: a file is backed up *before* its step is pushed and the step
 //! is pushed before the overwrite, so a rollback after a half-finished copy still
@@ -19,7 +21,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::log::{self, Record, Reversal};
 
@@ -28,10 +30,11 @@ use crate::log::{self, Record, Reversal};
 pub enum Prior {
     /// A file existed at the record's path; `backup` holds its earlier contents.
     File { backup: PathBuf },
-    /// Registry values that existed before, by name (`""` = the default value).
-    /// For an ARP record, every value of the key; else the one value set.
+    /// Registry values that existed before, as `(name, type, raw bytes)` so
+    /// every type round-trips (`""` = the default value). For an ARP record,
+    /// every value of the key; else the one value set.
     #[cfg(windows)]
-    Values(Vec<(String, winsafe::RegistryValue)>),
+    Values(Vec<(String, u32, Vec<u8>)>),
 }
 
 /// A command `embala.exec{ undo = ... }` asked to run if this run rolls back.
@@ -46,6 +49,12 @@ pub struct UndoCmd {
 enum Step {
     Record {
         record: Record,
+        prior: Option<Prior>,
+    },
+    /// A file the run wrote or removed that `install.log` does not list: the
+    /// uninstaller's own files and `install.log` itself. Rollback only.
+    Sidecar {
+        path: PathBuf,
         prior: Option<Prior>,
     },
     Undo(UndoCmd),
@@ -93,9 +102,33 @@ impl Journal {
             .iter()
             .filter_map(|s| match s {
                 Step::Record { record, .. } => Some(record.clone()),
-                Step::Undo(_) => None,
+                Step::Sidecar { .. } | Step::Undo(_) => None,
             })
             .collect()
+    }
+
+    /// Write one of the uninstaller's files (or `install.log`): backed up and
+    /// journaled like a record, so rollback restores or deletes it, but not
+    /// listed in `install.log`.
+    pub fn write_sidecar(&mut self, path: &Path, contents: &[u8]) -> io::Result<()> {
+        let prior = self.back_up_file(path)?;
+        self.steps.push(Step::Sidecar {
+            path: path.to_path_buf(),
+            prior,
+        });
+        std::fs::write(path, contents)
+    }
+
+    /// Remove one of the uninstaller's files, if present; rollback restores it.
+    pub fn remove_sidecar(&mut self, path: &Path) -> io::Result<()> {
+        let Some(prior) = self.back_up_file(path)? else {
+            return Ok(());
+        };
+        self.steps.push(Step::Sidecar {
+            path: path.to_path_buf(),
+            prior: Some(prior),
+        });
+        std::fs::remove_file(path)
     }
 
     /// Copy the file at `path`, if there is one, into the backup dir before it
@@ -129,6 +162,16 @@ impl Journal {
                     record,
                     prior: None,
                 } => Action::Reverse(log::reverse_one(record)),
+                Step::Sidecar {
+                    path,
+                    prior: Some(prior),
+                } => Action::Restore {
+                    record: Record::File { path: path.clone() },
+                    prior: prior.clone(),
+                },
+                Step::Sidecar { path, prior: None } => {
+                    Action::Reverse(Reversal::DeleteFile(path.clone()))
+                }
                 Step::Undo(undo) => Action::Run(undo.clone()),
             })
             .collect()
@@ -158,15 +201,50 @@ impl Journal {
     }
 }
 
-/// Run an undo command to completion. Its exit code is not checked: like any
-/// rollback action, a failing undo must not stop the rest.
+/// End an install run. If the script succeeded, `write_uninstaller` writes the
+/// uninstaller's files through the journal, then `install.log` is written the
+/// same way. If the script or either write failed, the whole run rolls back
+/// (`system` as for [`Journal::roll_back`]), so the uninstaller and the log on
+/// disk are the previous install's again. Else the backups are discarded. The
+/// partial log is removed either way.
+pub fn conclude(
+    journal: &mut Journal,
+    log_path: &Path,
+    script: Result<(), String>,
+    write_uninstaller: impl FnOnce(&mut Journal) -> Result<(), String>,
+    system: impl FnMut(&Action) -> io::Result<()>,
+) -> Result<(), String> {
+    let result = script
+        .and_then(|()| write_uninstaller(journal))
+        .and_then(|()| {
+            let text = log::encode(&journal.records());
+            journal
+                .write_sidecar(log_path, text.as_bytes())
+                .map_err(|e| e.to_string())
+        });
+    match result {
+        Ok(()) => journal.discard(),
+        Err(_) => journal.roll_back(system),
+    }
+    let _ = std::fs::remove_file(log::partial_path(log_path));
+    result
+}
+
+/// Run an undo command and wait for it to exit. Its exit code is not checked:
+/// like any rollback action, a failing undo must not stop the rest. Its stdio
+/// is null, so a child it leaves running (a started service) holds no pipe
+/// that setup would wait on.
 fn run_undo(undo: &UndoCmd) -> io::Result<()> {
     let mut command = Command::new(&undo.cmd);
-    command.args(&undo.args);
+    command
+        .args(&undo.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     if let Some(cwd) = &undo.cwd {
         command.current_dir(cwd);
     }
-    command.output().map(drop)
+    command.status().map(drop)
 }
 
 #[cfg(test)]
@@ -302,6 +380,136 @@ mod tests {
             vec![Reversal::DeleteFile(f.clone())]
         );
         j.discard();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An existing install: its log, uninstaller and script, and app.exe "v1".
+    /// Returns the journal after a run overwrote app.exe with "v2".
+    fn upgrade_in_progress(dir: &Path) -> Journal {
+        std::fs::write(dir.join("install.log"), "old log\n").unwrap();
+        std::fs::write(dir.join("uninstall.exe"), "old uninstaller").unwrap();
+        std::fs::write(dir.join("uninstall.lua"), "old script").unwrap();
+        std::fs::write(dir.join("app.exe"), "v1").unwrap();
+        let mut j = Journal::new(dir.join("backup"));
+        write_over(&mut j, &dir.join("app.exe"), "v2");
+        log::flush_partial(&dir.join("install.log"), &j.records()).unwrap();
+        j
+    }
+
+    fn read(path: PathBuf) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    /// What the previous install had, untouched.
+    fn assert_previous_install(dir: &Path) {
+        assert_eq!(read(dir.join("install.log")), "old log\n");
+        assert_eq!(read(dir.join("uninstall.exe")), "old uninstaller");
+        assert_eq!(read(dir.join("uninstall.lua")), "old script");
+        assert_eq!(read(dir.join("app.exe")), "v1");
+        assert!(!dir.join("install.log.partial").exists());
+        assert!(!dir.join("backup").exists());
+    }
+
+    /// Writes the uninstaller as `install::write_uninstaller` does for a
+    /// package with no uninstall.lua, then fails if asked to.
+    fn write_uninstaller(
+        dir: &Path,
+        fail: bool,
+    ) -> impl FnOnce(&mut Journal) -> Result<(), String> {
+        let dir = dir.to_path_buf();
+        move |j| {
+            let err = |e: io::Error| e.to_string();
+            j.write_sidecar(&dir.join("uninstall.exe"), b"new uninstaller")
+                .map_err(err)?;
+            j.remove_sidecar(&dir.join("uninstall.lua")).map_err(err)?;
+            if fail {
+                return Err("disk full".to_string());
+            }
+            j.write_sidecar(&dir.join("manifest.json"), b"{}")
+                .map_err(err)
+        }
+    }
+
+    #[test]
+    fn a_failed_upgrade_keeps_the_previous_install_log_and_files() {
+        // Why: after a failed upgrade the previous version's uninstaller is
+        // still the one on disk and replays install.log; the run must leave
+        // both, and the files they describe, as they were.
+        let dir = tmp("script-fails");
+        let mut j = upgrade_in_progress(&dir);
+        let mut called = false;
+        let result = conclude(
+            &mut j,
+            &dir.join("install.log"),
+            Err("script error".to_string()),
+            |_| {
+                called = true;
+                Ok(())
+            },
+            host_system,
+        );
+        assert!(result.is_err());
+        assert!(!called, "no uninstaller is written after a script error");
+        assert_previous_install(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failure_writing_the_uninstaller_rolls_the_run_back() {
+        // Why: a disk-full or locked file while writing the uninstaller must
+        // not leave a new uninstaller beside the old log, or new files with
+        // no log at all; the run is rolled back like a script error.
+        let dir = tmp("uninstaller-fails");
+        let mut j = upgrade_in_progress(&dir);
+        let result = conclude(
+            &mut j,
+            &dir.join("install.log"),
+            Ok(()),
+            write_uninstaller(&dir, true),
+            host_system,
+        );
+        assert_eq!(result, Err("disk full".to_string()));
+        assert_previous_install(&dir);
+        assert!(!dir.join("manifest.json").exists());
+
+        // A fresh install that fails the same way leaves nothing behind.
+        let dir = tmp("fresh-uninstaller-fails");
+        let mut j = Journal::new(dir.join("backup"));
+        write_over(&mut j, &dir.join("app.exe"), "v2");
+        let result = conclude(
+            &mut j,
+            &dir.join("install.log"),
+            Ok(()),
+            write_uninstaller(&dir, true),
+            host_system,
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_successful_upgrade_writes_the_new_log_and_drops_a_stale_script() {
+        // Why: the new uninstaller must replay this run's records only, and a
+        // previous version's uninstall.lua must not run for a package that
+        // ships none.
+        let dir = tmp("succeeds");
+        let mut j = upgrade_in_progress(&dir);
+        let records = j.records();
+        let result = conclude(
+            &mut j,
+            &dir.join("install.log"),
+            Ok(()),
+            write_uninstaller(&dir, false),
+            host_system,
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(read(dir.join("install.log")), log::encode(&records));
+        assert_eq!(read(dir.join("uninstall.exe")), "new uninstaller");
+        assert_eq!(read(dir.join("app.exe")), "v2");
+        assert!(!dir.join("uninstall.lua").exists());
+        assert!(!dir.join("install.log.partial").exists());
+        assert!(!dir.join("backup").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

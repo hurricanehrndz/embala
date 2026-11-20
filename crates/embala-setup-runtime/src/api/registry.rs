@@ -155,8 +155,9 @@ impl Engine {
         let prior = if created {
             None
         } else {
-            registry_get(hive, key, name)?
-                .map(|v| Prior::Values(vec![(name.unwrap_or_default().to_string(), v)]))
+            let name = name.unwrap_or_default();
+            read_raw(hive, key, name)?
+                .map(|(kind, data)| Prior::Values(vec![(name.to_string(), kind, data)]))
         };
         self.record_over(
             Record::Registry {
@@ -247,8 +248,8 @@ impl Engine {
         let scope = parse_scope(scope, self.mode);
         let (hive, key) = env_location(scope);
         let (guard, _created) = create_key(hive, key)?;
-        let prior = registry_get(hive, key, Some(name))?
-            .map(|v| Prior::Values(vec![(name.to_string(), v)]));
+        let prior = read_raw(hive, key, name)?
+            .map(|(kind, data)| Prior::Values(vec![(name.to_string(), kind, data)]));
         self.record_over(
             Record::Env {
                 name: name.to_string(),
@@ -295,7 +296,7 @@ pub fn reverse_arp(hive: Hive, identifier: &str) -> io::Result<()> {
 
 /// Rollback only: put back the values `record` overwrote. For an ARP entry the
 /// values this run wrote are dropped first, so the key ends as it was.
-pub fn restore(record: &Record, values: &[(String, w::RegistryValue)]) -> io::Result<()> {
+pub fn restore(record: &Record, values: &[(String, u32, Vec<u8>)]) -> io::Result<()> {
     let (hive, key) = match record {
         Record::Arp { hive, identifier } => (*hive, format!(r"{UNINSTALL_ROOT}\{identifier}")),
         Record::Registry { hive, key, .. } => (*hive, key.clone()),
@@ -311,8 +312,8 @@ pub fn restore(record: &Record, values: &[(String, w::RegistryValue)]) -> io::Re
             let _ = guard.RegDeleteValue(Some(&name));
         }
     }
-    for (name, value) in values {
-        let _ = guard.RegSetValueEx(Some(name), value.clone());
+    for (name, kind, data) in values {
+        let _ = crate::sys::reg_set_raw(guard.ptr(), name, *kind, data);
     }
     if matches!(record, Record::Env { .. }) {
         broadcast_env_change();
@@ -372,16 +373,28 @@ fn value_names(hive: Hive, key: &str) -> io::Result<Vec<String>> {
     names
 }
 
-/// Every value under `key`, to restore on rollback. A type winsafe does not
-/// map reads back as `REG_NONE` and is restored as such (no ARP value uses one).
-fn read_values(hive: Hive, key: &str) -> io::Result<Vec<(String, w::RegistryValue)>> {
-    value_names(hive, key)?
-        .into_iter()
-        .map(|name| {
-            let value = registry_get(hive, key, Some(&name))?.unwrap_or(w::RegistryValue::None);
-            Ok((name, value))
-        })
-        .collect()
+/// One value's type and raw bytes, `Ok(None)` when the key or value is absent.
+/// Rollback snapshots read raw, so a value of any type round-trips and none
+/// makes the read fail (see [`crate::sys::reg_query_raw`]).
+fn read_raw(hive: Hive, key: &str, name: &str) -> io::Result<Option<(u32, Vec<u8>)>> {
+    let guard =
+        match hive_key(hive).RegOpenKeyEx(Some(key), co::REG_OPTION::default(), co::KEY::READ) {
+            Ok(g) => g,
+            Err(co::ERROR::FILE_NOT_FOUND) => return Ok(None),
+            Err(e) => return Err(win(e)),
+        };
+    crate::sys::reg_query_raw(guard.ptr(), name)
+}
+
+/// Every value under `key`, raw, to restore on rollback.
+fn read_values(hive: Hive, key: &str) -> io::Result<Vec<(String, u32, Vec<u8>)>> {
+    let mut values = Vec::new();
+    for name in value_names(hive, key)? {
+        if let Some((kind, data)) = read_raw(hive, key, &name)? {
+            values.push((name, kind, data));
+        }
+    }
+    Ok(values)
 }
 
 /// Create-or-open `key` under `hive`, returning the guard and whether this call

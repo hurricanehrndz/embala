@@ -14,11 +14,12 @@ use winsafe::{self as w, co};
 
 use embala_setup_overlay::{Manifest, Trailer};
 
-use crate::api::{self, Engine};
+use crate::api::Engine;
 use crate::app::{read_section, read_stub_prefix, report};
 use crate::cli::Args;
 use crate::host;
 use crate::mode::{self, ManifestMode, ResolvedMode};
+use crate::rollback::Journal;
 
 pub fn run(exe: &Path, trailer: &Trailer, args: &Args, attached: bool) -> ExitCode {
     // Register the Ctrl+C handler so a cancel mid-install triggers rollback.
@@ -124,15 +125,25 @@ fn do_install(
         is_elevated(),
     )));
 
-    let result = host::run_script(&engine, &install_lua);
+    let script = host::run_script(&engine, &install_lua);
+    // A failed script closes the wizard before the rollback, as before.
+    if script.is_err() {
+        engine.borrow_mut().close_ui();
+    }
+    // The wizard's directory page may have re-pointed install_dir; read the
+    // engine's final value for the uninstaller + completion message.
+    let final_dir = engine.borrow().install_dir().to_path_buf();
+    let mode = engine.borrow().resolved_mode_str();
+    // After a successful script, write the uninstaller and install.log; if the
+    // script or those writes failed, unwind the whole run LIFO (spec R14
+    // engine): restore what it overwrote, reverse what it created, run its undo
+    // commands. Either way the partial log and the backups go.
+    let result = engine.borrow_mut().conclude(script, |journal| {
+        write_uninstaller(exe, trailer, &final_dir, manifest, mode, journal)
+    });
+    let _ = std::fs::remove_dir_all(&payload_dir);
     match result {
         Ok(()) => {
-            // The wizard's directory page may have re-pointed install_dir; read
-            // the engine's final value for the uninstaller + completion message.
-            let final_dir = engine.borrow().install_dir().to_path_buf();
-            write_uninstaller(exe, trailer, &final_dir, manifest, &engine.borrow())?;
-            engine.borrow().journal().discard();
-            let _ = std::fs::remove_dir_all(&payload_dir);
             if created_default_dir && final_dir != install_dir {
                 let _ = std::fs::remove_dir(&install_dir);
             }
@@ -147,16 +158,7 @@ fn do_install(
             ))
         }
         Err(e) => {
-            // Close the wizard, then unwind this run LIFO (spec R14 engine):
-            // restore what it overwrote, reverse what it created, run its undo
-            // commands. Then drop the staging dir, the partial log and the
-            // install dir if empty. `install.log` is only written on success, so
-            // an existing install's log is left as it was for its uninstaller.
             engine.borrow_mut().close_ui();
-            api::roll_back(engine.borrow().journal());
-            let final_dir = engine.borrow().install_dir().to_path_buf();
-            let _ = std::fs::remove_file(engine.borrow().partial_log_path());
-            let _ = std::fs::remove_dir_all(&payload_dir);
             let _ = std::fs::remove_dir(&final_dir);
             if created_default_dir && final_dir != install_dir {
                 let _ = std::fs::remove_dir(&install_dir);
@@ -167,41 +169,51 @@ fn do_install(
 }
 
 /// Write `uninstall.exe` (the embedded pre-signed stub, or the stub prefix with
-/// no overlay when none is embedded), the optional
-/// `uninstall.lua`, the `manifest.json` sidecar (so `uninstall.lua` can rebuild
-/// its `embala.package` context), and flush `install.log` — all into the install
-/// dir (spec R14).
+/// no overlay when none is embedded), the optional `uninstall.lua`, and the
+/// `manifest.json` sidecar (so `uninstall.lua` can rebuild its `embala.package`
+/// context) into the install dir (spec R14). Each write goes through the
+/// journal, so a failure, here or after, restores a previous install's files.
+/// A previous install's `uninstall.lua` is removed when this package ships
+/// none, so it does not run at uninstall.
 fn write_uninstaller(
     exe: &Path,
     trailer: &Trailer,
     install_dir: &Path,
     manifest: &Manifest,
-    engine: &Engine,
+    mode: &str,
+    journal: &mut Journal,
 ) -> Result<(), String> {
+    let err = |e: std::io::Error| e.to_string();
     // Prefer the embedded pre-signed stub (overlay v2): copying our own prefix
     // would break its Authenticode signature, so a zero-length signed_stub falls
     // back to the byte-for-byte prefix copy of the (unsigned) engine.
     let uninstall_exe = if trailer.signed_stub.len > 0 {
-        read_section(exe, trailer.signed_stub).map_err(|e| e.to_string())?
+        read_section(exe, trailer.signed_stub).map_err(err)?
     } else {
-        read_stub_prefix(exe, trailer).map_err(|e| e.to_string())?
+        read_stub_prefix(exe, trailer).map_err(err)?
     };
-    std::fs::write(install_dir.join("uninstall.exe"), &uninstall_exe).map_err(|e| e.to_string())?;
+    journal
+        .write_sidecar(&install_dir.join("uninstall.exe"), &uninstall_exe)
+        .map_err(err)?;
+    let uninstall_lua = install_dir.join("uninstall.lua");
     if trailer.uninstall_lua.len > 0 {
-        let script = read_section(exe, trailer.uninstall_lua).map_err(|e| e.to_string())?;
-        std::fs::write(install_dir.join("uninstall.lua"), &script).map_err(|e| e.to_string())?;
+        let script = read_section(exe, trailer.uninstall_lua).map_err(err)?;
+        journal
+            .write_sidecar(&uninstall_lua, &script)
+            .map_err(err)?;
+    } else {
+        journal.remove_sidecar(&uninstall_lua).map_err(err)?;
     }
     // Record the *resolved* mode (spec R5): the wizard/`/mode=` may have chosen
     // per-machine from a `user-choice` default, and the uninstaller must know to
     // elevate. Never write `user-choice` into the sidecar.
     let sidecar = Manifest {
-        install_mode: engine.resolved_mode_str().to_string(),
+        install_mode: mode.to_string(),
         ..manifest.clone()
     };
-    std::fs::write(install_dir.join("manifest.json"), sidecar.to_bytes())
-        .map_err(|e| e.to_string())?;
-    engine.flush_log().map_err(|e| e.to_string())?;
-    Ok(())
+    journal
+        .write_sidecar(&install_dir.join("manifest.json"), &sidecar.to_bytes())
+        .map_err(err)
 }
 
 fn resolve_install_dir(args: &Args, resolved: ResolvedMode, name: &str) -> Result<PathBuf, String> {

@@ -1,6 +1,7 @@
 //! Thin Win32 FFI for the few calls winsafe 0.0.28 does not cover (research-
 //! confirmed): `RtlGetVersion`, `SetConsoleCtrlHandler`, an elevated
-//! `ShellExecuteExW` that returns a waitable child handle, and a WinHTTP GET.
+//! `ShellExecuteExW` that returns a waitable child handle, a WinHTTP GET, and a
+//! raw (type + bytes) registry value read and write for rollback snapshots.
 //!
 //! Everything here is `#[cfg(windows)]` and kept deliberately small; the higher
 //! layers (`api`, `install`, `uninstall`) prefer winsafe. Elevation *detection*
@@ -12,13 +13,17 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, FALSE, GetLastError, TRUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, FALSE,
+    GetLastError, TRUE,
+};
 use windows_sys::Win32::Networking::WinHttp::{
     WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WinHttpCloseHandle, WinHttpConnect,
     WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable, WinHttpReadData,
     WinHttpReceiveResponse, WinHttpSendRequest,
 };
 use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler};
+use windows_sys::Win32::System::Registry::{HKEY, RegQueryValueExW, RegSetValueExW};
 use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows_sys::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
 use windows_sys::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
@@ -131,6 +136,64 @@ pub fn relaunch_elevated(exe: &Path, params: &str) -> io::Result<u32> {
             return Err(io::Error::last_os_error());
         }
         Ok(code)
+    }
+}
+
+/// Read one registry value as stored: its type and raw bytes, `Ok(None)` when
+/// absent. winsafe's `RegQueryValueEx` decodes the data and fails on types it
+/// does not map (`REG_LINK`, `REG_RESOURCE_LIST`, a mis-sized `REG_DWORD`), so
+/// rollback snapshots go through this instead and round-trip every type.
+pub fn reg_query_raw(hkey: HKEY, name: &str) -> io::Result<Option<(u32, Vec<u8>)>> {
+    let name = wide(name);
+    let mut data = Vec::new();
+    loop {
+        let mut kind: u32 = 0;
+        let mut len = data.len() as u32;
+        let ptr = if data.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            data.as_mut_ptr()
+        };
+        let err = unsafe {
+            RegQueryValueExW(
+                hkey,
+                name.as_ptr(),
+                std::ptr::null(),
+                &mut kind,
+                ptr,
+                &mut len,
+            )
+        };
+        match err {
+            // With no buffer, success reports the size; read again into one.
+            ERROR_SUCCESS if ptr.is_null() && len > 0 => data.resize(len as usize, 0),
+            ERROR_SUCCESS => {
+                data.truncate(len as usize);
+                return Ok(Some((kind, data)));
+            }
+            ERROR_MORE_DATA => data.resize(len as usize, 0),
+            ERROR_FILE_NOT_FOUND => return Ok(None),
+            e => return Err(io::Error::from_raw_os_error(e as i32)),
+        }
+    }
+}
+
+/// Write one registry value from its type and raw bytes (see [`reg_query_raw`]).
+pub fn reg_set_raw(hkey: HKEY, name: &str, kind: u32, data: &[u8]) -> io::Result<()> {
+    let name = wide(name);
+    let err = unsafe {
+        RegSetValueExW(
+            hkey,
+            name.as_ptr(),
+            0,
+            kind,
+            data.as_ptr(),
+            data.len() as u32,
+        )
+    };
+    match err {
+        ERROR_SUCCESS => Ok(()),
+        e => Err(io::Error::from_raw_os_error(e as i32)),
     }
 }
 
