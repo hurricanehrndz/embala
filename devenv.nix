@@ -27,23 +27,11 @@
 
   languages.rust = {
     enable = true;
-    # The `nixpkgs` channel cannot add cross-compile targets; the fenix-backed
-    # `stable` channel can, which `just stubs` needs for the windows-gnu std.
-    channel = "stable";
-    components = [
-      "rustc"
-      "cargo"
-      "clippy"
-      "rustfmt"
-      "rust-analyzer"
-    ];
-    # Windows std for the setup-exe stub cross-build (`just stubs` only).
-    # aarch64 Windows has no mingw-gcc target in Rust; its GNU flavour is the
-    # LLVM-based `gnullvm` triple, which zig cross-compiles natively.
-    targets = [
-      "x86_64-pc-windows-gnu"
-      "aarch64-pc-windows-gnullvm"
-    ];
+    # Version, components and the Windows stub targets live in
+    # rust-toolchain.toml, which CI's rustup reads too, so both build with the
+    # same compiler. aarch64 Windows has no mingw-gcc target in Rust; its GNU
+    # flavour is the LLVM-based `gnullvm` triple, which zig cross-compiles.
+    toolchainFile = ./rust-toolchain.toml;
   };
 
   # The mingw cross package (above) exports `CC=x86_64-w64-mingw32-gcc` into the

@@ -37,7 +37,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/zig-toolchain
-      - run: rustup target add x86_64-pc-windows-gnu aarch64-pc-windows-gnullvm
       - run: just stubs
       - uses: actions/upload-artifact@v7
         with:
