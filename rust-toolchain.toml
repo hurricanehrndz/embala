@@ -1,7 +1,8 @@
-# Pinned, not "stable": Rust 1.100's windows-gnu/gnullvm std no longer links
-# the setup.exe stubs under zig (missing libsynchronization / libunwind
-# symbols). Bump this once `just stubs` builds on the newer release.
+# Pinned, not "stable": a new Rust release can change what the windows-gnu and
+# gnullvm std ask the linker for, which zig may not provide (1.100 needed
+# cargo-zigbuild 0.24 and an explicit libunwind; see .cargo/config.toml).
+# Bump deliberately, and check that `just stubs` still builds.
 [toolchain]
-channel = "1.99.1"
+channel = "1.100.0"
 components = ["rustc", "cargo", "clippy", "rustfmt", "rust-analyzer", "rust-src"]
 targets = ["x86_64-pc-windows-gnu", "aarch64-pc-windows-gnullvm"]

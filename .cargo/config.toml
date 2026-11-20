@@ -1,0 +1,5 @@
+# Since Rust 1.100 the gnullvm std no longer pulls in an unwinder on its own
+# when linked through zig, leaving _Unwind_* and _GCC_specific_handler
+# undefined in the setup.exe stub. Have zig link its LLVM libunwind.
+[target.aarch64-pc-windows-gnullvm]
+rustflags = ["-Clink-arg=-lunwind"]
