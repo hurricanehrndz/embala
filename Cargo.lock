@@ -306,6 +306,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfb"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fef29b910ef2b9dbecc60168d1568d643c633b0518af970c17e83bd5f6e2c94f"
+dependencies = [
+ "fnv",
+ "uuid",
+ "web-time",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -593,7 +604,7 @@ name = "embala-msi"
 version = "0.15.0"
 dependencies = [
  "cab",
- "cfb",
+ "cfb 0.16.0",
  "msi",
  "thiserror 2.0.21",
  "time",
@@ -1194,7 +1205,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0325f8473ef1f5c38ee42345e2cd1678299cbbfa169d1776654a2a682867420"
 dependencies = [
  "byteorder",
- "cfb",
+ "cfb 0.14.0",
  "encoding_rs",
  "uuid",
 ]
