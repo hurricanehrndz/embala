@@ -8,7 +8,7 @@ runs:
         # Pinned to the versions devenv.nix puts in the dev shell, so a local
         # cross-build and a CI build use the same toolchain.
         ZIG_VERSION: 0.17.1
-        CARGO_ZIGBUILD_VERSION: 0.23.4
+        CARGO_ZIGBUILD_VERSION: 0.24.1
         JUST_VERSION: 1.59.0
       run: |
         # A plain venv rather than pipx: cargo-zigbuild finds zig by running

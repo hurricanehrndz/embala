@@ -15,7 +15,26 @@
     # These serve `just stubs` ONLY — `embala build` never compiles anything,
     # it only include_bytes!-embeds the committed stubs.
     zig
-    cargo-zigbuild
+    # 0.24 is the first release that links Rust 1.100's windows-gnu std
+    # (`-lsynchronization`); nixpkgs still ships 0.23.4. Drop this override
+    # once nixpkgs has 0.24 or newer.
+    (cargo-zigbuild.overrideAttrs (old: rec {
+      version = "0.24.1";
+      src = fetchFromGitHub {
+        owner = "rust-cross";
+        repo = "cargo-zigbuild";
+        rev = "v${version}";
+        hash = "sha256-8kwrI0pPCfFoA9tEsle5X/BBtrHFcfw8cMvStHTYaz4=";
+      };
+      cargoDeps = rustPlatform.fetchCargoVendor {
+        inherit src;
+        hash = "sha256-pq09R4V0o99HvcnddaAkY4/0PUtMXL+BRg/nWvO+/GU=";
+      };
+      # 0.24's linker_args tests write to ~/.cache, unwritable in the sandbox.
+      preCheck = (old.preCheck or "") + ''
+        export HOME=$TMPDIR
+      '';
+    }))
     # Signing tools the `[sign]` config shells out to in local/e2e tests:
     # osslsigncode (Authenticode on Linux), rcodesign (Apple code signing),
     # jsign (Authenticode for .msi — osslsigncode can't parse the msi crate's
