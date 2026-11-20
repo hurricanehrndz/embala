@@ -291,6 +291,36 @@ both. They use different directories (`<display-name>` and
 the MSI's `add-to-path` both directories end up on PATH and the first one
 wins, so uninstalling it silently hands the command to the other copy.
 
+## Inspecting installers
+
+`embala info <file>` reports a Windows binary's VERSIONINFO or an `.msi`'s
+Property table. The type comes from the file's contents, not its extension.
+`--json` prints one object; without it the same data prints as `key: value`
+lines.
+
+```console
+$ embala info --json vendor-setup.exe
+{"file_version":"24.1.0.3","product_version":"24.1.0.3","strings":{"CompanyName":"...","FileVersion":"24.1.0.3","ProductName":"...","ProductVersion":"24.1"},"type":"pe"}
+$ embala info --json vendor.msi
+{"properties":{"Manufacturer":"...","ProductCode":"{...}","ProductName":"...","ProductVersion":"24.1.0","UpgradeCode":"{...}"},"type":"msi"}
+```
+
+For a PE, `file_version` and `product_version` come from the fixed
+VERSIONINFO fields and `strings` is the string table named by the first
+translation, the one Windows reads, unmodified. If no table matches, `strings`
+is the first table and a warning goes to stderr. A PE without VERSIONINFO
+still exits 0, with `null` versions and empty `strings`. The VERSIONINFO parser
+is stricter than Windows: it skips strings not marked as text and rejects
+strings whose length is given in bytes, so a few files that Explorer shows fine
+fail or lose strings here.
+For an MSI, `properties` is the whole Property table. Values are reported as
+stored; nothing is converted to SemVer. Any other file, or one that can't be
+parsed, exits non-zero with an error naming the file.
+
+An installer's VERSIONINFO describes the installer, which is not always the
+app it installs: self-extracting archives often carry no version, and you
+have to extract the payload and run `info` on the inner exe.
+
 ## Signing — SmartScreen & Gatekeeper
 
 embala artifacts are **signable**: an optional `[sign]` section in `embala.toml`
