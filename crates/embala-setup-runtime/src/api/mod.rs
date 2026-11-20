@@ -11,9 +11,12 @@
 //!
 //! **Crash-ordering (applied uniformly, per [`crate::log`]).** A reversible
 //! mutation records its [`Record`] *before* it touches the system and the log is
-//! best-effort flushed, so an interrupt leaves a log that reverses work that
-//! *might* have happened; every reversal is idempotent (delete-if-exists /
-//! rmdir-if-empty), so reversing a not-actually-created resource is harmless.
+//! best-effort flushed to `install.log.partial`, so an interrupt leaves a log that
+//! reverses work that *might* have happened; every reversal is idempotent
+//! (delete-if-exists / rmdir-if-empty), so reversing a not-actually-created
+//! resource is harmless. A mutation that overwrites something first saves what
+//! was there (a file backup, the earlier registry values) as rollback-only state
+//! in the [`Journal`], so rollback restores it instead of deleting it.
 //! Destructive calls (`fs.remove*`, `registry.delete`) have no inverse and are
 //! therefore applied but **not** logged.
 
@@ -34,6 +37,7 @@ use embala_setup_overlay::Manifest;
 
 use crate::log::{self, Record, Reversal};
 use crate::mode::ResolvedMode;
+use crate::rollback::{self, Action, Journal, Prior};
 use crate::wizard;
 
 use ui::Page;
@@ -47,9 +51,12 @@ pub struct Engine {
     payload_dir: PathBuf,
     /// A console is attached (`/S` or launched from a shell) → echo `log` lines.
     attached: bool,
-    /// Reversible mutations, in call order; reversed LIFO on rollback/uninstall.
-    records: Vec<Record>,
-    /// `<install_dir>\install.log`, flushed best-effort after each record.
+    /// Reversible mutations and undo commands, in call order; unwound LIFO on
+    /// rollback. Its records are what `install.log` persists for uninstall.
+    journal: Journal,
+    /// `<install_dir>\install.log`, written once the install succeeds. Until
+    /// then the records are flushed best-effort to `install.log.partial`,
+    /// so a failed run leaves an existing install's log as it was.
     log_path: PathBuf,
     /// Buffered `log` lines for the future progress page (spec R11).
     progress: Vec<String>,
@@ -97,7 +104,9 @@ impl Engine {
             install_dir,
             payload_dir,
             attached,
-            records: Vec::new(),
+            journal: Journal::new(
+                std::env::temp_dir().join(format!("embala-backup-{}", std::process::id())),
+            ),
             log_path,
             progress: Vec::new(),
             pages: Vec::new(),
@@ -118,10 +127,9 @@ impl Engine {
         self.interactive
     }
 
-    /// The records logged so far (for writing `install.log` after a successful
-    /// install and for rollback).
-    pub fn records(&self) -> &[Record] {
-        &self.records
+    /// This run's journal (for rollback, and to discard its backups on success).
+    pub fn journal(&self) -> &Journal {
+        &self.journal
     }
 
     /// The resolved install directory (the wizard's directory page may have
@@ -146,10 +154,22 @@ impl Engine {
         self.selected_components = selected;
     }
 
-    /// Flush the whole log to `<install_dir>\install.log` (spec R12). Called at
-    /// the end of a successful install; also best-effort after each record.
-    pub fn flush_log(&self) -> std::io::Result<()> {
-        std::fs::write(&self.log_path, log::encode(&self.records))
+    /// End the install run ([`rollback::conclude`]): after a successful
+    /// `script`, write the uninstaller through `write_uninstaller` and then
+    /// `install.log` (spec R12); if any of it failed, roll the whole run back.
+    pub fn conclude(
+        &mut self,
+        script: Result<(), String>,
+        write_uninstaller: impl FnOnce(&mut Journal) -> Result<(), String>,
+    ) -> Result<(), String> {
+        rollback::conclude(
+            &mut self.journal,
+            &self.log_path,
+            self.mode.as_str(),
+            script,
+            write_uninstaller,
+            apply_action,
+        )
     }
 
     /// `embala.log(msg)`: buffer for the progress page, echo when a console is
@@ -168,11 +188,31 @@ impl Engine {
     /// Append a reversible record and best-effort flush (crash-ordering above).
     /// Also drives the progress page: each mutation advances the bar + status.
     fn record(&mut self, record: Record) {
+        self.record_over(record, None);
+    }
+
+    /// [`Engine::record`] for a mutation that overwrote something: rollback
+    /// restores `prior` instead of reversing the record.
+    fn record_over(&mut self, record: Record, prior: Option<Prior>) {
         if let Some(ui) = &self.ui {
             ui.push_log(&progress_desc(&record));
         }
-        self.records.push(record);
-        let _ = self.flush_log();
+        self.journal.push(record, prior);
+        let _ = log::flush_partial(&self.log_path, &self.journal.records());
+    }
+
+    /// See [`Journal::capture_previous`].
+    pub(crate) fn capture_previous(&mut self) {
+        let log_path = self.log_path.clone();
+        self.journal.capture_previous(&log_path);
+    }
+
+    /// Record a write to the file at `path` (a copy, download or shortcut),
+    /// first backing up any file already there so rollback can put it back.
+    fn record_file_write(&mut self, record: Record, path: &Path) -> std::io::Result<()> {
+        let prior = self.journal.back_up_file(path)?;
+        self.record_over(record, prior);
+        Ok(())
     }
 
     /// Resolve an API `src` (relative to `payload_dir`, absolute allowed).
@@ -239,7 +279,7 @@ pub fn register(lua: &Lua, engine: &Rc<RefCell<Engine>>) -> mlua::Result<()> {
     embala.set("registry", registry::registry_table(lua, engine)?)?;
     embala.set("arp", registry::arp_table(lua, engine)?)?;
     embala.set("env", registry::env_table(lua, engine)?)?;
-    embala.set("exec", exec::exec_fn(lua)?)?;
+    embala.set("exec", exec::exec_fn(lua, engine)?)?;
     embala.set("download", exec::download_fn(lua, engine)?)?;
     embala.set("ui", ui::table(lua, engine)?)?;
 
@@ -303,6 +343,14 @@ fn progress_desc(record: &Record) -> String {
 /// mutating method resolves its paths from `install_dir` *before* recording, so
 /// the directory page's choice must land first.
 pub(crate) fn gate(engine: &Rc<RefCell<Engine>>, lua: &Lua) -> mlua::Result<()> {
+    wizard_gate(engine, lua)?;
+    // With the install dir now final, snapshot the install already there
+    // before this mutation can change it ([`Journal::capture_previous`]).
+    engine.borrow_mut().capture_previous();
+    Ok(())
+}
+
+fn wizard_gate(engine: &Rc<RefCell<Engine>>, lua: &Lua) -> mlua::Result<()> {
     // Fast path: not interactive, or the wizard already ran.
     {
         let e = engine.borrow();
@@ -493,6 +541,19 @@ impl Engine {
 pub fn reverse_all(records: &[Record]) {
     for reversal in log::reversal_plan(records) {
         let _ = apply_reversal(&reversal);
+    }
+}
+
+/// The Win32 side of a rollback: reversals and registry restores. File
+/// restores and undo commands are run by the journal itself.
+fn apply_action(action: &Action) -> std::io::Result<()> {
+    match action {
+        Action::Reverse(reversal) => apply_reversal(reversal),
+        Action::Restore {
+            record,
+            prior: Prior::Values(values),
+        } => registry::restore(record, values),
+        Action::Restore { .. } | Action::Run(_) => Ok(()),
     }
 }
 

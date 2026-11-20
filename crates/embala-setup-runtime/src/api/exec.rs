@@ -1,7 +1,10 @@
 //! `embala.exec{...}` and `embala.download{...}` (spec R11).
 //!
 //! `exec` runs a process via `std::process` and returns `{code, stdout?,
-//! stderr?}`; it has no inverse and is not logged. `download` fetches over
+//! stderr?}`; it has no inverse and is not logged. Its optional `undo =
+//! {cmd, args?, cwd?}` is a command for rollback only: journaled before the
+//! process starts, run LIFO with the other rollback actions if this run rolls
+//! back, and never written to `install.log`. `download` fetches over
 //! WinHTTP (system TLS, [`crate::sys::http_get`]), verifies the sha256 with
 //! `sha2` (no rustls/openssl), and writes the file — a reversible creation, so it
 //! logs a `File` record.
@@ -16,14 +19,29 @@ use sha2::{Digest as _, Sha256};
 
 use super::{Engine, to_lua};
 use crate::log::Record;
+use crate::rollback::UndoCmd;
 
-/// `embala.exec` — no engine needed (unlogged).
-pub fn exec_fn(lua: &Lua) -> mlua::Result<mlua::Function> {
-    lua.create_function(|lua, spec: Table| {
+/// `embala.exec` — the engine only journals an `undo` (the run is unlogged).
+pub fn exec_fn(lua: &Lua, engine: &Rc<RefCell<Engine>>) -> mlua::Result<mlua::Function> {
+    let engine = Rc::clone(engine);
+    lua.create_function(move |lua, spec: Table| {
         let cmd = spec.get::<String>("cmd")?;
         let args = spec.get::<Option<Vec<String>>>("args")?.unwrap_or_default();
         let cwd = spec.get::<Option<String>>("cwd")?;
         let wait = spec.get::<Option<bool>>("wait")?.unwrap_or(true);
+        // exec is ungated but may change the install (e.g. remove files), so
+        // snapshot it first, as every gated mutation does.
+        engine.borrow_mut().capture_previous();
+        // Journal the undo before the process starts, as a record precedes its
+        // mutation: whatever the command got done, rollback undoes it.
+        if let Some(undo) = spec.get::<Option<Table>>("undo")? {
+            let undo = UndoCmd {
+                cmd: undo.get::<String>("cmd")?,
+                args: undo.get::<Option<Vec<String>>>("args")?.unwrap_or_default(),
+                cwd: undo.get::<Option<String>>("cwd")?,
+            };
+            engine.borrow_mut().journal.push_undo(undo);
+        }
 
         let mut command = Command::new(&cmd);
         command.args(&args);
@@ -74,7 +92,7 @@ impl Engine {
         if let Some(parent) = d.parent() {
             self.ensure_dir(parent)?;
         }
-        self.record(Record::File { path: d.clone() });
+        self.record_file_write(Record::File { path: d.clone() }, &d)?;
         std::fs::write(&d, &body)?;
         Ok(())
     }

@@ -1,5 +1,6 @@
 //! `embala.fs.*` — file operations (spec R11). Reversible creations (`copy`,
-//! `copy_tree`, `mkdir`) log a [`Record`]; destructive calls (`remove`,
+//! `copy_tree`, `mkdir`) log a [`Record`], and a copy over an existing file
+//! backs it up first so rollback restores it; destructive calls (`remove`,
 //! `remove_tree`) are applied but not logged (no inverse).
 
 use std::cell::RefCell;
@@ -57,9 +58,10 @@ impl Engine {
         if let Some(parent) = d.parent() {
             self.ensure_dir(parent)?;
         }
-        // Record before the write (crash-ordering): a delete-if-exists reversal
-        // is safe even if the copy never completed.
-        self.record(Record::File { path: d.clone() });
+        // Back up and record before the write (crash-ordering): rollback
+        // restores the backup, or deletes the file if none was there, even if
+        // the copy never completed.
+        self.record_file_write(Record::File { path: d.clone() }, &d)?;
         std::fs::copy(&s, &d)?;
         Ok(())
     }
@@ -80,7 +82,7 @@ impl Engine {
             if entry.file_type()?.is_dir() {
                 self.copy_tree_inner(&from, &to)?;
             } else {
-                self.record(Record::File { path: to.clone() });
+                self.record_file_write(Record::File { path: to.clone() }, &to)?;
                 std::fs::copy(&from, &to)?;
             }
         }

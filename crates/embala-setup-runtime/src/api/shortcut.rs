@@ -63,8 +63,9 @@ impl Engine {
             .clone()
             .unwrap_or_else(|| target.parent().map(path_string).unwrap_or_default());
 
-        // Record before writing the .lnk (crash-ordering; delete-if-exists undo).
-        self.record(Record::Shortcut { path: lnk.clone() });
+        // Back up any existing .lnk and record before writing (crash-ordering;
+        // rollback restores the old .lnk or deletes the new one).
+        self.record_file_write(Record::Shortcut { path: lnk.clone() }, &lnk)?;
         write_lnk(&lnk, &path_string(&target), &workdir, a).map_err(io::Error::other)?;
         Ok(())
     }

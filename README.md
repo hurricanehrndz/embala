@@ -28,7 +28,7 @@ with a Developer ID and notarized. Every archive carries a build-provenance
 attestation:
 
 ```sh
-gh attestation verify embala-0.13.0-x86_64-unknown-linux-musl.tar.gz --repo hurricanehrndz/embala
+gh attestation verify embala-0.14.0-x86_64-unknown-linux-musl.tar.gz --repo hurricanehrndz/embala
 ```
 
 The Linux builds are static musl — no glibc version to match, no runtime
@@ -36,8 +36,8 @@ dependencies at all. The Windows builds import only OS DLLs. The macOS build
 links `libSystem` and friends, as every Mach-O binary must.
 
 ```sh
-tar -xzf embala-0.13.0-x86_64-unknown-linux-musl.tar.gz
-./embala-0.13.0-x86_64-unknown-linux-musl/embala --version
+tar -xzf embala-0.14.0-x86_64-unknown-linux-musl.tar.gz
+./embala-0.14.0-x86_64-unknown-linux-musl/embala --version
 ```
 
 Building from source needs the dev shell once, to cross-compile the embedded
@@ -320,6 +320,82 @@ parsed, exits non-zero with an error naming the file.
 An installer's VERSIONINFO describes the installer, which is not always the
 app it installs: self-extracting archives often carry no version, and you
 have to extract the payload and run `info` on the inner exe.
+
+## setup.exe rollback and upgrades
+
+`setup.exe` runs `install.lua` against the `embala.*` API and journals each
+change it makes. If the script raises an error, the user cancels, or setup
+cannot write the uninstaller afterwards, setup rolls the run back, last change
+first, and leaves the machine as it was before the run, including when the
+run is an upgrade over an existing install:
+
+- A file written by `fs.copy`, `fs.copy_tree` or `download` over an existing
+  file gets the old contents back. A file the run created is deleted.
+- A shortcut from `shortcut.create` over an existing one is restored.
+- `arp.register` over an existing entry restores the entry's old values.
+- `registry.set` and `env.set` over an existing value restore the old value.
+  A value the run created is deleted, as before. Setup saves values as their
+  type and raw bytes, so a value of any type comes back unchanged.
+- The previous `uninstall.exe`, `uninstall.lua`, `manifest.json` and
+  `install.log` are left byte for byte, so the uninstaller already on disk
+  still removes the previous install. A successful run replaces them, and
+  removes a previous `uninstall.lua` when the new package ships none.
+
+Before overwriting a file, setup copies it to `%TEMP%\embala-backup-<pid>`.
+It deletes that directory when the run ends, unless a rollback could not
+restore a file (see Limits).
+
+Commands run by `embala.exec` are not undone, except by the `undo` command
+you give with them. It runs only if this run rolls back, in reverse order
+with the other changes, and the uninstaller never runs it:
+
+```lua
+local exe = embala.install_dir .. "\\app.exe"
+-- Stop and remove the old service. On rollback, after the old app.exe is
+-- back, install the service from it again.
+embala.exec{ cmd = exe, args = { "-serviceremove" },
+             undo = { cmd = exe, args = { "-serviceinstall" } } }
+embala.fs.copy("app.exe", "app.exe")
+embala.arp.register{ ... }
+local r = embala.exec{ cmd = exe, args = { "-serviceinstall" } }
+if r.code ~= 0 then error("service install failed: " .. r.code) end
+```
+
+`undo` takes `cmd`, `args` and `cwd`, like `exec`. Setup records it before the
+command starts, so it runs on rollback even if the command never started or
+failed. Its exit code is ignored, and a failing `undo` does not stop the rest
+of the rollback. Setup waits for the `undo` process to exit, with no timeout,
+but not for any process it leaves running: its input and output are discarded.
+If a restore before it was skipped because the file was in use, the `undo`
+runs against whatever file is on disk.
+
+Limits:
+
+- `fs.remove`, `fs.remove_tree` and `registry.delete` are not journaled, so
+  rollback does not bring back what they removed.
+- A restore fails if the file is in use, for example an exe the run started.
+  Setup skips it and continues. It then keeps `%TEMP%\embala-backup-<pid>`,
+  and its error message names each file it could not restore and the backup
+  that holds that file's previous version.
+- If the process is killed (not cancelled), nothing is rolled back. The
+  previous `install.log` stays as it was. The run's records are in
+  `install.log.partial` and the backups stay in `%TEMP%\embala-backup-<pid>`.
+- A successful run over an existing install keeps the previous
+  `install.log`'s records and adds its own, one entry per file, folder,
+  shortcut, registry value, ARP entry and environment variable. So the
+  uninstaller removes what any version installed, including a file or a
+  setting a later version stopped shipping, and the install folder ends
+  empty. Setup reads the previous log before the run's first change, from
+  the folder the run finally installs to, so a script that deletes it does
+  not lose its records. If the previous log exists but cannot be read or
+  decoded, setup prints a line on stderr and the new log lists only this run.
+  If the previous install used the other mode (per-user or per-machine, as
+  its `manifest.json` records), only its files, folders and shortcuts are
+  kept: its registry, ARP and environment entries may belong to another
+  user, and the new uninstaller leaves them alone.
+- `install.log` and the uninstaller's files are written to a `.tmp` file
+  and renamed into place, so a killed setup leaves the old file or the new
+  one, never a partial one.
 
 ## Signing — SmartScreen & Gatekeeper
 
