@@ -215,13 +215,25 @@ impl Journal {
                 Action::Restore {
                     record: Record::File { path } | Record::Shortcut { path },
                     prior: Prior::File { backup },
-                } => std::fs::copy(backup, path).map(drop).inspect_err(|e| {
-                    unrestored.push(format!(
-                        "{} ({e}; its previous version is {})",
-                        path.display(),
-                        backup.display()
-                    ));
-                }),
+                } => std::fs::copy(backup, path)
+                    .map(drop)
+                    // A write that failed because the file was locked never
+                    // replaced it, and the copy back fails the same way: the
+                    // file already is what the backup holds.
+                    .or_else(|e| {
+                        if same_contents(path, backup) {
+                            Ok(())
+                        } else {
+                            Err(e)
+                        }
+                    })
+                    .inspect_err(|e| {
+                        unrestored.push(format!(
+                            "{} ({e}; its previous version is {})",
+                            path.display(),
+                            backup.display()
+                        ));
+                    }),
                 Action::Run(undo) => run_undo(undo),
                 other => system(other),
             };
@@ -284,6 +296,15 @@ pub fn conclude(
     }
     let _ = std::fs::remove_file(log::partial_path(log_path));
     result
+}
+
+/// Whether `a` and `b` hold the same bytes. Reading only, so it works on a file
+/// another process holds open for reading. Unreadable counts as different.
+fn same_contents(a: &Path, b: &Path) -> bool {
+    let len = |p: &Path| std::fs::metadata(p).map(|m| m.len()).ok();
+    len(a).is_some()
+        && len(a) == len(b)
+        && matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
 }
 
 /// Run an undo command and wait for it to exit. Its exit code is not checked:
@@ -744,6 +765,28 @@ mod tests {
         std::fs::remove_dir(dir.join("install.log.tmp")).unwrap();
         assert_previous_install(&dir);
         assert!(!dir.join("manifest.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_locked_file_that_was_never_replaced_counts_as_restored() {
+        // Why: the common failure is a write refused because the target is
+        // locked; the copy back is refused too, yet nothing was lost. That
+        // must not keep the backups or tell the user a restore failed.
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tmp("locked-unchanged");
+        let f = dir.join("uninstall.exe");
+        std::fs::write(&f, "old").unwrap();
+        let mut j = Journal::new(dir.join("backup"));
+        // The write is journaled, then refused: the file keeps its bytes and
+        // stays unwritable, as a file another process holds open would.
+        let prior = j.back_up_file(&f).unwrap();
+        j.push(Record::File { path: f.clone() }, prior);
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        assert_eq!(j.roll_back(host_system), Ok(()));
+        assert_eq!(read(f.clone()), "old");
+        assert!(!dir.join("backup").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
