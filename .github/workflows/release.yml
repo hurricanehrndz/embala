@@ -226,7 +226,7 @@ jobs:
       # Build provenance for every archive, including the Linux ones, which
       # have no signature format of their own. Verify with
       # `gh attestation verify <file> --repo hurricanehrndz/embala`.
-      - uses: actions/attest-build-provenance@v3
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/embala-*
       - name: Publish
