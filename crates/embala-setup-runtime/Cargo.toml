@@ -31,7 +31,7 @@ serde_json = "1"
 # --workspace` still links on Linux. kernel: AttachConsole/console-ctrl/version;
 # user: MessageBox/SendMessageTimeout; advapi: registry; shell+ole: IShellLink +
 # ShellExecuteEx (UAC relaunch).
-winsafe = { version = "0.0.28", features = [
+winsafe = { version = "0.0.29", features = [
     "kernel",
     "user",
     "advapi",
@@ -45,14 +45,14 @@ winsafe = { version = "0.0.28", features = [
 # Self-extraction reads the payload zip; Windows-only (the extractor runs only
 # there) with just the pure-Rust zlib-rs deflate backend so zig cross-linking
 # stays trivial — no bzip2/zstd/lzma C.
-zip = { version = "8", default-features = false, features = [
+zip = { version = "9", default-features = false, features = [
     "deflate-flate2-zlib-rs",
 ] }
 # WinHTTP (system TLS) for embala.download + sha2 for checksum verify — no
 # rustls/openssl pulled in. windows-sys covers the Win32 bits winsafe 0.0.28
 # lacks: WinHTTP, RtlGetVersion, SetConsoleCtrlHandler, and ShellExecuteExW with
 # a process handle to wait on (winsafe's ShellExecuteEx drops the child handle).
-sha2 = "0.10"
+sha2 = "0.11"
 windows-sys = { version = "0.61", features = [
     "Wdk_System_SystemServices",       # RtlGetVersion
     "Win32_Foundation",
