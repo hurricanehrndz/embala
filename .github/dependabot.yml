@@ -4,9 +4,19 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Only patch updates are grouped. Anything bigger gets its own PR, so one
+    # breaking crate doesn't hold back the rest; that includes 0.x minor bumps
+    # (0.12 -> 0.13), which Cargo treats as breaking.
     groups:
       cargo:
-        patterns: ["*"]
+        update-types: [patch]
+    ignore:
+      # apple-xar and apple-bom implement scroll 0.12's traits; embala-pkg
+      # can't move to a newer scroll until they do.
+      - dependency-name: scroll
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
   - package-ecosystem: github-actions
     directory: /
     schedule:
