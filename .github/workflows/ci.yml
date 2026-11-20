@@ -1,0 +1,22 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/zig-toolchain
+      # embala-setup include_bytes!-embeds both Windows stubs, so nothing in
+      # the workspace compiles until `just stubs` has built them.
+      - run: rustup target add x86_64-pc-windows-gnu aarch64-pc-windows-gnullvm
+      - run: just stubs
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace

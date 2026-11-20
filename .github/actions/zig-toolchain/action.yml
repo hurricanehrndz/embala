@@ -1,0 +1,28 @@
+name: zig cross toolchain
+description: Install pinned zig, cargo-zigbuild and just, and put them on PATH
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        # Pinned to the versions devenv.nix puts in the dev shell, so a local
+        # cross-build and a CI build use the same toolchain.
+        ZIG_VERSION: 0.17.1
+        CARGO_ZIGBUILD_VERSION: 0.23.4
+        JUST_VERSION: 1.59.0
+      run: |
+        # A plain venv rather than pipx: cargo-zigbuild finds zig by running
+        # `python3 -m ziglang`, so the interpreter carrying `ziglang` has to
+        # be the one on PATH — pipx would hide it in an isolated venv.
+        python3 -m venv "$RUNNER_TEMP/venv"
+        "$RUNNER_TEMP/venv/bin/pip" install --quiet \
+          "ziglang==$ZIG_VERSION" \
+          "cargo-zigbuild==$CARGO_ZIGBUILD_VERSION" \
+          "rust-just==$JUST_VERSION"
+        # The wheel exposes zig only as `python -m ziglang`, but
+        # embala-setup-runtime's build.rs shells out to a real `zig` for
+        # `zig rc`. Shim it so both entry points hit the same pinned zig.
+        printf '#!/bin/sh\nexec "%s/bin/python3" -m ziglang "$@"\n' \
+          "$RUNNER_TEMP/venv" > "$RUNNER_TEMP/venv/bin/zig"
+        chmod +x "$RUNNER_TEMP/venv/bin/zig"
+        echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
