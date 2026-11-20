@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod info;
 mod lower;
 mod sign;
 
@@ -55,6 +56,14 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Report a PE's VERSIONINFO or an MSI's Property table
+    Info {
+        /// The .exe/.dll or .msi to inspect (detected by content)
+        file: PathBuf,
+        /// Print one JSON object instead of `key: value` lines
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -94,6 +103,7 @@ fn main() -> Result<()> {
             version,
             out,
         } => dump_stub(arch, config.as_deref(), version.as_deref(), &out),
+        Command::Info { file, json } => info::run(&file, json),
     }
 }
 
