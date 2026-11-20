@@ -76,6 +76,9 @@ pub struct Journal {
     /// Holds file backups; created on the first backup, removed by [`Journal::discard`].
     backup_dir: PathBuf,
     backups: usize,
+    /// The install already at a log path, read before this run changed
+    /// anything there ([`Journal::capture_previous`]).
+    previous: Option<(PathBuf, log::Previous)>,
 }
 
 impl Journal {
@@ -84,6 +87,17 @@ impl Journal {
             steps: Vec::new(),
             backup_dir,
             backups: 0,
+            previous: None,
+        }
+    }
+
+    /// Read the install at `log_path` ([`log::read_previous`]) unless already
+    /// read from there. Called before every mutation, so the snapshot predates
+    /// anything this run does to that directory (a script's own `fs.remove`
+    /// included) and follows a directory page that re-points the install.
+    pub fn capture_previous(&mut self, log_path: &Path) {
+        if self.previous.as_ref().is_none_or(|(p, _)| p != log_path) {
+            self.previous = Some((log_path.to_path_buf(), log::read_previous(log_path)));
         }
     }
 
@@ -110,13 +124,22 @@ impl Journal {
     /// Write one of the uninstaller's files (or `install.log`): backed up and
     /// journaled like a record, so rollback restores or deletes it, but not
     /// listed in `install.log`.
+    /// The write is atomic (a sibling `.tmp` renamed over the file), so a killed
+    /// process leaves the old file or the new one, never a torn one.
     pub fn write_sidecar(&mut self, path: &Path, contents: &[u8]) -> io::Result<()> {
         let prior = self.back_up_file(path)?;
         self.steps.push(Step::Sidecar {
             path: path.to_path_buf(),
             prior,
         });
-        std::fs::write(path, contents)
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let written = std::fs::write(&tmp, contents).and_then(|()| std::fs::rename(&tmp, path));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written
     }
 
     /// Remove one of the uninstaller's files, if present; rollback restores it.
@@ -180,19 +203,38 @@ impl Journal {
     /// Undo the run, LIFO and best-effort: a failed action is ignored so it
     /// cannot strand the rest. File restores and undo commands run here;
     /// `system` performs the rest (reversals, registry restores). Discards the
-    /// backups afterwards.
-    pub fn roll_back(&self, mut system: impl FnMut(&Action) -> io::Result<()>) {
+    /// backups afterwards, unless a file could not be restored: then the
+    /// backups are kept and the error names each such file and the backup dir.
+    pub fn roll_back(
+        &self,
+        mut system: impl FnMut(&Action) -> io::Result<()>,
+    ) -> Result<(), String> {
+        let mut unrestored = Vec::new();
         for action in self.rollback_plan() {
             let _ = match &action {
                 Action::Restore {
                     record: Record::File { path } | Record::Shortcut { path },
                     prior: Prior::File { backup },
-                } => std::fs::copy(backup, path).map(drop),
+                } => std::fs::copy(backup, path).map(drop).inspect_err(|e| {
+                    unrestored.push(format!(
+                        "{} ({e}; its previous version is {})",
+                        path.display(),
+                        backup.display()
+                    ));
+                }),
                 Action::Run(undo) => run_undo(undo),
                 other => system(other),
             };
         }
-        self.discard();
+        if unrestored.is_empty() {
+            self.discard();
+            return Ok(());
+        }
+        Err(format!(
+            "could not restore {}; backups kept in {}",
+            unrestored.join(", "),
+            self.backup_dir.display()
+        ))
     }
 
     /// Remove the backups (after a successful run, or once restored).
@@ -211,20 +253,20 @@ impl Journal {
 pub fn conclude(
     journal: &mut Journal,
     log_path: &Path,
+    mode: &str,
     script: Result<(), String>,
     write_uninstaller: impl FnOnce(&mut Journal) -> Result<(), String>,
     system: impl FnMut(&Action) -> io::Result<()>,
 ) -> Result<(), String> {
-    // An existing install's log, read before this run writes its own over it:
-    // its records are carried into the new log. Missing or unreadable as text
-    // counts as none.
-    let previous = std::fs::read(log_path)
-        .ok()
-        .map(|b| String::from_utf8_lossy(&b).into_owned());
-    let result = script
+    // The existing install, as read before this run's first mutation (or now,
+    // if the run made none): its records are carried into the new log.
+    journal.capture_previous(log_path);
+    let previous = journal.previous.take().map(|(_, p)| p);
+    let mut result = script
         .and_then(|()| write_uninstaller(journal))
         .and_then(|()| {
-            let (records, warning) = log::committed_records(previous.as_deref(), journal.records());
+            let previous = previous.unwrap_or(log::Previous::None);
+            let (records, warning) = log::committed_records(&previous, mode, journal.records());
             if let Some(warning) = warning {
                 eprintln!("setup: {warning}");
             }
@@ -232,9 +274,13 @@ pub fn conclude(
                 .write_sidecar(log_path, log::encode(&records).as_bytes())
                 .map_err(|e| e.to_string())
         });
-    match result {
+    match &mut result {
         Ok(()) => journal.discard(),
-        Err(_) => journal.roll_back(system),
+        Err(e) => {
+            if let Err(restore) = journal.roll_back(system) {
+                *e = format!("{e}; {restore}");
+            }
+        }
     }
     let _ = std::fs::remove_file(log::partial_path(log_path));
     result
@@ -303,7 +349,7 @@ mod tests {
 
         write_over(&mut j, &old, "v2");
         write_over(&mut j, &new, "v2");
-        j.roll_back(host_system);
+        j.roll_back(host_system).unwrap();
 
         assert_eq!(std::fs::read_to_string(&old).unwrap(), "v1");
         assert!(!new.exists());
@@ -319,7 +365,7 @@ mod tests {
         let mut j = Journal::new(dir.join("backup"));
         write_over(&mut j, &f, "v2");
         write_over(&mut j, &f, "v3");
-        j.roll_back(host_system);
+        j.roll_back(host_system).unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "v1");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -344,7 +390,7 @@ mod tests {
             cwd: None,
         });
         write_over(&mut j, &exe, "new");
-        j.roll_back(host_system);
+        j.roll_back(host_system).unwrap();
 
         assert_eq!(std::fs::read_to_string(&seen).unwrap(), "old");
         let _ = std::fs::remove_dir_all(&dir);
@@ -362,7 +408,7 @@ mod tests {
             args: vec![],
             cwd: None,
         });
-        j.roll_back(host_system);
+        j.roll_back(host_system).unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "v1");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -395,12 +441,21 @@ mod tests {
 
     /// An existing install: its log, uninstaller and script, and app.exe "v1".
     /// Returns the journal after a run overwrote app.exe with "v2".
+    /// The previous install's records: app.exe and old.dll.
+    fn old_records(dir: &Path) -> Vec<Record> {
+        ["app.exe", "old.dll"]
+            .map(|f| Record::File { path: dir.join(f) })
+            .to_vec()
+    }
+
     fn upgrade_in_progress(dir: &Path) -> Journal {
-        std::fs::write(dir.join("install.log"), "old log\n").unwrap();
+        std::fs::write(dir.join("install.log"), log::encode(&old_records(dir))).unwrap();
         std::fs::write(dir.join("uninstall.exe"), "old uninstaller").unwrap();
         std::fs::write(dir.join("uninstall.lua"), "old script").unwrap();
         std::fs::write(dir.join("app.exe"), "v1").unwrap();
         let mut j = Journal::new(dir.join("backup"));
+        // As the engine does before the run's first mutation.
+        j.capture_previous(&dir.join("install.log"));
         write_over(&mut j, &dir.join("app.exe"), "v2");
         log::flush_partial(&dir.join("install.log"), &j.records()).unwrap();
         j
@@ -412,7 +467,10 @@ mod tests {
 
     /// What the previous install had, untouched.
     fn assert_previous_install(dir: &Path) {
-        assert_eq!(read(dir.join("install.log")), "old log\n");
+        assert_eq!(
+            read(dir.join("install.log")),
+            log::encode(&old_records(dir))
+        );
         assert_eq!(read(dir.join("uninstall.exe")), "old uninstaller");
         assert_eq!(read(dir.join("uninstall.lua")), "old script");
         assert_eq!(read(dir.join("app.exe")), "v1");
@@ -451,6 +509,7 @@ mod tests {
         let result = conclude(
             &mut j,
             &dir.join("install.log"),
+            "per-user",
             Err("script error".to_string()),
             |_| {
                 called = true;
@@ -474,6 +533,7 @@ mod tests {
         let result = conclude(
             &mut j,
             &dir.join("install.log"),
+            "per-user",
             Ok(()),
             write_uninstaller(&dir, true),
             host_system,
@@ -489,6 +549,7 @@ mod tests {
         let result = conclude(
             &mut j,
             &dir.join("install.log"),
+            "per-user",
             Ok(()),
             write_uninstaller(&dir, true),
             host_system,
@@ -500,21 +561,32 @@ mod tests {
 
     #[test]
     fn a_successful_upgrade_writes_the_new_log_and_drops_a_stale_script() {
-        // Why: the new uninstaller must replay this run's records only, and a
-        // previous version's uninstall.lua must not run for a package that
-        // ships none.
+        // Why: the new uninstaller must replay the previous install's records
+        // and this run's, each once, and a previous version's uninstall.lua
+        // must not run for a package that ships none.
         let dir = tmp("succeeds");
         let mut j = upgrade_in_progress(&dir);
-        let records = j.records();
         let result = conclude(
             &mut j,
             &dir.join("install.log"),
+            "per-user",
             Ok(()),
             write_uninstaller(&dir, false),
             host_system,
         );
         assert_eq!(result, Ok(()));
-        assert_eq!(read(dir.join("install.log")), log::encode(&records));
+        assert_eq!(
+            log::decode(&read(dir.join("install.log"))).unwrap(),
+            vec![
+                Record::File {
+                    path: dir.join("old.dll")
+                },
+                Record::File {
+                    path: dir.join("app.exe")
+                },
+            ]
+        );
+        assert!(!dir.join("install.log.tmp").exists());
         assert_eq!(read(dir.join("uninstall.exe")), "new uninstaller");
         assert_eq!(read(dir.join("app.exe")), "v2");
         assert!(!dir.join("uninstall.lua").exists());
@@ -571,7 +643,14 @@ mod tests {
             },
             None,
         );
-        let result = conclude(&mut j, &log_path, Ok(()), |_| Ok(()), host_system);
+        let result = conclude(
+            &mut j,
+            &log_path,
+            "per-user",
+            Ok(()),
+            |_| Ok(()),
+            host_system,
+        );
         assert_eq!(result, Ok(()));
 
         // The uninstaller's replay of the committed log.
@@ -594,6 +673,112 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(left, vec![std::ffi::OsString::from("install.log")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn committed(dir: &Path) -> Vec<Record> {
+        log::decode(&read(dir.join("install.log"))).unwrap()
+    }
+
+    #[test]
+    fn a_script_that_deletes_the_old_log_still_carries_it() {
+        // Why: `fs.remove` is not journaled; a script cleaning up the old
+        // install could delete install.log before the run commits.
+        let dir = tmp("script-deletes-log");
+        let mut j = upgrade_in_progress(&dir);
+        std::fs::remove_file(dir.join("install.log")).unwrap();
+        let result = conclude(
+            &mut j,
+            &dir.join("install.log"),
+            "per-user",
+            Ok(()),
+            |_| Ok(()),
+            host_system,
+        );
+        assert_eq!(result, Ok(()));
+        assert!(committed(&dir).contains(&Record::File {
+            path: dir.join("old.dll")
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_previous_log_is_read_from_the_re_pointed_directory() {
+        // Why: a directory page can move the install after setup started;
+        // the install to carry is the one where this run finally installs.
+        let first = tmp("re-point-default");
+        let dir = tmp("re-point-final");
+        std::fs::write(dir.join("install.log"), log::encode(&old_records(&dir))).unwrap();
+        let mut j = Journal::new(dir.join("backup"));
+        j.capture_previous(&first.join("install.log"));
+        j.capture_previous(&dir.join("install.log"));
+        let result = conclude(
+            &mut j,
+            &dir.join("install.log"),
+            "per-user",
+            Ok(()),
+            |_| Ok(()),
+            host_system,
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(committed(&dir), old_records(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&first);
+    }
+
+    #[test]
+    fn a_failure_writing_install_log_rolls_back_and_keeps_the_old_one() {
+        // The temp file the atomic write needs cannot be created.
+        let dir = tmp("log-write-fails");
+        let mut j = upgrade_in_progress(&dir);
+        std::fs::create_dir(dir.join("install.log.tmp")).unwrap();
+        let result = conclude(
+            &mut j,
+            &dir.join("install.log"),
+            "per-user",
+            Ok(()),
+            write_uninstaller(&dir, false),
+            host_system,
+        );
+        assert!(result.is_err());
+        std::fs::remove_dir(dir.join("install.log.tmp")).unwrap();
+        assert_previous_install(&dir);
+        assert!(!dir.join("manifest.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_restore_keeps_the_backups_and_says_where() {
+        // Why: deleting the backups after a restore failed would lose the
+        // previous version of that file for good.
+        let dir = tmp("restore-fails");
+        let f = dir.join("app.exe");
+        std::fs::write(&f, "v1").unwrap();
+        let mut j = Journal::new(dir.join("backup"));
+        write_over(&mut j, &f, "v2");
+        // Something now holds the path the restore must write.
+        std::fs::remove_file(&f).unwrap();
+        std::fs::create_dir(&f).unwrap();
+
+        let err = j.roll_back(host_system).unwrap_err();
+        assert!(err.contains(&f.display().to_string()), "{err}");
+        assert!(
+            err.contains(&dir.join("backup").display().to_string()),
+            "{err}"
+        );
+        assert_eq!(read(dir.join("backup").join("0")), "v1");
+
+        // conclude passes it on to the message the user sees.
+        let result = conclude(
+            &mut j,
+            &dir.join("install.log"),
+            "per-user",
+            Err("script error".to_string()),
+            |_| Ok(()),
+            host_system,
+        );
+        let err = result.unwrap_err();
+        assert!(err.starts_with("script error; could not restore"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -29,6 +29,9 @@ pub fn exec_fn(lua: &Lua, engine: &Rc<RefCell<Engine>>) -> mlua::Result<mlua::Fu
         let args = spec.get::<Option<Vec<String>>>("args")?.unwrap_or_default();
         let cwd = spec.get::<Option<String>>("cwd")?;
         let wait = spec.get::<Option<bool>>("wait")?.unwrap_or(true);
+        // exec is ungated but may change the install (e.g. remove files), so
+        // snapshot it first, as every gated mutation does.
+        engine.borrow_mut().capture_previous();
         // Journal the undo before the process starts, as a record precedes its
         // mutation: whatever the command got done, rollback undoes it.
         if let Some(undo) = spec.get::<Option<Table>>("undo")? {

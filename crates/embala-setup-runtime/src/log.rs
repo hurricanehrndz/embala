@@ -127,20 +127,74 @@ pub fn flush_partial(log_path: &Path, records: &[Record]) -> std::io::Result<()>
     std::fs::write(partial_path(log_path), encode(records))
 }
 
-/// The records a successful run commits to `install.log`. `previous` is the
-/// install's existing log text (`None` when there is none): its records are
-/// carried forward ahead of this run's ([`merge`]), so the uninstaller removes
-/// what any version installed. A fresh install commits `current` unchanged.
-/// A previous log that does not decode is dropped with a warning (returned),
-/// not an error: the install itself succeeded.
+/// What an existing install left beside `install.log`, read before the run
+/// changes anything ([`read_previous`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Previous {
+    /// No `install.log`: a fresh install.
+    None,
+    /// Its records, and the resolved mode its `manifest.json` records, if any.
+    Install {
+        records: Vec<Record>,
+        mode: Option<String>,
+    },
+    /// An `install.log` that could not be read or decoded, and why.
+    Unreadable(String),
+}
+
+/// Read the install at `log_path`: its log, and its mode from the
+/// `manifest.json` sidecar beside it.
+pub fn read_previous(log_path: &Path) -> Previous {
+    let text = match std::fs::read(log_path) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|e| e.to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Previous::None,
+        Err(e) => Err(e.to_string()),
+    };
+    match text.and_then(|t| decode(&t).map_err(|e| e.to_string())) {
+        Ok(records) => Previous::Install {
+            records,
+            mode: std::fs::read(log_path.with_file_name("manifest.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|m| m["install_mode"].as_str().map(str::to_string)),
+        },
+        Err(e) => Previous::Unreadable(e),
+    }
+}
+
+/// The records a successful run in `mode` commits to `install.log`: the
+/// previous install's carried ahead of this run's ([`merge`]), so the
+/// uninstaller removes what any version installed. A fresh install commits
+/// `current` unchanged. If the previous install ran in the other mode, only
+/// its files, folders and shortcuts are carried: its registry, ARP and env
+/// records name another user's HKCU (or HKLM), which this uninstaller, running
+/// as whoever installed this run, must not touch. An unreadable previous log
+/// is dropped with a warning (returned), not an error: the install succeeded.
 pub fn committed_records(
-    previous: Option<&str>,
+    previous: &Previous,
+    mode: &str,
     current: Vec<Record>,
 ) -> (Vec<Record>, Option<String>) {
-    match previous.map(decode) {
-        None => (current, None),
-        Some(Ok(previous)) => (merge(&previous, &current), None),
-        Some(Err(e)) => (
+    match previous {
+        Previous::None => (current, None),
+        Previous::Install {
+            records,
+            mode: previous_mode,
+        } => {
+            let carried: Vec<Record> = records
+                .iter()
+                .filter(|r| {
+                    previous_mode.as_deref().is_none_or(|m| m == mode)
+                        || matches!(
+                            r,
+                            Record::File { .. } | Record::Mkdir { .. } | Record::Shortcut { .. }
+                        )
+                })
+                .cloned()
+                .collect();
+            (merge(&carried, &current), None)
+        }
+        Previous::Unreadable(e) => (
             current,
             Some(format!(
                 "previous install.log unreadable ({e}); it lists only this install now"
@@ -437,31 +491,85 @@ mod tests {
     fn a_fresh_install_commits_its_records_unchanged() {
         // Even its own duplicates: byte for byte what earlier versions wrote.
         let current = vec![file("/app/a"), file("/app/a")];
-        assert_eq!(committed_records(None, current.clone()), (current, None));
-    }
-
-    #[test]
-    fn a_corrupt_previous_log_is_dropped_with_a_warning() {
-        let (records, warning) = committed_records(Some("{not json\n"), v2());
-        assert_eq!(records, v2());
-        assert!(warning.unwrap().contains("unreadable"));
-    }
-
-    #[test]
-    fn a_0_12_0_previous_log_is_carried() {
-        let previous = concat!(
-            r#"{"op":"mkdir","path":"/app/data"}"#,
-            "\n",
-            r#"{"op":"file","path":"/app/old.dll"}"#,
-            "\n",
-            r#"{"op":"registry","hive":"hklm","key":"Software\\App","name":"Version","key_created":true}"#,
-            "\n",
+        assert_eq!(
+            committed_records(&Previous::None, "per-user", current.clone()),
+            (current, None)
         );
-        let (records, warning) = committed_records(Some(previous), v2());
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("embala-log-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn an_unreadable_previous_log_is_dropped_with_a_warning() {
+        // Why: the install succeeded; a bad old log must not fail it, but the
+        // user should hear that the new log no longer lists the old install.
+        let dir = tmp("unreadable");
+        let log = dir.join("install.log");
+        assert_eq!(read_previous(&log), Previous::None, "missing is silent");
+
+        std::fs::write(&log, "{not json\n").unwrap();
+        let corrupt = read_previous(&log);
+        // An I/O error other than not-found: the log path is a directory.
+        let io_error = read_previous(&dir);
+        for previous in [corrupt, io_error] {
+            assert!(matches!(previous, Previous::Unreadable(_)));
+            let (records, warning) = committed_records(&previous, "per-user", v2());
+            assert_eq!(records, v2());
+            assert!(warning.unwrap().contains("unreadable"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_0_12_0_previous_install_is_carried() {
+        let dir = tmp("0.12.0");
+        let log = dir.join("install.log");
+        std::fs::write(
+            &log,
+            concat!(
+                r#"{"op":"mkdir","path":"/app/data"}"#,
+                "\n",
+                r#"{"op":"file","path":"/app/old.dll"}"#,
+                "\n",
+                r#"{"op":"registry","hive":"hklm","key":"Software\\App","name":"Version","key_created":true}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            r#"{"format_version":2,"arch":"x86_64","install_mode":"per-machine"}"#,
+        )
+        .unwrap();
+        let previous = read_previous(&log);
+        assert!(matches!(&previous, Previous::Install { mode: Some(m), .. } if m == "per-machine"));
+        let (records, warning) = committed_records(&previous, "per-machine", v2());
         assert_eq!(warning, None);
         assert_eq!(records[0], mkdir("/app/data"));
         assert!(records.contains(&file("/app/old.dll")));
         assert!(records.contains(&reg("Version", true)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mode_switch_carries_only_paths() {
+        // Why: a per-user install's HKCU records belong to the user who ran
+        // it; a per-machine uninstaller runs elevated, possibly as someone
+        // else, and would delete that user's own values.
+        let previous = Previous::Install {
+            records: v1(),
+            mode: Some("per-user".to_string()),
+        };
+        let (records, _) = committed_records(&previous, "per-machine", vec![]);
+        assert_eq!(records, v1()[..4].to_vec());
+        let (records, _) = committed_records(&previous, "per-user", vec![]);
+        assert_eq!(records, v1());
     }
 
     #[test]

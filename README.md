@@ -342,8 +342,8 @@ run is an upgrade over an existing install:
   removes a previous `uninstall.lua` when the new package ships none.
 
 Before overwriting a file, setup copies it to `%TEMP%\embala-backup-<pid>`.
-It deletes that directory when the run ends, whether it succeeded or rolled
-back.
+It deletes that directory when the run ends, unless a rollback could not
+restore a file (see Limits).
 
 Commands run by `embala.exec` are not undone, except by the `undo` command
 you give with them. It runs only if this run rolls back, in reverse order
@@ -374,7 +374,9 @@ Limits:
 - `fs.remove`, `fs.remove_tree` and `registry.delete` are not journaled, so
   rollback does not bring back what they removed.
 - A restore fails if the file is in use, for example an exe the run started.
-  Setup skips it and continues.
+  Setup skips it and continues. It then keeps `%TEMP%\embala-backup-<pid>`,
+  and its error message names each file it could not restore and the backup
+  that holds that file's previous version.
 - If the process is killed (not cancelled), nothing is rolled back. The
   previous `install.log` stays as it was. The run's records are in
   `install.log.partial` and the backups stay in `%TEMP%\embala-backup-<pid>`.
@@ -383,8 +385,17 @@ Limits:
   shortcut, registry value, ARP entry and environment variable. So the
   uninstaller removes what any version installed, including a file or a
   setting a later version stopped shipping, and the install folder ends
-  empty. A previous log that cannot be read is dropped, with a line on
-  stderr, and the new log lists only this run.
+  empty. Setup reads the previous log before the run's first change, from
+  the folder the run finally installs to, so a script that deletes it does
+  not lose its records. If the previous log exists but cannot be read or
+  decoded, setup prints a line on stderr and the new log lists only this run.
+  If the previous install used the other mode (per-user or per-machine, as
+  its `manifest.json` records), only its files, folders and shortcuts are
+  kept: its registry, ARP and environment entries may belong to another
+  user, and the new uninstaller leaves them alone.
+- `install.log` and the uninstaller's files are written to a `.tmp` file
+  and renamed into place, so a killed setup leaves the old file or the new
+  one, never a partial one.
 
 ## Signing — SmartScreen & Gatekeeper
 

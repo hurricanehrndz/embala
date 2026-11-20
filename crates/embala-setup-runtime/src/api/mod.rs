@@ -165,6 +165,7 @@ impl Engine {
         rollback::conclude(
             &mut self.journal,
             &self.log_path,
+            self.mode.as_str(),
             script,
             write_uninstaller,
             apply_action,
@@ -198,6 +199,12 @@ impl Engine {
         }
         self.journal.push(record, prior);
         let _ = log::flush_partial(&self.log_path, &self.journal.records());
+    }
+
+    /// See [`Journal::capture_previous`].
+    pub(crate) fn capture_previous(&mut self) {
+        let log_path = self.log_path.clone();
+        self.journal.capture_previous(&log_path);
     }
 
     /// Record a write to the file at `path` (a copy, download or shortcut),
@@ -336,6 +343,14 @@ fn progress_desc(record: &Record) -> String {
 /// mutating method resolves its paths from `install_dir` *before* recording, so
 /// the directory page's choice must land first.
 pub(crate) fn gate(engine: &Rc<RefCell<Engine>>, lua: &Lua) -> mlua::Result<()> {
+    wizard_gate(engine, lua)?;
+    // With the install dir now final, snapshot the install already there
+    // before this mutation can change it ([`Journal::capture_previous`]).
+    engine.borrow_mut().capture_previous();
+    Ok(())
+}
+
+fn wizard_gate(engine: &Rc<RefCell<Engine>>, lua: &Lua) -> mlua::Result<()> {
     // Fast path: not interactive, or the wizard already ran.
     {
         let e = engine.borrow();
