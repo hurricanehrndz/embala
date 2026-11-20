@@ -563,7 +563,7 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "embala"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "apple-bundles",
@@ -590,7 +590,7 @@ dependencies = [
 
 [[package]]
 name = "embala-msi"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "cab",
  "cfb",
@@ -602,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "embala-nupkg"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "quick-xml 0.41.0",
  "sha2 0.10.9",
@@ -613,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "embala-pkg"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "apple-bom",
  "apple-xar",
@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "embala-setup"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "editpe",
  "embala-setup-overlay",
@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "embala-setup-overlay"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -646,7 +646,7 @@ dependencies = [
 
 [[package]]
 name = "embala-setup-runtime"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "embala-setup-overlay",
  "mlua",
