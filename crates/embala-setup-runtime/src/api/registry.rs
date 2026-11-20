@@ -10,7 +10,7 @@ use mlua::{Lua, Table};
 use winsafe::{self as w, co, msg};
 
 use super::{Engine, to_lua};
-use crate::log::{EnvScope, Hive, Record};
+use crate::log::{self, EnvScope, Hive, Record};
 use crate::rollback::Prior;
 
 /// The Uninstall root the ARP entry lives under (spec R11/R14).
@@ -270,25 +270,49 @@ impl Engine {
 // Reversal executors (called from api::apply_reversal)
 // ---------------------------------------------------------------------------
 
-pub fn reverse_registry(
-    hive: Hive,
-    key: &str,
-    name: Option<&str>,
-    delete_key: bool,
-) -> io::Result<()> {
-    let root = hive_key(hive);
-    if delete_key {
-        // The install created the key: remove it and everything under it.
-        let _ = root.RegDeleteTree(Some(key));
-    } else if let Ok(guard) =
-        root.RegOpenKeyEx(Some(key), co::REG_OPTION::default(), co::KEY::WRITE)
+pub fn reverse_registry(hive: Hive, key: &str, name: Option<&str>) -> io::Result<()> {
+    if let Ok(guard) =
+        hive_key(hive).RegOpenKeyEx(Some(key), co::REG_OPTION::default(), co::KEY::WRITE)
     {
         let _ = guard.RegDeleteValue(name);
     }
     Ok(())
 }
 
+/// Delete `key` if it has no values or subkeys left ([`log::remove_key`]).
+/// A key that cannot be opened or counted is kept.
+pub fn remove_key_if_empty(hive: Hive, key: &str) -> io::Result<()> {
+    let root = hive_key(hive);
+    let Ok(guard) = root.RegOpenKeyEx(Some(key), co::REG_OPTION::default(), co::KEY::QUERY_VALUE)
+    else {
+        return Ok(());
+    };
+    let (mut subkeys, mut values) = (0, 0);
+    let counted = guard
+        .RegQueryInfoKey(
+            None,
+            Some(&mut subkeys),
+            None,
+            None,
+            Some(&mut values),
+            None,
+            None,
+            None,
+            None,
+        )
+        .is_ok();
+    drop(guard);
+    if counted && log::remove_key(values, subkeys) {
+        // Something could write to the key between the count and the delete;
+        // Win32 has no delete-if-empty, so that window stays.
+        let _ = root.RegDeleteKey(key);
+    }
+    Ok(())
+}
+
 pub fn reverse_arp(hive: Hive, identifier: &str) -> io::Result<()> {
+    // The package's own `Uninstall\<identifier>` entry, which nothing else
+    // writes to: the whole tree goes, unlike a `registry.set` key.
     let key = format!(r"{UNINSTALL_ROOT}\{identifier}");
     let _ = hive_key(hive).RegDeleteTree(Some(&key));
     Ok(())

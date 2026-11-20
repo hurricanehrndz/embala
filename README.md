@@ -28,7 +28,7 @@ with a Developer ID and notarized. Every archive carries a build-provenance
 attestation:
 
 ```sh
-gh attestation verify embala-0.14.0-x86_64-unknown-linux-musl.tar.gz --repo hurricanehrndz/embala
+gh attestation verify embala-0.15.0-x86_64-unknown-linux-musl.tar.gz --repo hurricanehrndz/embala
 ```
 
 The Linux builds are static musl — no glibc version to match, no runtime
@@ -36,8 +36,8 @@ dependencies at all. The Windows builds import only OS DLLs. The macOS build
 links `libSystem` and friends, as every Mach-O binary must.
 
 ```sh
-tar -xzf embala-0.14.0-x86_64-unknown-linux-musl.tar.gz
-./embala-0.14.0-x86_64-unknown-linux-musl/embala --version
+tar -xzf embala-0.15.0-x86_64-unknown-linux-musl.tar.gz
+./embala-0.15.0-x86_64-unknown-linux-musl/embala --version
 ```
 
 Building from source needs the dev shell once, to cross-compile the embedded
@@ -334,7 +334,8 @@ run is an upgrade over an existing install:
 - A shortcut from `shortcut.create` over an existing one is restored.
 - `arp.register` over an existing entry restores the entry's old values.
 - `registry.set` and `env.set` over an existing value restore the old value.
-  A value the run created is deleted, as before. Setup saves values as their
+  A value the run created is deleted, as before, and a key the run created is
+  deleted only if nothing else is left in it. Setup saves values as their
   type and raw bytes, so a value of any type comes back unchanged.
 - The previous `uninstall.exe`, `uninstall.lua`, `manifest.json` and
   `install.log` are left byte for byte, so the uninstaller already on disk
@@ -393,6 +394,12 @@ Limits:
   its `manifest.json` records), only its files, folders and shortcuts are
   kept: its registry, ARP and environment entries may belong to another
   user, and the new uninstaller leaves them alone.
+- The uninstaller deletes the registry values `registry.set` wrote, then
+  each key the install created only if it has no values or subkeys left, as
+  it removes a folder only if empty. So values or subkeys written later
+  under such a key, by another product, an administrator or the app itself,
+  survive uninstall; to remove the app's own, `registry.delete` them in
+  `uninstall.lua`. The ARP entry is deleted whole.
 - `install.log` and the uninstaller's files are written to a `.tmp` file
   and renamed into place, so a killed setup leaves the old file or the new
   one, never a partial one.

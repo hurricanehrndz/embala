@@ -168,9 +168,12 @@ impl Journal {
         Ok(Some(Prior::File { backup }))
     }
 
-    /// The rollback actions, LIFO.
+    /// The rollback actions, LIFO, then removing each registry key this run
+    /// created if it is left empty. A key an earlier install created is left
+    /// to its uninstaller.
     pub fn rollback_plan(&self) -> Vec<Action> {
-        self.steps
+        let mut plan: Vec<Action> = self
+            .steps
             .iter()
             .rev()
             .map(|s| match s {
@@ -197,7 +200,13 @@ impl Journal {
                 }
                 Step::Undo(undo) => Action::Run(undo.clone()),
             })
-            .collect()
+            .collect();
+        plan.extend(
+            log::created_key_removals(&self.records())
+                .into_iter()
+                .map(Action::Reverse),
+        );
+        plan
     }
 
     /// Undo the run, LIFO and best-effort: a failed action is ignored so it
@@ -460,6 +469,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn rollback_removes_only_a_key_this_run_created_and_only_if_empty() {
+        // Why: a failed fresh install must leave no key it created behind,
+        // whichever of its values is reversed last, but a key that existed
+        // before the run (an upgrade) is never removed by its rollback.
+        let reg = |key: &str, name: &str, key_created| Record::Registry {
+            hive: log::Hive::Hkcu,
+            key: key.to_string(),
+            name: Some(name.to_string()),
+            key_created,
+        };
+        let mut j = Journal::new(tmp("reg-rollback").join("backup"));
+        j.push(reg(r"Software\New", "A", true), None);
+        j.push(reg(r"Software\New", "B", false), None);
+        j.push(reg(r"Software\Old", "C", false), None);
+        let plan: Vec<_> = j
+            .rollback_plan()
+            .into_iter()
+            .map(|a| match a {
+                Action::Reverse(r) => r,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        let value = |key: &str, name: &str| Reversal::DeleteRegistryValue {
+            hive: log::Hive::Hkcu,
+            key: key.to_string(),
+            name: Some(name.to_string()),
+        };
+        assert_eq!(
+            plan,
+            vec![
+                value(r"Software\Old", "C"),
+                value(r"Software\New", "B"),
+                value(r"Software\New", "A"),
+                Reversal::RemoveKeyIfEmpty {
+                    hive: log::Hive::Hkcu,
+                    key: r"Software\New".to_string(),
+                },
+            ]
+        );
+    }
+
     /// An existing install: its log, uninstaller and script, and app.exe "v1".
     /// Returns the journal after a run overwrote app.exe with "v2".
     /// The previous install's records: app.exe and old.dll.
@@ -680,7 +731,10 @@ mod tests {
             hive: log::Hive::Hklm,
             key: r"Software\App".to_string(),
             name: Some("Version".to_string()),
-            delete_key: true,
+        }));
+        assert!(plan.contains(&Reversal::RemoveKeyIfEmpty {
+            hive: log::Hive::Hklm,
+            key: r"Software\App".to_string(),
         }));
         for reversal in &plan {
             match reversal {

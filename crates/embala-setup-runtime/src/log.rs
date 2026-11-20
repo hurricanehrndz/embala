@@ -54,8 +54,8 @@ pub enum Record {
     /// A `.lnk` shortcut was created at `path`. Reverse: delete it.
     Shortcut { path: PathBuf },
     /// A registry value was set. `key_created` records whether *this* call
-    /// created the key (so reversal can delete the whole key, not just the
-    /// value). Kept simple: only a key created by this install is removed.
+    /// created the key. Reverse: delete the value, then the key if this
+    /// install created it and nothing else is left in it.
     Registry {
         hive: Hive,
         key: String,
@@ -81,8 +81,12 @@ pub enum Reversal {
         hive: Hive,
         key: String,
         name: Option<String>,
-        /// Delete the whole key after the value (the install created it).
-        delete_key: bool,
+    },
+    /// Delete a key the install created if no value or subkey is left in it.
+    /// See [`remove_key`].
+    RemoveKeyIfEmpty {
+        hive: Hive,
+        key: String,
     },
     DeleteArp {
         hive: Hive,
@@ -262,8 +266,8 @@ fn dedupe_key(record: &Record) -> String {
         Record::Registry {
             hive, key, name, ..
         } => format!(
-            "registry\0{hive:?}\0{}\0{}",
-            fold(key),
+            "registry\0{}\0{}",
+            key_id(*hive, key),
             name.as_deref().map(fold).unwrap_or_default()
         ),
         Record::Arp { hive, identifier } => format!("arp\0{hive:?}\0{}", fold(identifier)),
@@ -271,9 +275,59 @@ fn dedupe_key(record: &Record) -> String {
     }
 }
 
-/// Map an install log to its undo actions in **LIFO** order (spec R14).
+/// Map an install log to its undo actions in **LIFO** order (spec R14), then
+/// [`created_key_removals`].
 pub fn reversal_plan(records: &[Record]) -> Vec<Reversal> {
-    records.iter().rev().map(reverse_one).collect()
+    let mut plan: Vec<Reversal> = records.iter().rev().map(reverse_one).collect();
+    plan.extend(created_key_removals(records));
+    plan
+}
+
+/// A [`Reversal::RemoveKeyIfEmpty`] for each registry key `records` say the
+/// install created, deepest first. They run after every value is deleted, so
+/// a key and a created subkey of it both go, whatever order an upgrade's
+/// merge left their records in. Keys match case-insensitively and ignore
+/// empty or trailing `\`.
+pub fn created_key_removals(records: &[Record]) -> Vec<Reversal> {
+    let mut keys = std::collections::BTreeMap::new();
+    for record in records {
+        if let Record::Registry {
+            hive,
+            key,
+            key_created: true,
+            ..
+        } = record
+        {
+            keys.entry(key_id(*hive, key))
+                .or_insert_with(|| (*hive, normalize_key(key)));
+        }
+    }
+    let mut keys: Vec<(Hive, String)> = keys.into_values().collect();
+    keys.sort_by_key(|(_, key)| std::cmp::Reverse(key.matches('\\').count()));
+    keys.into_iter()
+        .map(|(hive, key)| Reversal::RemoveKeyIfEmpty { hive, key })
+        .collect()
+}
+
+/// `key` without empty components: no leading, trailing or doubled `\`.
+fn normalize_key(key: &str) -> String {
+    key.split('\\')
+        .filter(|c| !c.is_empty())
+        .collect::<Vec<_>>()
+        .join("\\")
+}
+
+fn key_id(hive: Hive, key: &str) -> String {
+    format!("{hive:?}\0{}", normalize_key(key).to_lowercase())
+}
+
+/// Whether to delete a key the install created: only if no value or subkey
+/// is left, as a directory is removed only if empty. Anything left was
+/// written by something else (another product, an administrator, the app
+/// itself). Win32 `RegDeleteKey` deletes a key that still holds values, so
+/// the caller counts them rather than relying on the delete to fail.
+pub fn remove_key(values: u32, subkeys: u32) -> bool {
+    values == 0 && subkeys == 0
 }
 
 /// The undo action for one record. Also used by rollback for a record that
@@ -284,15 +338,11 @@ pub fn reverse_one(record: &Record) -> Reversal {
         Record::Mkdir { path } => Reversal::RemoveDirIfEmpty(path.clone()),
         Record::Shortcut { path } => Reversal::DeleteShortcut(path.clone()),
         Record::Registry {
-            hive,
-            key,
-            name,
-            key_created,
+            hive, key, name, ..
         } => Reversal::DeleteRegistryValue {
             hive: *hive,
             key: key.clone(),
             name: name.clone(),
-            delete_key: *key_created,
         },
         Record::Arp { hive, identifier } => Reversal::DeleteArp {
             hive: *hive,
@@ -440,8 +490,14 @@ mod tests {
             ]
         );
         assert_eq!(
-            reversal_plan(&merged).last(),
-            Some(&Reversal::RemoveDirIfEmpty(PathBuf::from("/app/data")))
+            reversal_plan(&merged)[5..],
+            [
+                Reversal::RemoveDirIfEmpty(PathBuf::from("/app/data")),
+                Reversal::RemoveKeyIfEmpty {
+                    hive: Hive::Hklm,
+                    key: r"Software\App".to_string(),
+                },
+            ]
         );
     }
 
@@ -642,8 +698,162 @@ mod tests {
                 hive: Hive::Hklm,
                 key: r"Software\X".to_string(),
                 name: None,
-                delete_key: false,
             }]
         );
+    }
+
+    /// A model of HKLM: key id ([`key_id`]) to its value names, lowercase,
+    /// `""` for the default value. Every ancestor listed is a key.
+    type Model = std::collections::BTreeMap<String, BTreeSet<String>>;
+
+    fn model(keys: &[(&str, &[&str])]) -> Model {
+        keys.iter()
+            .map(|(k, vs)| {
+                let values = vs.iter().map(|v| v.to_lowercase()).collect();
+                (key_id(Hive::Hklm, k), values)
+            })
+            .collect()
+    }
+
+    /// Run a plan's registry reversals on `m` as `api::registry` does.
+    fn replay(plan: &[Reversal], m: &mut Model) {
+        for reversal in plan {
+            match reversal {
+                Reversal::DeleteRegistryValue { hive, key, name } => {
+                    if let Some(values) = m.get_mut(&key_id(*hive, key)) {
+                        values.remove(&name.as_deref().unwrap_or_default().to_lowercase());
+                    }
+                }
+                Reversal::RemoveKeyIfEmpty { hive, key } => {
+                    let id = key_id(*hive, key);
+                    let Some(values) = m.get(&id) else { continue };
+                    let prefix = format!("{id}\\");
+                    let subkeys = m
+                        .keys()
+                        .filter(|k| k.strip_prefix(&prefix).is_some_and(|r| !r.contains('\\')))
+                        .count();
+                    if remove_key(values.len() as u32, subkeys as u32) {
+                        m.remove(&id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn reg_at(key: &str, name: Option<&str>, key_created: bool) -> Record {
+        Record::Registry {
+            hive: Hive::Hklm,
+            key: key.to_string(),
+            name: name.map(str::to_string),
+            key_created,
+        }
+    }
+
+    const APP: &str = r"Software\App";
+    const SUB: &str = r"Software\App\Sub";
+
+    #[test]
+    fn a_created_key_is_removed_only_when_nothing_else_is_left_in_it() {
+        // Why: a created key may later hold another product's values or an
+        // administrator's subkey; uninstall must remove only what it wrote,
+        // as it does for a folder. Win32 deletes a key that still has values,
+        // so the value count must be part of the decision.
+        let plan = reversal_plan(&[reg_at(APP, None, true)]);
+        let run = |mut m: Model| {
+            replay(&plan, &mut m);
+            m
+        };
+        assert_eq!(run(model(&[(APP, &[""])])), model(&[]), "empty: removed");
+        assert_eq!(
+            run(model(&[(APP, &["", "Foreign"])])),
+            model(&[(APP, &["Foreign"])]),
+            "foreign value"
+        );
+        assert_eq!(
+            run(model(&[(APP, &[""]), (SUB, &[])])),
+            model(&[(APP, &[]), (SUB, &[])]),
+            "foreign subkey"
+        );
+        let mut m = model(&[(APP, &[""])]);
+        replay(&reversal_plan(&[reg_at(APP, None, false)]), &mut m);
+        assert_eq!(m, model(&[(APP, &[])]), "never created: kept");
+    }
+
+    #[test]
+    fn a_created_key_goes_with_its_last_value_in_any_order() {
+        // Why: only the call that created the key records it, and an upgrade's
+        // merge can move that record before its siblings in the log.
+        for records in [
+            vec![reg("A", true), reg("B", false)],
+            vec![reg("B", false), reg("A", true)],
+        ] {
+            let plan = reversal_plan(&records);
+            let mut m = model(&[(APP, &["A", "B"])]);
+            replay(&plan, &mut m);
+            assert_eq!(m, model(&[]), "{records:?}");
+            let mut m = model(&[(APP, &["A", "B", "Foreign"])]);
+            replay(&plan, &mut m);
+            assert_eq!(m, model(&[(APP, &["Foreign"])]), "{records:?}");
+        }
+        // Keys match per hive.
+        let hkcu = Record::Registry {
+            hive: Hive::Hkcu,
+            key: APP.to_string(),
+            name: Some("B".to_string()),
+            key_created: false,
+        };
+        assert_eq!(
+            created_key_removals(&[hkcu, reg("A", true)]),
+            vec![Reversal::RemoveKeyIfEmpty {
+                hive: Hive::Hklm,
+                key: APP.to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn nested_created_keys_both_go_whatever_order_an_upgrade_leaves() {
+        // Why: v1 created App, then App\Sub. v2 makes the same calls in the
+        // other order into existing keys, and the merge moves each record to
+        // v2's position: App's value is reversed while Sub still exists. Both
+        // keys must still go, as the old whole-tree delete removed them.
+        let v1 = vec![reg_at(APP, Some("A"), true), reg_at(SUB, Some("B"), true)];
+        for v2 in [
+            vec![reg_at(SUB, Some("B"), false), reg_at(APP, Some("A"), false)],
+            vec![reg_at(APP, Some("A"), false), reg_at(SUB, Some("B"), false)],
+        ] {
+            let merged = merge(&v1, &v2);
+            let mut m = model(&[(APP, &["A"]), (SUB, &["B"])]);
+            replay(&reversal_plan(&merged), &mut m);
+            assert_eq!(m, model(&[]), "{merged:?}");
+        }
+        // A parent created on the way to a deeper key is not recorded: kept.
+        let mut m = model(&[(APP, &[]), (SUB, &["B"])]);
+        replay(&reversal_plan(&[reg_at(SUB, Some("B"), true)]), &mut m);
+        assert_eq!(m, model(&[(APP, &[])]));
+    }
+
+    #[test]
+    fn key_spellings_with_extra_backslashes_are_the_same_key() {
+        // Why: `Software\App\` and `Software\App` open the same key; counting
+        // them as two would leave the created key to a value spelled the
+        // other way, and dedupe would keep one value twice.
+        let records = vec![
+            reg_at(r"Software\App\", Some("A"), true),
+            reg_at(r"Software\\App", Some("B"), false),
+        ];
+        assert_eq!(
+            created_key_removals(&records),
+            vec![Reversal::RemoveKeyIfEmpty {
+                hive: Hive::Hklm,
+                key: APP.to_string(),
+            }]
+        );
+        let mut m = model(&[(APP, &["A", "B"])]);
+        replay(&reversal_plan(&records), &mut m);
+        assert_eq!(m, model(&[]));
+        let again = vec![reg_at(r"\SOFTWARE\APP\", Some("a"), false)];
+        assert_eq!(merge(&records, &again).len(), 2);
     }
 }
